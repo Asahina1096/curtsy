@@ -1,0 +1,22 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.pins
+
+# Xcode
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Editors and operating systems
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Runtime files
+*.log
+*.pid
