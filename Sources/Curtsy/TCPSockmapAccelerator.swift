@@ -1,10 +1,7 @@
 import CBPFSupport
+import Glibc
 import NIOConcurrencyHelpers
 import NIOCore
-
-#if os(Linux)
-import Glibc
-#endif
 
 final class TCPSockmapAccelerator: @unchecked Sendable {
     enum AcceleratorError: Error, CustomStringConvertible {
@@ -16,11 +13,7 @@ final class TCPSockmapAccelerator: @unchecked Sendable {
             case .unsupportedChannel:
                 return "channel does not expose socket options"
             case .systemCall(let errorNumber, let verifierLog):
-                #if os(Linux)
                 let reason = String(cString: Glibc.strerror(errorNumber))
-                #else
-                let reason = "not supported"
-                #endif
                 return verifierLog.isEmpty ? reason : "\(reason); verifier=\(verifierLog)"
             }
         }
@@ -33,8 +26,7 @@ final class TCPSockmapAccelerator: @unchecked Sendable {
     }
 
     // Each proxied TCP connection consumes two map entries.
-    static func load(maxEntries: Int = 131_072) throws -> TCPSockmapAccelerator? {
-        #if os(Linux)
+    static func load(maxEntries: Int = 131_072) throws -> TCPSockmapAccelerator {
         var verifierLog = [CChar](repeating: 0, count: 256 * 1_024)
         let runtime = verifierLog.withUnsafeMutableBufferPointer { buffer in
             curtsy_sockmap_create(UInt32(maxEntries), buffer.baseAddress, buffer.count)
@@ -47,9 +39,6 @@ final class TCPSockmapAccelerator: @unchecked Sendable {
             throw AcceleratorError.systemCall(errorNumber: errorNumber, verifierLog: message)
         }
         return TCPSockmapAccelerator(runtime: runtime)
-        #else
-        return nil
-        #endif
     }
 
     func pair(client: Channel, upstream: Channel) -> EventLoopFuture<TCPSockmapConnection> {

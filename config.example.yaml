@@ -26,8 +26,8 @@ upstream:
 #   tcpListenBacklog: auto
 #   maxTCPBufferedBytes: auto
 #   maxUDPAssociations: auto
-#   maxUDPPendingDatagrams: auto
-#   maxUDPPendingBytes: auto
+#   maxUDPPendingDatagrams: auto   # legacy: unused by the batched UDP transport
+#   maxUDPPendingBytes: auto       # legacy: unused by the batched UDP transport
 # performance:
 #   tcpSockmapAcceleration: auto
 # logging:

@@ -1,13 +1,8 @@
 import Dispatch
 import Foundation
+import Glibc
 import NIOCore
 import NIOPosix
-
-#if canImport(Glibc)
-import Glibc
-#else
-import Darwin
-#endif
 
 final class ForwarderService: @unchecked Sendable {
     private let configurationPath: String
@@ -110,17 +105,10 @@ final class ForwarderService: @unchecked Sendable {
     }
 
     private func installSignalHandlers() {
-        #if canImport(Glibc)
         _ = Glibc.signal(SIGPIPE, SIG_IGN)
         _ = Glibc.signal(SIGINT, SIG_IGN)
         _ = Glibc.signal(SIGTERM, SIG_IGN)
         _ = Glibc.signal(SIGHUP, SIG_IGN)
-        #else
-        _ = Darwin.signal(SIGPIPE, SIG_IGN)
-        _ = Darwin.signal(SIGINT, SIG_IGN)
-        _ = Darwin.signal(SIGTERM, SIG_IGN)
-        _ = Darwin.signal(SIGHUP, SIG_IGN)
-        #endif
 
         let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: controlQueue)
         interrupt.setEventHandler { [weak self] in self?.shutdown(reason: "SIGINT") }

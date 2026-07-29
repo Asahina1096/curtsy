@@ -9,6 +9,14 @@ ExecStart=/usr/bin/curtsy --config /etc/curtsy/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
+# Least privilege: transient user, only the capabilities the forwarder needs.
+# CAP_BPF + CAP_NET_ADMIN load/attach the sockmap and reuseport eBPF programs,
+# CAP_PERFMON feeds the BPF observer kprobes, CAP_NET_BIND_SERVICE covers
+# privileged listen ports. CAP_BPF requires kernel >= 5.8; on older kernels
+# remove DynamicUser/AmbientCapabilities and run as root instead.
+DynamicUser=true
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

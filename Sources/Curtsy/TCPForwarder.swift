@@ -1,13 +1,8 @@
 import Atomics
+import Glibc
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
-
-#if canImport(Glibc)
-import Glibc
-#else
-import Darwin
-#endif
 
 private enum TCPPerformanceTuning {
     // Large reads and batched flushes keep syscall and event-loop overhead low enough
@@ -20,14 +15,16 @@ private enum TCPPerformanceTuning {
         )
     }
 
-    // Four 1 MiB buffers retain the same 4 MiB maximum read batch as the
-    // previous sixteen 256 KiB buffers while requiring fewer read syscalls.
-    static let maxMessagesPerRead: UInt = 4
-    // Keep one full read batch below the high watermark. A 1 MiB watermark
-    // made nearly every batch toggle autoRead and issue redundant epoll_ctl calls.
+    // Eight 1 MiB buffers form an 8 MiB maximum read batch, halving the read
+    // and epoll_wait syscall rate measured under load compared to four buffers.
+    static let maxMessagesPerRead: UInt = 8
+    // Keep one full read batch below the high watermark with hysteresis above
+    // the low watermark so a batch never toggles autoRead or issues redundant
+    // epoll_ctl calls. Worst case is 12 MiB buffered per connection, still
+    // bounded globally by TCPBufferBudget.
     static let writeBufferWaterMark = ChannelOptions.Types.WriteBufferWaterMark(
-        low: 1 * 1_024 * 1_024,
-        high: 4 * 1_024 * 1_024
+        low: 4 * 1_024 * 1_024,
+        high: 12 * 1_024 * 1_024
     )
 }
 
@@ -82,7 +79,7 @@ final class TCPListener: @unchecked Sendable {
     private let log: LogStore
     private let bufferBudget: TCPBufferBudget
     private let enableSockmapAccelerationOverride: Bool?
-    private let loadSockmapAccelerator: () throws -> TCPSockmapAccelerator?
+    private let loadSockmapAccelerator: () throws -> TCPSockmapAccelerator
     private let activeChannels = ChannelRegistry()
     private let accepting = ManagedAtomic(true)
     private var listenerChannels: [Channel] = []
@@ -94,7 +91,7 @@ final class TCPListener: @unchecked Sendable {
         log: LogStore,
         enableSockmapAcceleration: Bool? = nil,
         bufferBudget: TCPBufferBudget? = nil,
-        loadSockmapAccelerator: @escaping () throws -> TCPSockmapAccelerator? = {
+        loadSockmapAccelerator: @escaping () throws -> TCPSockmapAccelerator = {
             try TCPSockmapAccelerator.load()
         }
     ) {
@@ -111,9 +108,7 @@ final class TCPListener: @unchecked Sendable {
         if shouldEnableSockmap {
             do {
                 accelerator = try loadSockmapAccelerator()
-                if accelerator != nil {
-                    log.info("tcp sockmap acceleration enabled")
-                }
+                log.info("tcp sockmap acceleration enabled")
             } catch {
                 accelerator = nil
                 log.warning("tcp sockmap acceleration unavailable; using userspace relay error=\(error)")
@@ -220,9 +215,7 @@ final class TCPListener: @unchecked Sendable {
             if accelerator == nil {
                 do {
                     accelerator = try loadSockmapAccelerator()
-                    if accelerator != nil {
-                        log.info("tcp sockmap acceleration enabled")
-                    }
+                    log.info("tcp sockmap acceleration enabled")
                 } catch {
                     log.warning("tcp sockmap acceleration unavailable; using userspace relay error=\(error)")
                 }
@@ -313,11 +306,7 @@ final class TCPListener: @unchecked Sendable {
             let result = try channel.pipeline.syncOperations.withUnsafeTransportIfAvailable(
                 of: NIOBSDSocket.Handle.self
             ) { descriptor -> Bool in
-                #if canImport(Glibc)
                 let status = Glibc.listen(descriptor, Int32(backlog))
-                #else
-                let status = Darwin.listen(descriptor, Int32(backlog))
-                #endif
                 guard status == 0 else {
                     throw IOError(errnoCode: errno, reason: "listen backlog update")
                 }

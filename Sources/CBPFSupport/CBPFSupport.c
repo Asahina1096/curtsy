@@ -1,7 +1,12 @@
+#define _GNU_SOURCE
+
 #include "CBPFSupport.h"
 
 #include <errno.h>
+#include <netinet/in.h>
 #include <stdlib.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 
 int32_t curtsy_socket_level(void) {
@@ -11,8 +16,6 @@ int32_t curtsy_socket_level(void) {
 int32_t curtsy_so_reuseport(void) {
     return SO_REUSEPORT;
 }
-
-#if defined(__linux__)
 
 #include <linux/bpf.h>
 #include <stddef.h>
@@ -677,96 +680,166 @@ int32_t curtsy_bpf_observer_read(
     return 0;
 }
 
-
-#else
-
-int32_t curtsy_so_attach_reuseport_ebpf(void) {
-    return -1;
-}
-
-int32_t curtsy_load_reuseport_bpf(
-    uint32_t socket_count,
-    char *verifier_log,
-    size_t verifier_log_capacity
-) {
-    (void)socket_count;
-    if (verifier_log != NULL && verifier_log_capacity > 0) {
-        verifier_log[0] = '\0';
+int32_t curtsy_udp_recv_batch(int fd, curtsy_udp_slot *slots, uint32_t max_slots) {
+    if (slots == NULL || max_slots == 0) {
+        errno = EINVAL;
+        return -1;
     }
-    errno = ENOTSUP;
+    struct mmsghdr headers[64];
+    struct iovec vectors[64];
+    if (max_slots > 64) max_slots = 64;
+    for (uint32_t i = 0; i < max_slots; i++) {
+        vectors[i].iov_base = slots[i].data;
+        vectors[i].iov_len = slots[i].capacity;
+        headers[i].msg_hdr.msg_name = &slots[i].address;
+        headers[i].msg_hdr.msg_namelen = sizeof(slots[i].address);
+        headers[i].msg_hdr.msg_iov = &vectors[i];
+        headers[i].msg_hdr.msg_iovlen = 1;
+        headers[i].msg_hdr.msg_control = NULL;
+        headers[i].msg_hdr.msg_controllen = 0;
+        headers[i].msg_hdr.msg_flags = 0;
+        headers[i].msg_len = 0;
+    }
+    int received = recvmmsg(fd, headers, max_slots, MSG_DONTWAIT, NULL);
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+        return -1;
+    }
+    for (int i = 0; i < received; i++) {
+        slots[i].length = headers[i].msg_len;
+        slots[i].address_length = headers[i].msg_hdr.msg_namelen;
+    }
+    return received;
+}
+
+int32_t curtsy_udp_send_batch(
+    int fd,
+    const struct sockaddr *address,
+    socklen_t address_length,
+    const curtsy_udp_slot *slots,
+    uint32_t count
+) {
+    if (slots == NULL || count == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct mmsghdr headers[64];
+    struct iovec vectors[64];
+    if (count > 64) count = 64;
+    for (uint32_t i = 0; i < count; i++) {
+        vectors[i].iov_base = slots[i].data;
+        vectors[i].iov_len = slots[i].length;
+        headers[i].msg_hdr.msg_name = (void *)address;
+        headers[i].msg_hdr.msg_namelen = address_length;
+        headers[i].msg_hdr.msg_iov = &vectors[i];
+        headers[i].msg_hdr.msg_iovlen = 1;
+        headers[i].msg_hdr.msg_control = NULL;
+        headers[i].msg_hdr.msg_controllen = 0;
+        headers[i].msg_hdr.msg_flags = 0;
+        headers[i].msg_len = 0;
+    }
+    int sent = sendmmsg(fd, headers, count, MSG_DONTWAIT);
+    if (sent < 0) return -1;
+    return sent;
+}
+
+int32_t curtsy_epoll_create(void) {
+    return epoll_create1(EPOLL_CLOEXEC);
+}
+
+int32_t curtsy_epoll_add(int32_t epoll_fd, int32_t fd) {
+    struct epoll_event event;
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.fd = fd;
+    return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event);
+}
+
+int32_t curtsy_epoll_wait(
+    int32_t epoll_fd,
+    int32_t *ready_fds,
+    uint32_t max_fds,
+    int32_t timeout_ms
+) {
+    if (ready_fds == NULL || max_fds == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct epoll_event events[65];
+    if (max_fds > 65) max_fds = 65;
+    int ready;
+    do {
+        ready = epoll_wait(epoll_fd, events, (int)max_fds, (int)timeout_ms);
+    } while (ready < 0 && errno == EINTR);
+    if (ready < 0) return -1;
+    for (int i = 0; i < ready; i++) {
+        ready_fds[i] = events[i].data.fd;
+    }
+    return ready;
+}
+
+int32_t curtsy_eventfd_create(void) {
+    return eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+}
+
+void curtsy_eventfd_signal(int32_t fd) {
+    uint64_t one = 1;
+    ssize_t ignored = write(fd, &one, sizeof(one));
+    (void)ignored;
+}
+
+void curtsy_eventfd_drain(int32_t fd) {
+    uint64_t value;
+    ssize_t ignored = read(fd, &value, sizeof(value));
+    (void)ignored;
+}
+
+int32_t curtsy_udp_listen_socket(
+    const struct sockaddr *address,
+    socklen_t address_length,
+    struct sockaddr_storage *bound,
+    socklen_t *bound_length
+) {
+    if (address == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = socket(address->sa_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    int yes = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) != 0) goto fail;
+    if (address->sa_family == AF_INET6) {
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes)) != 0) goto fail;
+    }
+    if (bind(fd, address, address_length) != 0) goto fail;
+    if (bound != NULL && bound_length != NULL) {
+        *bound_length = sizeof(*bound);
+        if (getsockname(fd, (struct sockaddr *)bound, bound_length) != 0) goto fail;
+    }
+    return fd;
+
+fail:
+    {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
     return -1;
 }
 
-curtsy_sockmap_runtime *curtsy_sockmap_create(
-    uint32_t max_entries,
-    char *verifier_log,
-    size_t verifier_log_capacity
-) {
-    (void)max_entries;
-    if (verifier_log != NULL && verifier_log_capacity > 0) verifier_log[0] = '\0';
-    errno = ENOTSUP;
-    return NULL;
+int32_t curtsy_udp_upstream_socket(const struct sockaddr *address, socklen_t address_length) {
+    if (address == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = socket(address->sa_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, address, address_length) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
 }
-
-void curtsy_sockmap_destroy(curtsy_sockmap_runtime *runtime) { (void)runtime; }
-
-int32_t curtsy_sockmap_pair(
-    curtsy_sockmap_runtime *runtime,
-    int32_t client_fd,
-    int32_t upstream_fd,
-    uint64_t *client_cookie,
-    uint64_t *upstream_cookie
-) {
-    (void)runtime; (void)client_fd; (void)upstream_fd;
-    (void)client_cookie; (void)upstream_cookie;
-    errno = ENOTSUP;
-    return -1;
-}
-
-void curtsy_sockmap_unpair(
-    curtsy_sockmap_runtime *runtime,
-    uint64_t client_cookie,
-    uint64_t upstream_cookie
-) {
-    (void)runtime; (void)client_cookie; (void)upstream_cookie;
-}
-
-int32_t curtsy_sockmap_idle_remaining_ns(
-    curtsy_sockmap_runtime *runtime,
-    uint64_t client_cookie,
-    uint64_t upstream_cookie,
-    uint64_t idle_timeout_ns,
-    uint64_t *remaining_ns
-) {
-    (void)runtime; (void)client_cookie; (void)upstream_cookie;
-    (void)idle_timeout_ns; (void)remaining_ns;
-    errno = ENOTSUP;
-    return -1;
-}
-
-
-typedef struct curtsy_bpf_observer curtsy_bpf_observer;
-
-curtsy_bpf_observer *curtsy_bpf_observer_create(
-    uint32_t target_pid,
-    char *verifier_log,
-    size_t verifier_log_capacity
-) {
-    (void)target_pid;
-    if (verifier_log != NULL && verifier_log_capacity > 0) verifier_log[0] = '\0';
-    errno = ENOTSUP;
-    return NULL;
-}
-
-void curtsy_bpf_observer_destroy(curtsy_bpf_observer *observer) { (void)observer; }
-
-int32_t curtsy_bpf_observer_read(
-    curtsy_bpf_observer *observer,
-    curtsy_bpf_observer_counters *counters
-) {
-    (void)observer; (void)counters;
-    errno = ENOTSUP;
-    return -1;
-}
-
-#endif

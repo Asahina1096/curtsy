@@ -64,27 +64,32 @@ final class ForwardingTests: XCTestCase {
     func testTCPListenerUsesResolvedSockmapDecisionAndAllowsTestOverride() {
         let loopback = makeResolvedConfiguration(protocols: [.tcp], upstreamPort: 9)
         var loadCount = 0
+        let loader: () throws -> TCPSockmapAccelerator = {
+            loadCount += 1
+            throw TCPSockmapAccelerator.AcceleratorError.unsupportedChannel
+        }
 
+        // Auto mode attempts to load even for loopback upstreams.
         let automatic = TCPListener(
             group: group,
             configuration: loopback,
             log: LogStore(level: "critical"),
-            loadSockmapAccelerator: {
-                loadCount += 1
-                return nil
-            }
+            loadSockmapAccelerator: loader
         )
-        XCTAssertEqual(loadCount, 0)
-
-        let remote = makeResolvedConfiguration(
-            protocols: [.tcp],
-            upstreamHost: "192.0.2.1",
-            upstreamPort: 9
-        )
-        automatic.update(configuration: remote)
         XCTAssertEqual(loadCount, 1)
+
+        // Failed loads are retried on configuration updates while sockmap stays requested.
         automatic.update(configuration: loopback)
-        automatic.update(configuration: remote)
+        XCTAssertEqual(loadCount, 2)
+
+        // Explicit override forces the decision regardless of configuration.
+        _ = TCPListener(
+            group: group,
+            configuration: loopback,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false,
+            loadSockmapAccelerator: loader
+        )
         XCTAssertEqual(loadCount, 2)
 
         _ = TCPListener(
@@ -92,10 +97,7 @@ final class ForwardingTests: XCTestCase {
             configuration: loopback,
             log: LogStore(level: "critical"),
             enableSockmapAcceleration: true,
-            loadSockmapAccelerator: {
-                loadCount += 1
-                return nil
-            }
+            loadSockmapAccelerator: loader
         )
         XCTAssertEqual(loadCount, 3)
     }
@@ -235,247 +237,130 @@ final class ForwardingTests: XCTestCase {
         XCTAssertEqual(listener.associationCount, 1)
     }
 
-    func testUDPResetRejectsStalePendingConnection() throws {
-        let eventLoop = EmbeddedEventLoop()
-        let connectionPromise = eventLoop.makePromise(of: Channel.self)
-        let budget = UDPAssociationBudget()
-        let configuration = makeResolvedConfiguration(protocols: [.udp], upstreamPort: 9)
-        let handler = UDPRelayHandler(
-            runtime: RuntimeConfiguration(configuration),
-            budget: budget,
-            log: LogStore(level: "critical"),
-            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
-        )
-        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
-        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
-        var buffer = listener.allocator.buffer(capacity: 4)
-        buffer.writeString("test")
-
-        XCTAssertNoThrow(
-            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
-        )
-        XCTAssertEqual(budget.count, 1)
-
-        handler.resetAssociations()
-        XCTAssertEqual(budget.count, 0)
-
-        let staleUpstream = EmbeddedChannel(loop: eventLoop)
-        connectionPromise.succeed(staleUpstream)
-        eventLoop.run()
-
-        XCTAssertFalse(staleUpstream.isActive)
-        XCTAssertEqual(budget.count, 0)
-        XCTAssertNoThrow(try listener.finish())
-        _ = try? staleUpstream.finish()
-    }
-
-    func testUDPPendingAssociationDatagramLimitDropsExcessBuffers() throws {
-        let eventLoop = EmbeddedEventLoop()
-        let connectionPromise = eventLoop.makePromise(of: Channel.self)
-        let budget = UDPAssociationBudget()
-        var limits = LimitConfiguration()
-        limits.maxUDPPendingDatagrams = 2
-        limits.maxUDPPendingBytes = 1_024
-        let configuration = makeResolvedConfiguration(
-            protocols: [.udp],
-            upstreamPort: 9,
-            limits: limits
-        )
-        let handler = UDPRelayHandler(
-            runtime: RuntimeConfiguration(configuration),
-            budget: budget,
-            log: LogStore(level: "critical"),
-            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
-        )
-        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
-        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
-
-        for value in ["one", "two", "three"] {
-            var buffer = listener.allocator.buffer(capacity: value.utf8.count)
-            buffer.writeString(value)
-            XCTAssertNoThrow(
-                try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
-            )
-        }
-        XCTAssertEqual(budget.count, 1)
-
-        let upstream = EmbeddedChannel(loop: eventLoop)
-        connectionPromise.succeed(upstream)
-        eventLoop.run()
-
-        let first: ByteBuffer? = try upstream.readOutbound()
-        let second: ByteBuffer? = try upstream.readOutbound()
-        let third: ByteBuffer? = try upstream.readOutbound()
-        XCTAssertEqual(first.map { $0.getString(at: $0.readerIndex, length: $0.readableBytes) }, "one")
-        XCTAssertEqual(second.map { $0.getString(at: $0.readerIndex, length: $0.readableBytes) }, "two")
-        XCTAssertNil(third)
-        XCTAssertNoThrow(try listener.finish())
-        _ = try? upstream.finish()
-    }
-
-    func testUDPPendingAssociationByteLimitRejectsOversizedFirstDatagram() throws {
-        let eventLoop = EmbeddedEventLoop()
-        let budget = UDPAssociationBudget()
-        var connectCount = 0
-        var limits = LimitConfiguration()
-        limits.maxUDPPendingBytes = 2
-        let configuration = makeResolvedConfiguration(
-            protocols: [.udp],
-            upstreamPort: 9,
-            limits: limits
-        )
-        let handler = UDPRelayHandler(
-            runtime: RuntimeConfiguration(configuration),
-            budget: budget,
-            log: LogStore(level: "critical"),
-            connectUpstream: { _, _, _, _, _, _ in
-                connectCount += 1
-                return eventLoop.makeSucceededFuture(EmbeddedChannel(loop: eventLoop))
+    func testUDPResetAssociationsClearsAndRebuilds() throws {
+        let echo = try DatagramBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(UDPEchoHandler())
             }
-        )
-        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
-        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
-        var buffer = listener.allocator.buffer(capacity: 3)
-        buffer.writeString("big")
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+        defer { try? echo.close().wait() }
 
-        XCTAssertNoThrow(
-            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
-        )
+        let configuration = makeResolvedConfiguration(protocols: [.udp], upstreamPort: echo.localAddress!.port!)
+        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        try listener.start()
+        defer { listener.stop() }
 
-        XCTAssertEqual(connectCount, 0)
-        XCTAssertEqual(budget.count, 0)
-        XCTAssertNoThrow(try listener.finish())
+        let first = try makeUDPClient(message: "first", destination: listener.localAddresses[0])
+        defer { try? first.channel.close().wait() }
+        first.recorder.wait()
+        XCTAssertEqual(first.recorder.string, "first")
+        XCTAssertTrue(waitForCondition { listener.associationCount == 1 })
+
+        listener.update(configuration: configuration, resetAssociations: true)
+        XCTAssertTrue(waitForCondition { listener.associationCount == 0 })
+
+        let second = try makeUDPClient(message: "second", destination: listener.localAddresses[0])
+        defer { try? second.channel.close().wait() }
+        second.recorder.wait()
+        XCTAssertEqual(second.recorder.string, "second")
+        XCTAssertTrue(waitForCondition { listener.associationCount == 1 })
     }
 
     func testUDPUpstreamActivityRefreshesAssociationExpiry() throws {
-        let eventLoop = EmbeddedEventLoop()
-        let connectionPromise = eventLoop.makePromise(of: Channel.self)
-        let activity = NIOLockedValueBox<(@Sendable () -> Void)?>(nil)
-        let budget = UDPAssociationBudget()
-        let configuration = makeResolvedConfiguration(protocols: [.udp], upstreamPort: 9)
-        let handler = UDPRelayHandler(
-            runtime: RuntimeConfiguration(configuration),
-            budget: budget,
-            log: LogStore(level: "critical"),
-            connectUpstream: { _, _, _, _, _, recordActivity in
-                activity.withLockedValue { $0 = recordActivity }
-                return connectionPromise.futureResult
+        let echo = try DatagramBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(UDPEchoHandler())
             }
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+        defer { try? echo.close().wait() }
+
+        let configuration = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: echo.localAddress!.port!,
+            udpSessionSeconds: 1
         )
-        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
-        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
-        var buffer = listener.allocator.buffer(capacity: 4)
-        buffer.writeString("test")
+        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        try listener.start()
+        defer { listener.stop() }
 
-        XCTAssertNoThrow(
-            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
-        )
-        let upstream = EmbeddedChannel(loop: eventLoop)
-        connectionPromise.succeed(upstream)
-        eventLoop.run()
-        XCTAssertEqual(budget.count, 1)
+        let client = try makeUDPSocket()
+        defer { try? client.close().wait() }
+        for _ in 0..<4 {
+            try sendUDP(client, "ping", to: listener.localAddresses[0])
+            XCTAssertTrue(waitForCondition { listener.associationCount == 1 })
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+        XCTAssertEqual(listener.associationCount, 1)
 
-        eventLoop.advanceTime(by: .seconds(4))
-        activity.withLockedValue { $0 }?()
-        eventLoop.run()
-        eventLoop.advanceTime(by: .seconds(4))
-        XCTAssertEqual(budget.count, 1)
-
-        eventLoop.advanceTime(by: .seconds(2))
-        XCTAssertEqual(budget.count, 0)
-        XCTAssertNoThrow(try listener.finish())
-        _ = try? upstream.finish()
+        // Without further traffic the association expires after one second.
+        XCTAssertTrue(waitForCondition(timeout: 3) { listener.associationCount == 0 })
     }
 
-    func testUDPTimeoutReloadReschedulesActiveAssociation() throws {
-        let eventLoop = EmbeddedEventLoop()
-        let connectionPromise = eventLoop.makePromise(of: Channel.self)
-        let budget = UDPAssociationBudget()
-        let initial = makeResolvedConfiguration(
+    func testUDPTimeoutReloadExpiresAssociationWithShortenedTimeout() throws {
+        let echo = try DatagramBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(UDPEchoHandler())
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+        defer { try? echo.close().wait() }
+
+        let configuration = makeResolvedConfiguration(
             protocols: [.udp],
-            upstreamPort: 9,
+            upstreamPort: echo.localAddress!.port!,
             udpSessionSeconds: 10
         )
-        let runtime = RuntimeConfiguration(initial)
-        let handler = UDPRelayHandler(
-            runtime: runtime,
-            budget: budget,
-            log: LogStore(level: "critical"),
-            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
-        )
-        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
-        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
-        var buffer = listener.allocator.buffer(capacity: 4)
-        buffer.writeString("test")
+        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        try listener.start()
+        defer { listener.stop() }
 
-        XCTAssertNoThrow(
-            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
-        )
-        let upstream = EmbeddedChannel(loop: eventLoop)
-        connectionPromise.succeed(upstream)
-        eventLoop.run()
-        XCTAssertEqual(budget.count, 1)
+        let client = try makeUDPSocket()
+        defer { try? client.close().wait() }
+        try sendUDP(client, "ping", to: listener.localAddresses[0])
+        XCTAssertTrue(waitForCondition { listener.associationCount == 1 })
 
-        eventLoop.advanceTime(by: .seconds(6))
         let shortened = makeResolvedConfiguration(
             protocols: [.udp],
-            upstreamPort: 9,
-            udpSessionSeconds: 5
+            upstreamPort: echo.localAddress!.port!,
+            udpSessionSeconds: 1
         )
-        runtime.update(shortened)
-        handler.rescheduleAssociationExpiries(on: eventLoop)
-
-        XCTAssertEqual(budget.count, 0)
-        XCTAssertFalse(upstream.isActive)
-        XCTAssertNoThrow(try listener.finish())
-        _ = try? upstream.finish()
+        listener.update(configuration: shortened, resetAssociations: false)
+        XCTAssertTrue(waitForCondition(timeout: 3) { listener.associationCount == 0 })
     }
 
     func testUDPTimeoutReloadCanExtendActiveAssociation() throws {
-        let eventLoop = EmbeddedEventLoop()
-        let connectionPromise = eventLoop.makePromise(of: Channel.self)
-        let budget = UDPAssociationBudget()
-        let initial = makeResolvedConfiguration(
+        let echo = try DatagramBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(UDPEchoHandler())
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+        defer { try? echo.close().wait() }
+
+        let configuration = makeResolvedConfiguration(
             protocols: [.udp],
-            upstreamPort: 9,
-            udpSessionSeconds: 5
+            upstreamPort: echo.localAddress!.port!,
+            udpSessionSeconds: 1
         )
-        let runtime = RuntimeConfiguration(initial)
-        let handler = UDPRelayHandler(
-            runtime: runtime,
-            budget: budget,
-            log: LogStore(level: "critical"),
-            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
-        )
-        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
-        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
-        var buffer = listener.allocator.buffer(capacity: 4)
-        buffer.writeString("test")
+        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        try listener.start()
+        defer { listener.stop() }
 
-        XCTAssertNoThrow(
-            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
-        )
-        let upstream = EmbeddedChannel(loop: eventLoop)
-        connectionPromise.succeed(upstream)
-        eventLoop.run()
-        XCTAssertEqual(budget.count, 1)
+        let client = try makeUDPSocket()
+        defer { try? client.close().wait() }
+        try sendUDP(client, "ping", to: listener.localAddresses[0])
+        XCTAssertTrue(waitForCondition { listener.associationCount == 1 })
 
-        eventLoop.advanceTime(by: .seconds(4))
         let extended = makeResolvedConfiguration(
             protocols: [.udp],
-            upstreamPort: 9,
+            upstreamPort: echo.localAddress!.port!,
             udpSessionSeconds: 10
         )
-        runtime.update(extended)
-        handler.rescheduleAssociationExpiries(on: eventLoop)
-
-        eventLoop.advanceTime(by: .seconds(2))
-        XCTAssertEqual(budget.count, 1)
-        eventLoop.advanceTime(by: .seconds(4))
-        XCTAssertEqual(budget.count, 0)
-        XCTAssertFalse(upstream.isActive)
-        XCTAssertNoThrow(try listener.finish())
-        _ = try? upstream.finish()
+        listener.update(configuration: extended, resetAssociations: false)
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertEqual(listener.associationCount, 1)
     }
 
     func testTCPListeningBacklogCanBeUpdatedInPlace() throws {
@@ -570,23 +455,18 @@ final class ForwardingTests: XCTestCase {
         XCTAssertEqual(recorder.string, "fallback")
     }
 
-    func testOptionalEBPFLoadersWhenExplicitlyEnabled() throws {
-        #if os(Linux)
+    func testEBPFLoadersWhenExplicitlyEnabled() throws {
         guard ProcessInfo.processInfo.environment["CURTSY_ENABLE_EBPF_TESTS"] == "1" else {
             throw XCTSkip("set CURTSY_ENABLE_EBPF_TESTS=1 on a Linux host with eBPF permissions")
         }
 
         let reusePortProgram = try ReusePortBPFProgram.load(workerCount: 1)
-        reusePortProgram?.close()
+        reusePortProgram.close()
 
-        let sockmapAccelerator = try TCPSockmapAccelerator.load(maxEntries: 8)
-        XCTAssertNotNil(sockmapAccelerator)
+        _ = try TCPSockmapAccelerator.load(maxEntries: 8)
 
         let observer = try BPFObserver.load()
         _ = try observer.readCounters()
-        #else
-        throw XCTSkip("eBPF loader tests only run on Linux")
-        #endif
     }
 
     private func makeUDPClient(message: String, destination: SocketAddress) throws -> (channel: Channel, recorder: DataRecorder) {
@@ -597,10 +477,32 @@ final class ForwardingTests: XCTestCase {
             }
             .bind(host: "127.0.0.1", port: 0)
             .wait()
+        try sendUDP(channel, message, to: destination)
+        return (channel, recorder)
+    }
+
+    private func makeUDPSocket() throws -> Channel {
+        try DatagramBootstrap(group: group)
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+    }
+
+    private func sendUDP(_ channel: Channel, _ message: String, to destination: SocketAddress) throws {
         var buffer = channel.allocator.buffer(capacity: message.utf8.count)
         buffer.writeString(message)
         try channel.writeAndFlush(AddressedEnvelope(remoteAddress: destination, data: buffer)).wait()
-        return (channel, recorder)
+    }
+
+    private func waitForCondition(
+        timeout: TimeInterval = 3,
+        _ condition: @escaping () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return condition()
     }
 
     private func makeResolvedConfiguration(

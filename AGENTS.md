@@ -6,9 +6,9 @@
 
 Curtsy 是一个使用 SwiftNIO 编写的 TCP/UDP 透明流量转发器（主要面向 Linux）。它在固定地址和端口上监听 TCP、UDP 或两种协议，并把流量转发到固定上游。当前版本只支持一条监听规则和一个上游，不终止 TLS、不检查流量内容、不记录转发数据正文。
 
-- 语言与工具链：Swift 6（`swift-tools-version: 6.0`），Swift Package Manager。`Package.swift` 声明了 `.macOS(.v13)` 平台以便在 macOS 上开发测试，eBPF 加速路径仅 Linux 生效，其他平台自动回退。
+- 语言与工具链：Swift 6（`swift-tools-version: 6.0`），Swift Package Manager。仅支持 Linux（代码无条件使用 Glibc 与 Linux 内核 API，不保留其他平台的编译期回退）。
 - 关键配置清单：`Package.swift`（包定义）、`Package.resolved`（依赖锁定）、`config.example.yaml`（配置示例）。
-- 运行时产物：单一可执行文件 `curtsy`（当前版本 1.0.0），无部署流水线、无 CI 配置、无容器文件，直接以二进制方式部署运行。
+- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.1.0），无 CI 配置、无容器文件；`debian/` 目录提供 Debian 打包（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。
 
 ## 构建与测试命令
 
@@ -44,12 +44,12 @@ SwiftPM 标准布局，共两个源 target 和一个测试 target：
 - `Sources/Curtsy/`：主可执行 target（同时作为库被测试 target `@testable import`）。
   - `CurtsyCommand.swift`：`@main` 入口，解析 `--config` / `--check-config`，引导日志系统。
   - `Configuration.swift`：YAML 配置模型（`ForwarderConfiguration`）、严格键白名单校验（未知键直接报错）与数值范围校验。所有超时单位为秒且必须大于零。
-  - `RuntimeSupport.swift`：`ResolvedConfiguration`（地址解析、回环判断）、`RuntimeConfiguration`（线程安全的配置快照）、`LogStore`（带原子阈值的日志门面）、`ChannelRegistry`（分片锁连接表）。
+  - `RuntimeSupport.swift`：`ResolvedConfiguration`（地址解析）、`RuntimeConfiguration`（线程安全的配置快照）、`LogStore`（带原子阈值的日志门面）、`ChannelRegistry`（分片锁连接表）。
   - `ForwarderService.swift`：服务编排器。持有 `MultiThreadedEventLoopGroup`（线程数 = CPU 核数），处理 `SIGHUP` 热加载与 `SIGINT`/`SIGTERM` 优雅退出（最多等待 `shutdownGraceSeconds`）。
   - `TCPForwarder.swift`：`TCPListener`（每事件循环一个 `SO_REUSEPORT` 监听 socket）、`TCPFrontendHandler` / `TCPRelayHandler`（双向 relay、背压、`IdleStateHandler` 空闲超时）、`TCPBufferBudget`（全局用户态缓冲预算，默认 256 MiB）。
-  - `UDPForwarder.swift`：`UDPListener` / `UDPRelayHandler`（按客户端四元组隔离的 UDP 会话、空闲回收、`maxUDPAssociations` 上限）、`UDPAssociationBudget`。
-  - `TCPSockmapAccelerator.swift` / `ReusePortBPF.swift`：eBPF 加速路径的 Swift 封装（sockmap 内核转发、reuseport 分流程序），仅 Linux 生效，其他平台返回 `nil`。
-- `Sources/CBPFSupport/`：C target，直接调用 `bpf()` syscall 加载 eBPF 程序并管理 `BPF_MAP_TYPE_SOCKHASH`，头文件在 `include/CBPFSupport.h`。Swift 侧通过它创建/配对/解除 sockmap 连接并查询空闲剩余时间。
+  - `UDPForwarder.swift`：`UDPListener` / `UDPRelayEngine`（独立 I/O 线程用 epoll 管理监听与上游 socket，`recvmmsg`/`sendmmsg` 批量收发，64 报文批次；按客户端四元组隔离会话，50ms 周期扫描空闲回收，`maxUDPAssociations` 上限）、`UDPAssociationBudget`。
+  - `TCPSockmapAccelerator.swift` / `ReusePortBPF.swift`：eBPF 加速路径的 Swift 封装（sockmap 内核转发、reuseport 分流程序）。loader 失败（无权限、内核不支持）时抛错，由调用方回退到用户态路径。
+- `Sources/CBPFSupport/`：C target，直接调用 `bpf()` syscall 加载 eBPF 程序并管理 `BPF_MAP_TYPE_SOCKHASH`，头文件在 `include/CBPFSupport.h`。Swift 侧通过它创建/配对/解除 sockmap 连接并查询空闲剩余时间；另封装 UDP 批量 I/O（`recvmmsg`/`sendmmsg`）与 epoll/eventfd/UDP socket 创建等类型敏感的原语，Swift 侧不直接碰这些 C 类型。
 - `Tests/CurtsyTests/`：XCTest 测试（见"测试策略"一节）。
 
 ## 运行时架构要点
@@ -57,7 +57,8 @@ SwiftPM 标准布局，共两个源 target 和一个测试 target：
 - 热加载（`SIGHUP`）：监听地址变化时先绑新端口再停旧监听；失败则整体回滚到旧配置。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 sockmap 模式时已有 TCP 连接保持原模式，UDP listener 和会话不受影响。
 - 优雅退出：先停止 accept，等待已有 TCP 连接，超时（`shutdownGraceSeconds`）后强制关闭。
 - TCP 性能：大块自适应读缓冲、批量 flush、水位线背压控制；多 worker 时通过 `SO_ATTACH_REUSEPORT_EBPF` 按连接四元组 hash 分流，失败时回退内核原生 `SO_REUSEPORT` hash。
-- sockmap 加速（`performance.tcpSockmapAcceleration`）：`enabled` / `disabled` / `auto`（默认，对回环上游禁用）。无权限或内核不支持时自动回退用户态 relay，不影响服务启动。sockmap 内核转发不占用用户态缓冲预算，BPF 记录双向最后活动时间，加速连接仍遵守 `tcpIdleSeconds`。
+- UDP 性能：独立 I/O 线程（`curtsy-udp-io`）用 epoll 驱动全部监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发；会话建立是同步的（UDP connect 无握手），不存在待转发缓冲窗口。
+- sockmap 加速（`performance.tcpSockmapAcceleration`）：`enabled` / `disabled` / `auto`（默认，对所有上游尝试启用，包括回环）。无权限或内核不支持时自动回退用户态 relay，不影响服务启动。sockmap 内核转发不占用用户态缓冲预算，BPF 记录双向最后活动时间，加速连接仍遵守 `tcpIdleSeconds`。
 - 并发约定：跨线程共享状态使用 `NIOLockedValueBox` 或 `ManagedAtomic`；事件循环上的可变状态只在对应 `EventLoop` 上访问；关键类标注 `@unchecked Sendable`。
 
 ## 代码风格约定
@@ -73,7 +74,7 @@ SwiftPM 标准布局，共两个源 target 和一个测试 target：
 - 使用 XCTest，测试通过 `@testable import Curtsy` 直接测内部类型，不走命令行。
 - `ConfigurationTests.swift`：配置默认值、覆盖、未知键拒绝、数值范围校验、地址解析与 sockmap 模式判断。
 - `ForwardingTests.swift`：基于 `MultiThreadedEventLoopGroup` 的真实回环网络测试（TCP/UDP 回显往返、缓冲预算、UDP 会话隔离与超时重载、backlog 原地更新、通配符双栈监听等），绑定 `127.0.0.1` 的 0 号端口，无需 root。
-- 测试通过依赖注入隔离系统依赖：`TCPListener` 可注入 `enableSockmapAcceleration` 和 `loadSockmapAccelerator`，`UDPRelayHandler` 可注入 `connectUpstream`，因此测试不触碰 eBPF。
+- 测试通过依赖注入隔离系统依赖：`TCPListener` 可注入 `enableSockmapAcceleration` 和 `loadSockmapAccelerator`，因此测试不触碰 eBPF；UDP 引擎直接跑真实回环收发。
 - 新增功能应附带同风格测试；修改转发逻辑后运行完整 `swift test`。
 
 ## 安全注意事项

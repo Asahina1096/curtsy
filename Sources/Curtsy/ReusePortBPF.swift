@@ -1,9 +1,6 @@
 import CBPFSupport
-import NIOCore
-
-#if os(Linux)
 import Glibc
-#endif
+import NIOCore
 
 enum ReusePortSocketOptions {
     static let reusePort = ChannelOptions.Types.SocketOption(
@@ -27,11 +24,7 @@ final class ReusePortBPFProgram {
         let verifierLog: String
 
         var description: String {
-            #if os(Linux)
             let reason = String(cString: Glibc.strerror(errorNumber))
-            #else
-            let reason = "not supported"
-            #endif
             guard !verifierLog.isEmpty else { return reason }
             return "\(reason); verifier=\(verifierLog)"
         }
@@ -43,8 +36,7 @@ final class ReusePortBPFProgram {
         self.descriptor = descriptor
     }
 
-    static func load(workerCount: Int) throws -> ReusePortBPFProgram? {
-        #if os(Linux)
+    static func load(workerCount: Int) throws -> ReusePortBPFProgram {
         var verifierLog = [CChar](repeating: 0, count: 64 * 1_024)
         let descriptor = verifierLog.withUnsafeMutableBufferPointer { buffer in
             curtsy_load_reuseport_bpf(UInt32(workerCount), buffer.baseAddress, buffer.count)
@@ -57,9 +49,6 @@ final class ReusePortBPFProgram {
             throw LoadError(errorNumber: errorNumber, verifierLog: message)
         }
         return ReusePortBPFProgram(descriptor: descriptor)
-        #else
-        return nil
-        #endif
     }
 
     func attach(to channel: Channel) throws {
@@ -74,12 +63,10 @@ final class ReusePortBPFProgram {
     }
 
     func close() {
-        #if os(Linux)
         if descriptor >= 0 {
             _ = Glibc.close(descriptor)
             descriptor = -1
         }
-        #endif
     }
 
     deinit {

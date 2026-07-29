@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 int32_t curtsy_socket_level(void);
 int32_t curtsy_so_reuseport(void);
@@ -67,5 +68,58 @@ int32_t curtsy_bpf_observer_read(
     curtsy_bpf_observer *observer,
     curtsy_bpf_observer_counters *counters
 );
+
+// Batched UDP I/O. One slot describes a single datagram buffer: the caller
+// fills data/capacity, recv fills length and the source address.
+typedef struct curtsy_udp_slot {
+    uint8_t *data;
+    uint32_t capacity;
+    uint32_t length;
+    struct sockaddr_storage address;
+    socklen_t address_length;
+} curtsy_udp_slot;
+
+// Receives up to max_slots datagrams from fd (nonblocking) into slots.
+// Returns the datagram count, 0 when the socket would block, or -1 with
+// errno set for other errors.
+int32_t curtsy_udp_recv_batch(int fd, curtsy_udp_slot *slots, uint32_t max_slots);
+
+// Sends count datagrams described by slots (data/length only) to address.
+// Pass address == NULL for connected sockets. Returns the number of
+// datagrams handed to the kernel, or -1 with errno set.
+int32_t curtsy_udp_send_batch(
+    int fd,
+    const struct sockaddr *address,
+    socklen_t address_length,
+    const curtsy_udp_slot *slots,
+    uint32_t count
+);
+
+// Minimal event-loop primitives for the batched UDP transport, kept in C so
+// the Swift side never touches epoll/eventfd/socket type details.
+// All returned fds are nonblocking and close-on-exec; every function returns
+// -1 with errno set on failure.
+
+int32_t curtsy_epoll_create(void);
+int32_t curtsy_epoll_add(int32_t epoll_fd, int32_t fd);
+// Fills ready_fds and returns the number of ready fds (0 on timeout).
+int32_t curtsy_epoll_wait(int32_t epoll_fd, int32_t *ready_fds, uint32_t max_fds, int32_t timeout_ms);
+
+int32_t curtsy_eventfd_create(void);
+void curtsy_eventfd_signal(int32_t fd);
+void curtsy_eventfd_drain(int32_t fd);
+
+// Creates a bound datagram socket for address. Sets SO_REUSEADDR and, for
+// AF_INET6, IPV6_V6ONLY. On success the bound address (getsockname) is stored
+// in bound/bound_length and the fd is returned.
+int32_t curtsy_udp_listen_socket(
+    const struct sockaddr *address,
+    socklen_t address_length,
+    struct sockaddr_storage *bound,
+    socklen_t *bound_length
+);
+
+// Creates a datagram socket connected to address (default destination).
+int32_t curtsy_udp_upstream_socket(const struct sockaddr *address, socklen_t address_length);
 
 #endif

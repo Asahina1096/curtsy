@@ -1,6 +1,8 @@
+import CBPFSupport
+import Foundation
+import Glibc
 import NIOConcurrencyHelpers
 import NIOCore
-import NIOPosix
 
 final class UDPAssociationBudget: @unchecked Sendable {
     private let used = NIOLockedValueBox(0)
@@ -25,459 +27,461 @@ final class UDPAssociationBudget: @unchecked Sendable {
 }
 
 final class UDPListener: @unchecked Sendable {
-    private let group: EventLoopGroup
     private let runtime: RuntimeConfiguration
-    private let log: LogStore
-    private let associationBudget = UDPAssociationBudget()
-    private var listenerChannels: [Channel] = []
-    private var handlers: [UDPRelayHandler] = []
+    private let engine: UDPRelayEngine
 
     init(group: EventLoopGroup, configuration: ResolvedConfiguration, log: LogStore) {
-        self.group = group
+        // The batched transport runs its own I/O thread instead of event loop
+        // channels; the group parameter only keeps call sites unchanged.
+        _ = group
         runtime = RuntimeConfiguration(configuration)
-        self.log = log
+        engine = UDPRelayEngine(runtime: runtime, log: log)
     }
 
     func start() throws {
-        let resolved = runtime.current()
-        var bound: [Channel] = []
-        var installedHandlers: [UDPRelayHandler] = []
-
-        do {
-            for listenAddress in resolved.listenAddresses {
-                let handler = UDPRelayHandler(runtime: runtime, budget: associationBudget, log: log)
-                var bootstrap = DatagramBootstrap(group: group)
-                    .channelOption(.socketOption(.so_reuseaddr), value: 1)
-                    .channelInitializer { channel in
-                        channel.pipeline.addHandler(handler)
-                    }
-                if case .v6 = listenAddress {
-                    bootstrap = bootstrap.channelOption(
-                        ChannelOptions.Types.SocketOption(level: .ipv6, name: .ipv6_v6only),
-                        value: 1
-                    )
-                }
-
-                let channel = try bootstrap.bind(to: listenAddress).wait()
-                bound.append(channel)
-                installedHandlers.append(handler)
-                log.info("udp listening on \(channel.localAddress?.curtsyDescription ?? listenAddress.curtsyDescription)")
-            }
-            listenerChannels = bound
-            handlers = installedHandlers
-        } catch {
-            for channel in bound { try? channel.close().wait() }
-            throw error
-        }
+        try engine.start()
     }
 
     func update(configuration: ResolvedConfiguration, resetAssociations: Bool) {
-        let timeoutChanged = runtime.current().configuration.timeouts.udpSessionSeconds
-            != configuration.configuration.timeouts.udpSessionSeconds
+        // Timeout changes apply on the engine's next expiry sweep, which reads
+        // the current snapshot; only upstream changes need association resets.
         runtime.update(configuration)
-        guard resetAssociations || timeoutChanged else { return }
-        let pairs = Array(zip(listenerChannels, handlers))
-        for (channel, handler) in pairs {
-            let promise = channel.eventLoop.makePromise(of: Void.self)
-            channel.eventLoop.execute {
-                if resetAssociations {
-                    handler.resetAssociations()
-                } else {
-                    handler.rescheduleAssociationExpiries(on: channel.eventLoop)
-                }
-                promise.succeed(())
-            }
-            try? promise.futureResult.wait()
+        if resetAssociations {
+            engine.resetAssociations()
         }
     }
 
-    var localAddresses: [SocketAddress] {
-        listenerChannels.compactMap(\.localAddress)
-    }
+    var localAddresses: [SocketAddress] { engine.localAddresses }
 
-    var associationCount: Int { associationBudget.count }
+    var associationCount: Int { engine.associationCount }
 
     func stop() {
-        let pairs = Array(zip(listenerChannels, handlers))
-        listenerChannels.removeAll()
-        handlers.removeAll()
-        for (channel, handler) in pairs {
-            channel.eventLoop.execute { handler.resetAssociations() }
-            try? channel.close().wait()
-        }
+        engine.stop()
     }
 }
 
-typealias UDPUpstreamConnector = (
-    EventLoop,
-    SocketAddress,
-    Channel,
-    SocketAddress,
-    LogStore,
-    @escaping @Sendable () -> Void
-) -> EventLoopFuture<Channel>
-
-final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = AddressedEnvelope<ByteBuffer>
-
-    private struct ActiveAssociation {
-        let identifier: UInt64
-        let channel: Channel
-        var lastActivity: NIODeadline
-        var expiry: Scheduled<Void>
+// Batched UDP relay: one I/O thread polls all listen and upstream sockets
+// with epoll and moves datagrams with recvmmsg/sendmmsg batches. UDP connect
+// is synchronous, so associations are established on the first datagram with
+// no pending-buffer window.
+final class UDPRelayEngine: @unchecked Sendable {
+    private enum Command {
+        case stop
+        case resetAssociations
     }
 
-    private struct PendingAssociation {
-        let generation: UInt64
-        let identifier: UInt64
-        var buffers: [ByteBuffer]
-        var bufferedBytes: Int
+    private struct Association {
+        let client: SocketAddress
+        let clientAddress: sockaddr_storage
+        let clientAddressLength: socklen_t
+        let listenFD: Int32
+        let upstreamFD: Int32
+        var lastActivityMilliseconds: UInt64
     }
+
+    private static let batchSize = 64
+    private static let datagramCapacity = 65_536
+    private static let sweepIntervalMilliseconds: Int32 = 50
 
     private let runtime: RuntimeConfiguration
-    private let budget: UDPAssociationBudget
     private let log: LogStore
-    private let connectUpstream: UDPUpstreamConnector
-    private var active: [SocketAddress: ActiveAssociation] = [:]
-    private var pending: [SocketAddress: PendingAssociation] = [:]
-    private weak var listenerChannel: Channel?
+    private let budget = UDPAssociationBudget()
+    private let pendingCommands = NIOLockedValueBox<[Command]>([])
+    // running is set before the I/O thread starts and cleared in its defer
+    // before teardown; the wake fd stays open until stop() joins the thread,
+    // so a signal write can never land on a closed or reused descriptor.
+    private let lifecycle = NIOLockedValueBox(false)
+    private let finishSignal = DispatchSemaphore(value: 0)
+    private let boundAddresses = NIOLockedValueBox<[SocketAddress]>([])
+
+    // I/O-thread-confined state below; only touched from run() and its callees,
+    // except the fds created in start() before the thread spawns.
+    private var epollFD: Int32 = -1
+    private var wakeFD: Int32 = -1
+    private var listenFDs: [Int32] = []
+    private var associations: [SocketAddress: Association] = [:]
+    private var upstreamToClient: [Int32: SocketAddress] = [:]
     private var warnedAtLimit = false
-    private var warnedPendingOverflow = false
-    private var generation: UInt64 = 0
-    private var nextAssociationIdentifier: UInt64 = 0
 
-    init(
-        runtime: RuntimeConfiguration,
-        budget: UDPAssociationBudget,
-        log: LogStore,
-        connectUpstream: @escaping UDPUpstreamConnector = UDPRelayHandler.makeUpstreamConnection
-    ) {
+    init(runtime: RuntimeConfiguration, log: LogStore) {
         self.runtime = runtime
-        self.budget = budget
         self.log = log
-        self.connectUpstream = connectUpstream
     }
 
-    func handlerAdded(context: ChannelHandlerContext) {
-        listenerChannel = context.channel
-    }
+    var localAddresses: [SocketAddress] { boundAddresses.withLockedValue { $0 } }
 
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let envelope = unwrapInboundIn(data)
-        let client = envelope.remoteAddress
+    var associationCount: Int { budget.count }
 
-        if let association = active[client] {
-            refreshAssociation(
-                client: client,
-                identifier: association.identifier,
-                on: context.eventLoop
-            )
-            association.channel.writeAndFlush(envelope.data).whenFailure { [log] error in
-                log.error("udp upstream write failed client=\(client.curtsyDescription) error=\(error)")
-            }
-            return
-        }
-
-        if var association = pending[client] {
-            guard appendPendingDatagram(envelope.data, to: &association) else {
-                if !warnedPendingOverflow {
-                    warnedPendingOverflow = true
-                    let limits = runtime.current().configuration.limits
-                    log.warning(
-                        "udp pending association buffer limit reached "
-                            + "max_datagrams=\(limits.maxUDPPendingDatagrams) "
-                            + "max_bytes=\(limits.maxUDPPendingBytes)"
-                    )
-                }
-                return
-            }
-            pending[client] = association
-            return
-        }
-
+    func start() throws {
         let snapshot = runtime.current()
-        let firstDatagramBytes = envelope.data.readableBytes
-        guard firstDatagramBytes <= snapshot.configuration.limits.maxUDPPendingBytes else {
-            if !warnedPendingOverflow {
-                warnedPendingOverflow = true
-                log.warning(
-                    "udp pending association buffer limit reached "
-                        + "max_datagrams=\(snapshot.configuration.limits.maxUDPPendingDatagrams) "
-                        + "max_bytes=\(snapshot.configuration.limits.maxUDPPendingBytes)"
+        var addresses: [SocketAddress] = []
+        var createdFDs: [Int32] = []
+        var epollFD: Int32 = -1
+        var wakeFD: Int32 = -1
+
+        do {
+            for listenAddress in snapshot.listenAddresses {
+                let fd = try listenAddress.withSockAddr { pointer, length in
+                    var bound = sockaddr_storage()
+                    var boundLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+                    let fd = curtsy_udp_listen_socket(pointer, socklen_t(length), &bound, &boundLength)
+                    guard fd >= 0 else {
+                        throw IOError(errnoCode: errno, reason: "udp listen socket")
+                    }
+                    guard let boundAddress = Self.socketAddress(from: bound) else {
+                        Glibc.close(fd)
+                        throw IOError(errnoCode: EAFNOSUPPORT, reason: "udp listen address family")
+                    }
+                    addresses.append(boundAddress)
+                    return fd
+                }
+                createdFDs.append(fd)
+                log.info("udp listening on \(addresses.last?.curtsyDescription ?? listenAddress.curtsyDescription)")
+            }
+
+            epollFD = curtsy_epoll_create()
+            guard epollFD >= 0 else {
+                throw IOError(errnoCode: errno, reason: "epoll_create1")
+            }
+            wakeFD = curtsy_eventfd_create()
+            guard wakeFD >= 0 else {
+                throw IOError(errnoCode: errno, reason: "eventfd")
+            }
+            guard curtsy_epoll_add(epollFD, wakeFD) == 0 else {
+                throw IOError(errnoCode: errno, reason: "epoll add wake fd")
+            }
+            for fd in createdFDs {
+                guard curtsy_epoll_add(epollFD, fd) == 0 else {
+                    throw IOError(errnoCode: errno, reason: "epoll add listen socket")
+                }
+            }
+        } catch {
+            for fd in createdFDs { Glibc.close(fd) }
+            if epollFD >= 0 { Glibc.close(epollFD) }
+            if wakeFD >= 0 { Glibc.close(wakeFD) }
+            throw error
+        }
+
+        self.epollFD = epollFD
+        self.wakeFD = wakeFD
+        listenFDs = createdFDs
+        boundAddresses.withLockedValue { $0 = addresses }
+        lifecycle.withLockedValue { $0 = true }
+
+        let thread = Thread { [weak self] in self?.run() }
+        thread.name = "curtsy-udp-io"
+        thread.start()
+    }
+
+    func resetAssociations() {
+        enqueue(.resetAssociations)
+    }
+
+    func stop() {
+        let wasRunning = lifecycle.withLockedValue { running -> Bool in
+            defer { running = false }
+            return running
+        }
+        guard wasRunning else { return }
+        enqueue(.stop)
+        finishSignal.wait()
+        boundAddresses.withLockedValue { $0 = [] }
+    }
+
+    private func enqueue(_ command: Command) {
+        pendingCommands.withLockedValue { $0.append(command) }
+        let running = lifecycle.withLockedValue { $0 }
+        if running, wakeFD >= 0 {
+            curtsy_eventfd_signal(wakeFD)
+        }
+    }
+
+    private func run() {
+        defer {
+            lifecycle.withLockedValue { $0 = false }
+            teardown()
+            finishSignal.signal()
+        }
+
+        let bufferBase = UnsafeMutablePointer<UInt8>.allocate(
+            capacity: Self.batchSize * Self.datagramCapacity
+        )
+        defer { bufferBase.deallocate() }
+        var recvSlots = [curtsy_udp_slot](repeating: curtsy_udp_slot(), count: Self.batchSize)
+        for index in 0..<Self.batchSize {
+            recvSlots[index].data = bufferBase.advanced(by: index * Self.datagramCapacity)
+            recvSlots[index].capacity = UInt32(Self.datagramCapacity)
+        }
+        var sendSlots = [curtsy_udp_slot](repeating: curtsy_udp_slot(), count: Self.batchSize)
+        var readyFDs = [Int32](repeating: -1, count: Self.batchSize + 1)
+
+        while true {
+            let ready = readyFDs.withUnsafeMutableBufferPointer { buffer in
+                curtsy_epoll_wait(
+                    epollFD,
+                    buffer.baseAddress,
+                    UInt32(buffer.count),
+                    Self.sweepIntervalMilliseconds
                 )
             }
-            return
+            if ready < 0 {
+                log.error("udp event wait failed error=\(Self.errnoDescription())")
+            }
+
+            let commands = pendingCommands.withLockedValue { pending -> [Command] in
+                let drained = pending
+                pending = []
+                return drained
+            }
+            for command in commands {
+                switch command {
+                case .stop:
+                    return
+                case .resetAssociations:
+                    closeAllAssociations()
+                }
+            }
+
+            if ready > 0 {
+                for fd in readyFDs.prefix(Int(ready)) {
+                    if fd == wakeFD {
+                        curtsy_eventfd_drain(wakeFD)
+                    } else if upstreamToClient[fd] != nil {
+                        drainUpstream(fd: fd, slots: &recvSlots)
+                    } else {
+                        drainListen(fd: fd, slots: &recvSlots, sendSlots: &sendSlots)
+                    }
+                }
+            }
+            sweepExpiredAssociations()
         }
+    }
+
+    private func teardown() {
+        closeAllAssociations()
+        for fd in listenFDs { Glibc.close(fd) }
+        listenFDs = []
+        if epollFD >= 0 { Glibc.close(epollFD) }
+        if wakeFD >= 0 { Glibc.close(wakeFD) }
+        epollFD = -1
+        wakeFD = -1
+    }
+
+    private func drainListen(
+        fd: Int32,
+        slots: inout [curtsy_udp_slot],
+        sendSlots: inout [curtsy_udp_slot]
+    ) {
+        slots.withUnsafeMutableBufferPointer { slotBuffer in
+            sendSlots.withUnsafeMutableBufferPointer { sendBuffer in
+                while true {
+                    let received = curtsy_udp_recv_batch(
+                        fd,
+                        slotBuffer.baseAddress,
+                        UInt32(Self.batchSize)
+                    )
+                    if received == 0 { return }
+                    if received < 0 {
+                        log.error("udp listener read failed error=\(Self.errnoDescription())")
+                        return
+                    }
+                    forwardClientDatagrams(
+                        count: Int(received),
+                        listenFD: fd,
+                        slots: slotBuffer,
+                        sendSlots: sendBuffer
+                    )
+                }
+            }
+        }
+    }
+
+    private func forwardClientDatagrams(
+        count: Int,
+        listenFD: Int32,
+        slots: UnsafeMutableBufferPointer<curtsy_udp_slot>,
+        sendSlots: UnsafeMutableBufferPointer<curtsy_udp_slot>
+    ) {
+        guard let slotBase = slots.baseAddress, let sendBase = sendSlots.baseAddress else { return }
+        var runFD: Int32 = -1
+        var runLength = 0
+        for index in 0..<count {
+            let slot = slotBase[index]
+            guard let client = Self.socketAddress(from: slot.address) else { continue }
+            let association = associations[client]
+                ?? openAssociation(
+                    client: client,
+                    clientAddress: slot.address,
+                    clientAddressLength: slot.address_length,
+                    listenFD: listenFD
+                )
+            guard let association else { continue }
+            associations[client]?.lastActivityMilliseconds = Self.monotonicMilliseconds()
+            if association.upstreamFD != runFD {
+                if runLength > 0 {
+                    _ = curtsy_udp_send_batch(runFD, nil, 0, sendBase, UInt32(runLength))
+                }
+                runFD = association.upstreamFD
+                runLength = 0
+            }
+            sendBase[runLength].data = slot.data
+            sendBase[runLength].length = slot.length
+            runLength += 1
+        }
+        if runLength > 0 {
+            _ = curtsy_udp_send_batch(runFD, nil, 0, sendBase, UInt32(runLength))
+        }
+    }
+
+    private func drainUpstream(fd: Int32, slots: inout [curtsy_udp_slot]) {
+        guard
+            let client = upstreamToClient[fd],
+            let association = associations[client]
+        else { return }
+        slots.withUnsafeMutableBufferPointer { slotBuffer in
+            while true {
+                let received = curtsy_udp_recv_batch(
+                    fd,
+                    slotBuffer.baseAddress,
+                    UInt32(Self.batchSize)
+                )
+                if received == 0 { return }
+                if received < 0 {
+                    log.error(
+                        "udp upstream error client=\(client.curtsyDescription) "
+                            + "error=\(Self.errnoDescription())"
+                    )
+                    closeAssociation(client: client)
+                    return
+                }
+                associations[client]?.lastActivityMilliseconds = Self.monotonicMilliseconds()
+                var clientAddress = association.clientAddress
+                let sent = withUnsafePointer(to: &clientAddress) { storagePointer in
+                    storagePointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address in
+                        curtsy_udp_send_batch(
+                            association.listenFD,
+                            address,
+                            association.clientAddressLength,
+                            slotBuffer.baseAddress,
+                            UInt32(received)
+                        )
+                    }
+                }
+                if sent < 0, errno != EAGAIN, errno != EWOULDBLOCK {
+                    log.error(
+                        "udp client write failed client=\(client.curtsyDescription) "
+                            + "error=\(Self.errnoDescription())"
+                    )
+                }
+            }
+        }
+    }
+
+    private func openAssociation(
+        client: SocketAddress,
+        clientAddress: sockaddr_storage,
+        clientAddressLength: socklen_t,
+        listenFD: Int32
+    ) -> Association? {
+        let snapshot = runtime.current()
         guard budget.tryAcquire(limit: snapshot.configuration.limits.maxUDPAssociations) else {
             if !warnedAtLimit {
                 warnedAtLimit = true
                 log.warning("udp association limit reached limit=\(snapshot.configuration.limits.maxUDPAssociations)")
             }
-            return
+            return nil
         }
-
-        let pendingGeneration = generation
-        nextAssociationIdentifier &+= 1
-        let associationIdentifier = nextAssociationIdentifier
-        pending[client] = PendingAssociation(
-            generation: pendingGeneration,
-            identifier: associationIdentifier,
-            buffers: [envelope.data],
-            bufferedBytes: firstDatagramBytes
-        )
-        let eventLoop = context.eventLoop
-        let recordUpstreamActivity: @Sendable () -> Void = { [weak self] in
-            guard let self else { return }
-            if eventLoop.inEventLoop {
-                refreshAssociation(
-                    client: client,
-                    identifier: associationIdentifier,
-                    on: eventLoop
-                )
-                return
-            }
-            eventLoop.execute { [self] in
-                refreshAssociation(
-                    client: client,
-                    identifier: associationIdentifier,
-                    on: eventLoop
-                )
-            }
-        }
-        connectUpstream(
-            eventLoop,
-            snapshot.upstreamAddress,
-            context.channel,
-            client,
-            log,
-            recordUpstreamActivity
-        ).whenComplete { [weak self] result in
-            guard let self else {
-                if case .success(let channel) = result {
-                    channel.close(promise: nil)
+        do {
+            let upstreamFD = try snapshot.upstreamAddress.withSockAddr { pointer, length in
+                let fd = curtsy_udp_upstream_socket(pointer, socklen_t(length))
+                guard fd >= 0 else {
+                    throw IOError(errnoCode: errno, reason: "udp upstream socket")
                 }
-                return
+                return fd
             }
-            guard
-                self.generation == pendingGeneration,
-                self.pending[client]?.generation == pendingGeneration,
-                self.pending[client]?.identifier == associationIdentifier
-            else {
-                if case .success(let channel) = result {
-                    channel.close(promise: nil)
-                }
-                return
+            guard curtsy_epoll_add(epollFD, upstreamFD) == 0 else {
+                let errorNumber = errno
+                Glibc.close(upstreamFD)
+                throw IOError(errnoCode: errorNumber, reason: "epoll add upstream socket")
             }
-
-            let pendingAssociation = self.pending.removeValue(forKey: client)
-            let buffers = pendingAssociation?.buffers ?? []
-            switch result {
-            case .success(let channel):
-                let lastActivity = eventLoop.now
-                let deadline = self.expirationDeadline(lastActivity: lastActivity)
-                let expiry = self.scheduleExpiry(
-                    client: client,
-                    identifier: associationIdentifier,
-                    deadline: deadline,
-                    on: eventLoop
-                )
-                self.active[client] = ActiveAssociation(
-                    identifier: associationIdentifier,
-                    channel: channel,
-                    lastActivity: lastActivity,
-                    expiry: expiry
-                )
-                self.warnedAtLimit = false
-                self.warnedPendingOverflow = false
-                channel.closeFuture.whenComplete { [weak self, weak channel] _ in
-                    guard let self, let channel else { return }
-                    eventLoop.execute {
-                        if self.active[client]?.channel === channel {
-                            self.active.removeValue(forKey: client)?.expiry.cancel()
-                            self.budget.release()
-                            self.warnedAtLimit = false
-                            self.warnedPendingOverflow = false
-                        }
-                    }
-                }
-                for buffer in buffers {
-                    channel.writeAndFlush(buffer).whenFailure { [log = self.log] error in
-                        log.error("udp upstream write failed client=\(client.curtsyDescription) error=\(error)")
-                    }
-                }
-                self.log.debug("udp association opened client=\(client.curtsyDescription) upstream=\(snapshot.upstreamAddress.curtsyDescription)")
-            case .failure(let error):
-                self.budget.release()
-                self.warnedAtLimit = false
-                self.warnedPendingOverflow = false
-                self.log.error("udp association failed client=\(client.curtsyDescription) error=\(error)")
-            }
-        }
-    }
-
-    func channelInactive(context: ChannelHandlerContext) {
-        resetAssociations()
-        context.fireChannelInactive()
-    }
-
-    func errorCaught(context: ChannelHandlerContext, error: Error) {
-        log.error("udp listener error error=\(error)")
-    }
-
-    func resetAssociations() {
-        generation &+= 1
-        let releasedCount = active.count + pending.count
-        for association in active.values {
-            association.expiry.cancel()
-            association.channel.close(promise: nil)
-        }
-        active.removeAll()
-        pending.removeAll()
-        budget.release(releasedCount)
-        warnedAtLimit = false
-        warnedPendingOverflow = false
-    }
-
-    func rescheduleAssociationExpiries(on eventLoop: EventLoop) {
-        eventLoop.assertInEventLoop()
-        let now = eventLoop.now
-        for client in Array(active.keys) {
-            guard var association = active[client] else { continue }
-            association.expiry.cancel()
-            let deadline = expirationDeadline(lastActivity: association.lastActivity)
-            if deadline <= now {
-                expireAssociation(client: client, identifier: association.identifier)
-                continue
-            }
-            association.expiry = scheduleExpiry(
+            let association = Association(
                 client: client,
-                identifier: association.identifier,
-                deadline: deadline,
-                on: eventLoop
+                clientAddress: clientAddress,
+                clientAddressLength: clientAddressLength,
+                listenFD: listenFD,
+                upstreamFD: upstreamFD,
+                lastActivityMilliseconds: Self.monotonicMilliseconds()
             )
-            active[client] = association
+            associations[client] = association
+            upstreamToClient[upstreamFD] = client
+            warnedAtLimit = false
+            log.debug(
+                "udp association opened client=\(client.curtsyDescription) "
+                    + "upstream=\(snapshot.upstreamAddress.curtsyDescription)"
+            )
+            return association
+        } catch {
+            budget.release()
+            log.error("udp association failed client=\(client.curtsyDescription) error=\(error)")
+            return nil
         }
     }
 
-    private func scheduleExpiry(
-        client: SocketAddress,
-        identifier: UInt64,
-        deadline: NIODeadline,
-        on eventLoop: EventLoop
-    ) -> Scheduled<Void> {
-        return eventLoop.scheduleTask(deadline: deadline) { [weak self] in
-            self?.expireAssociation(client: client, identifier: identifier)
-        }
-    }
-
-    private func expirationDeadline(lastActivity: NIODeadline) -> NIODeadline {
-        let seconds = runtime.current().configuration.timeouts.udpSessionSeconds
-        return lastActivity + .seconds(Int64(seconds))
-    }
-
-    private func expireAssociation(client: SocketAddress, identifier: UInt64) {
-        guard
-            active[client]?.identifier == identifier,
-            let association = active.removeValue(forKey: client)
-        else { return }
-        association.channel.close(promise: nil)
+    private func closeAssociation(client: SocketAddress) {
+        guard let association = associations.removeValue(forKey: client) else { return }
+        upstreamToClient.removeValue(forKey: association.upstreamFD)
+        Glibc.close(association.upstreamFD)
         budget.release()
         warnedAtLimit = false
-        warnedPendingOverflow = false
-        log.debug("udp association expired client=\(client.curtsyDescription)")
     }
 
-    private func appendPendingDatagram(
-        _ buffer: ByteBuffer,
-        to association: inout PendingAssociation
-    ) -> Bool {
-        let limits = runtime.current().configuration.limits
-        guard association.buffers.count < limits.maxUDPPendingDatagrams else {
-            return false
+    private func closeAllAssociations() {
+        for client in Array(associations.keys) {
+            closeAssociation(client: client)
         }
-        let byteCount = buffer.readableBytes
-        guard
-            association.bufferedBytes <= limits.maxUDPPendingBytes,
-            byteCount <= limits.maxUDPPendingBytes - association.bufferedBytes
-        else {
-            return false
+    }
+
+    private func sweepExpiredAssociations() {
+        let timeoutSeconds = runtime.current().configuration.timeouts.udpSessionSeconds
+        let timeoutMilliseconds = UInt64(max(1, timeoutSeconds)) * 1_000
+        let now = Self.monotonicMilliseconds()
+        for client in Array(associations.keys) {
+            guard
+                let association = associations[client],
+                now &- association.lastActivityMilliseconds >= timeoutMilliseconds
+            else { continue }
+            log.debug("udp association expired client=\(client.curtsyDescription)")
+            closeAssociation(client: client)
         }
-        association.buffers.append(buffer)
-        association.bufferedBytes += byteCount
-        return true
     }
 
-    private func refreshAssociation(client: SocketAddress, identifier: UInt64, on eventLoop: EventLoop) {
-        guard var association = active[client], association.identifier == identifier else { return }
-        association.expiry.cancel()
-        association.lastActivity = eventLoop.now
-        let deadline = expirationDeadline(lastActivity: association.lastActivity)
-        association.expiry = scheduleExpiry(
-            client: client,
-            identifier: identifier,
-            deadline: deadline,
-            on: eventLoop
-        )
-        active[client] = association
+    private static func monotonicMilliseconds() -> UInt64 {
+        var time = timespec()
+        clock_gettime(CLOCK_MONOTONIC, &time)
+        return UInt64(time.tv_sec) * 1_000 + UInt64(time.tv_nsec) / 1_000_000
     }
 
-    private static func makeUpstreamConnection(
-        eventLoop: EventLoop,
-        upstreamAddress: SocketAddress,
-        listener: Channel,
-        clientAddress: SocketAddress,
-        log: LogStore,
-        recordActivity: @escaping @Sendable () -> Void
-    ) -> EventLoopFuture<Channel> {
-        let upstreamHandler = UDPUpstreamHandler(
-            listener: listener,
-            clientAddress: clientAddress,
-            log: log,
-            recordActivity: recordActivity
-        )
-        let bootstrap = DatagramBootstrap(group: eventLoop)
-            .channelOption(.autoRead, value: false)
-            .channelInitializer { channel in
-                channel.pipeline.addHandler(upstreamHandler)
+    private static func errnoDescription() -> String {
+        String(cString: strerror(errno))
+    }
+
+    private static func socketAddress(from storage: sockaddr_storage) -> SocketAddress? {
+        var storage = storage
+        switch Int32(storage.ss_family) {
+        case AF_INET:
+            return withUnsafePointer(to: &storage) { pointer in
+                pointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    SocketAddress($0.pointee)
+                }
             }
-
-        return bootstrap.connect(to: upstreamAddress).flatMap { channel in
-            channel.setOption(.autoRead, value: true).map { channel }
+        case AF_INET6:
+            return withUnsafePointer(to: &storage) { pointer in
+                pointer.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                    SocketAddress($0.pointee)
+                }
+            }
+        default:
+            return nil
         }
-    }
-}
-
-private final class UDPUpstreamHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = AddressedEnvelope<ByteBuffer>
-
-    private let listener: Channel
-    private let clientAddress: SocketAddress
-    private let log: LogStore
-    private let recordActivity: @Sendable () -> Void
-
-    init(
-        listener: Channel,
-        clientAddress: SocketAddress,
-        log: LogStore,
-        recordActivity: @escaping @Sendable () -> Void
-    ) {
-        self.listener = listener
-        self.clientAddress = clientAddress
-        self.log = log
-        self.recordActivity = recordActivity
-    }
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let upstreamEnvelope = unwrapInboundIn(data)
-        recordActivity()
-        let response = AddressedEnvelope(remoteAddress: clientAddress, data: upstreamEnvelope.data)
-        listener.writeAndFlush(response).whenFailure { [log] error in
-            log.error("udp client write failed client=\(self.clientAddress.curtsyDescription) error=\(error)")
-        }
-    }
-
-    func errorCaught(context: ChannelHandlerContext, error: Error) {
-        log.error("udp upstream error client=\(clientAddress.curtsyDescription) error=\(error)")
-        context.close(promise: nil)
     }
 }

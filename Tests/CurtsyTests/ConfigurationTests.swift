@@ -256,25 +256,25 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertNotNil(hostname.upstreamAddress.port)
     }
 
-    func testSockmapAutoDisablesLoopbackAndEnablesRemoteUpstreams() throws {
+    func testSockmapAutoEnablesLoopbackAndRemoteUpstreams() throws {
         let ipv4 = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "127.42.0.1"))
-        XCTAssertFalse(ipv4.shouldEnableTCPSockmap)
+        XCTAssertTrue(ipv4.shouldEnableTCPSockmap)
 
         let ipv6 = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "::1"))
-        XCTAssertFalse(ipv6.shouldEnableTCPSockmap)
+        XCTAssertTrue(ipv6.shouldEnableTCPSockmap)
 
         let hostname = try ResolvedConfiguration.resolve(
             makeConfiguration(upstreamHost: "loopback.internal")
         ) { _, port in
             try SocketAddress(ipAddress: "127.0.0.1", port: port)
         }
-        XCTAssertFalse(hostname.shouldEnableTCPSockmap)
+        XCTAssertTrue(hostname.shouldEnableTCPSockmap)
 
         let remote = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "192.0.2.1"))
         XCTAssertTrue(remote.shouldEnableTCPSockmap)
     }
 
-    func testSockmapExplicitModesOverrideAddressSelection() throws {
+    func testSockmapExplicitModesOverrideAuto() throws {
         var enabled = makeConfiguration(upstreamHost: "127.0.0.1")
         enabled.performance = PerformanceConfiguration(tcpSockmapAcceleration: .enabled)
         XCTAssertTrue(try ResolvedConfiguration.resolve(enabled).shouldEnableTCPSockmap)
