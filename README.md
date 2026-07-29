@@ -56,7 +56,21 @@ TCP 转发路径使用大块自适应读取、批量 flush 和背压控制，目
 ## 配置约束
 
 - 当前版本只支持一条监听规则和一个上游。
-- 所有超时单位均为秒且必须大于零。
+- 所有超时单位均为秒，必须大于零，且不能超过 `9223372036` 秒。
 - UDP 会话按客户端 IP 与端口隔离，空闲超过 `udpSessionSeconds` 后回收。
 - 达到 `maxUDPAssociations` 后，新 UDP 客户端会被丢弃，已有会话不受影响。
+- UDP 客户端在上游 socket 建立完成前的待转发数据受
+  `maxUDPPendingDatagrams` 和 `maxUDPPendingBytes` 限制；超出后会丢弃新的待发送数据，避免单客户端在上游慢连接或异常时持续占用内存。
 - 程序不会终止 TLS、检查流量内容或记录转发数据正文。
+
+## 测试
+
+```bash
+swift test
+```
+
+默认测试不要求 eBPF 权限。若要在具备权限的 Linux 主机上显式验证 eBPF loader，可运行：
+
+```bash
+CURTSY_ENABLE_EBPF_TESTS=1 swift test --filter ForwardingTests.testOptionalEBPFLoadersWhenExplicitlyEnabled
+```

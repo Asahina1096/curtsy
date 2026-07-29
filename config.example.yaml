@@ -19,6 +19,8 @@ limits:
   tcpListenBacklog: 4096
   maxTCPBufferedBytes: 268435456
   maxUDPAssociations: 4096
+  maxUDPPendingDatagrams: 64
+  maxUDPPendingBytes: 1048576
 
 performance:
   tcpSockmapAcceleration: auto

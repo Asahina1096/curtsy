@@ -32,6 +32,8 @@ struct LimitConfiguration: Codable, Equatable, Sendable {
     var tcpListenBacklog: Int = 4_096
     var maxTCPBufferedBytes: Int = 256 * 1_024 * 1_024
     var maxUDPAssociations: Int = 4_096
+    var maxUDPPendingDatagrams: Int = 64
+    var maxUDPPendingBytes: Int = 1 * 1_024 * 1_024
 
     init() {}
 
@@ -43,6 +45,14 @@ struct LimitConfiguration: Codable, Equatable, Sendable {
             forKey: .maxTCPBufferedBytes
         ) ?? 256 * 1_024 * 1_024
         maxUDPAssociations = try container.decodeIfPresent(Int.self, forKey: .maxUDPAssociations) ?? 4_096
+        maxUDPPendingDatagrams = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maxUDPPendingDatagrams
+        ) ?? 64
+        maxUDPPendingBytes = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maxUDPPendingBytes
+        ) ?? 1 * 1_024 * 1_024
     }
 }
 
@@ -150,7 +160,13 @@ enum ConfigurationLoader {
         "listen": ["host", "port"],
         "upstream": ["host", "port"],
         "timeouts": ["connectSeconds", "tcpIdleSeconds", "udpSessionSeconds", "shutdownGraceSeconds"],
-        "limits": ["tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations"],
+        "limits": [
+            "tcpListenBacklog",
+            "maxTCPBufferedBytes",
+            "maxUDPAssociations",
+            "maxUDPPendingDatagrams",
+            "maxUDPPendingBytes",
+        ],
         "logging": ["level"],
         "performance": ["tcpSockmapAcceleration"]
     ]
@@ -215,6 +231,12 @@ enum ConfigurationLoader {
         guard timeoutValues.allSatisfy({ $0 > 0 }) else {
             throw ConfigurationError.invalidValue("all timeout values must be positive")
         }
+        let maxTimeoutSeconds = Int(Int64.max / 1_000_000_000)
+        guard timeoutValues.allSatisfy({ $0 <= maxTimeoutSeconds }) else {
+            throw ConfigurationError.invalidValue(
+                "all timeout values must be no greater than \(maxTimeoutSeconds) seconds"
+            )
+        }
         guard (1...Int(Int32.max)).contains(configuration.limits.tcpListenBacklog) else {
             throw ConfigurationError.invalidValue("limits.tcpListenBacklog must be between 1 and \(Int32.max)")
         }
@@ -223,6 +245,12 @@ enum ConfigurationLoader {
         }
         guard configuration.limits.maxUDPAssociations > 0 else {
             throw ConfigurationError.invalidValue("limits.maxUDPAssociations must be positive")
+        }
+        guard configuration.limits.maxUDPPendingDatagrams > 0 else {
+            throw ConfigurationError.invalidValue("limits.maxUDPPendingDatagrams must be positive")
+        }
+        guard configuration.limits.maxUDPPendingBytes > 0 else {
+            throw ConfigurationError.invalidValue("limits.maxUDPPendingBytes must be positive")
         }
         let validLogLevels = Set(["trace", "debug", "info", "notice", "warning", "error", "critical"])
         guard validLogLevels.contains(configuration.logging.level.lowercased()) else {

@@ -131,6 +131,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         let generation: UInt64
         let identifier: UInt64
         var buffers: [ByteBuffer]
+        var bufferedBytes: Int
     }
 
     private let runtime: RuntimeConfiguration
@@ -141,6 +142,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     private var pending: [SocketAddress: PendingAssociation] = [:]
     private weak var listenerChannel: Channel?
     private var warnedAtLimit = false
+    private var warnedPendingOverflow = false
     private var generation: UInt64 = 0
     private var nextAssociationIdentifier: UInt64 = 0
 
@@ -177,12 +179,35 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         }
 
         if var association = pending[client] {
-            association.buffers.append(envelope.data)
+            guard appendPendingDatagram(envelope.data, to: &association) else {
+                if !warnedPendingOverflow {
+                    warnedPendingOverflow = true
+                    let limits = runtime.current().configuration.limits
+                    log.warning(
+                        "udp pending association buffer limit reached "
+                            + "max_datagrams=\(limits.maxUDPPendingDatagrams) "
+                            + "max_bytes=\(limits.maxUDPPendingBytes)"
+                    )
+                }
+                return
+            }
             pending[client] = association
             return
         }
 
         let snapshot = runtime.current()
+        let firstDatagramBytes = envelope.data.readableBytes
+        guard firstDatagramBytes <= snapshot.configuration.limits.maxUDPPendingBytes else {
+            if !warnedPendingOverflow {
+                warnedPendingOverflow = true
+                log.warning(
+                    "udp pending association buffer limit reached "
+                        + "max_datagrams=\(snapshot.configuration.limits.maxUDPPendingDatagrams) "
+                        + "max_bytes=\(snapshot.configuration.limits.maxUDPPendingBytes)"
+                )
+            }
+            return
+        }
         guard budget.tryAcquire(limit: snapshot.configuration.limits.maxUDPAssociations) else {
             if !warnedAtLimit {
                 warnedAtLimit = true
@@ -197,7 +222,8 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         pending[client] = PendingAssociation(
             generation: pendingGeneration,
             identifier: associationIdentifier,
-            buffers: [envelope.data]
+            buffers: [envelope.data],
+            bufferedBytes: firstDatagramBytes
         )
         let eventLoop = context.eventLoop
         let recordUpstreamActivity: @Sendable () -> Void = { [weak self] in
@@ -262,6 +288,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
                     expiry: expiry
                 )
                 self.warnedAtLimit = false
+                self.warnedPendingOverflow = false
                 channel.closeFuture.whenComplete { [weak self, weak channel] _ in
                     guard let self, let channel else { return }
                     eventLoop.execute {
@@ -269,6 +296,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
                             self.active.removeValue(forKey: client)?.expiry.cancel()
                             self.budget.release()
                             self.warnedAtLimit = false
+                            self.warnedPendingOverflow = false
                         }
                     }
                 }
@@ -281,6 +309,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
             case .failure(let error):
                 self.budget.release()
                 self.warnedAtLimit = false
+                self.warnedPendingOverflow = false
                 self.log.error("udp association failed client=\(client.curtsyDescription) error=\(error)")
             }
         }
@@ -306,6 +335,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         pending.removeAll()
         budget.release(releasedCount)
         warnedAtLimit = false
+        warnedPendingOverflow = false
     }
 
     func rescheduleAssociationExpiries(on eventLoop: EventLoop) {
@@ -353,7 +383,28 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         association.channel.close(promise: nil)
         budget.release()
         warnedAtLimit = false
+        warnedPendingOverflow = false
         log.debug("udp association expired client=\(client.curtsyDescription)")
+    }
+
+    private func appendPendingDatagram(
+        _ buffer: ByteBuffer,
+        to association: inout PendingAssociation
+    ) -> Bool {
+        let limits = runtime.current().configuration.limits
+        guard association.buffers.count < limits.maxUDPPendingDatagrams else {
+            return false
+        }
+        let byteCount = buffer.readableBytes
+        guard
+            association.bufferedBytes <= limits.maxUDPPendingBytes,
+            byteCount <= limits.maxUDPPendingBytes - association.bufferedBytes
+        else {
+            return false
+        }
+        association.buffers.append(buffer)
+        association.bufferedBytes += byteCount
+        return true
     }
 
     private func refreshAssociation(client: SocketAddress, identifier: UInt64, on eventLoop: EventLoop) {

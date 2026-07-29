@@ -1,3 +1,4 @@
+import Foundation
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
@@ -268,6 +269,84 @@ final class ForwardingTests: XCTestCase {
         _ = try? staleUpstream.finish()
     }
 
+    func testUDPPendingAssociationDatagramLimitDropsExcessBuffers() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let connectionPromise = eventLoop.makePromise(of: Channel.self)
+        let budget = UDPAssociationBudget()
+        var limits = LimitConfiguration()
+        limits.maxUDPPendingDatagrams = 2
+        limits.maxUDPPendingBytes = 1_024
+        let configuration = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: 9,
+            limits: limits
+        )
+        let handler = UDPRelayHandler(
+            runtime: RuntimeConfiguration(configuration),
+            budget: budget,
+            log: LogStore(level: "critical"),
+            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
+        )
+        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
+        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
+
+        for value in ["one", "two", "three"] {
+            var buffer = listener.allocator.buffer(capacity: value.utf8.count)
+            buffer.writeString(value)
+            XCTAssertNoThrow(
+                try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
+            )
+        }
+        XCTAssertEqual(budget.count, 1)
+
+        let upstream = EmbeddedChannel(loop: eventLoop)
+        connectionPromise.succeed(upstream)
+        eventLoop.run()
+
+        let first: ByteBuffer? = try upstream.readOutbound()
+        let second: ByteBuffer? = try upstream.readOutbound()
+        let third: ByteBuffer? = try upstream.readOutbound()
+        XCTAssertEqual(first.map { $0.getString(at: $0.readerIndex, length: $0.readableBytes) }, "one")
+        XCTAssertEqual(second.map { $0.getString(at: $0.readerIndex, length: $0.readableBytes) }, "two")
+        XCTAssertNil(third)
+        XCTAssertNoThrow(try listener.finish())
+        _ = try? upstream.finish()
+    }
+
+    func testUDPPendingAssociationByteLimitRejectsOversizedFirstDatagram() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let budget = UDPAssociationBudget()
+        var connectCount = 0
+        var limits = LimitConfiguration()
+        limits.maxUDPPendingBytes = 2
+        let configuration = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: 9,
+            limits: limits
+        )
+        let handler = UDPRelayHandler(
+            runtime: RuntimeConfiguration(configuration),
+            budget: budget,
+            log: LogStore(level: "critical"),
+            connectUpstream: { _, _, _, _, _, _ in
+                connectCount += 1
+                return eventLoop.makeSucceededFuture(EmbeddedChannel(loop: eventLoop))
+            }
+        )
+        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
+        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
+        var buffer = listener.allocator.buffer(capacity: 3)
+        buffer.writeString("big")
+
+        XCTAssertNoThrow(
+            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
+        )
+
+        XCTAssertEqual(connectCount, 0)
+        XCTAssertEqual(budget.count, 0)
+        XCTAssertNoThrow(try listener.finish())
+    }
+
     func testUDPUpstreamActivityRefreshesAssociationExpiry() throws {
         let eventLoop = EmbeddedEventLoop()
         let connectionPromise = eventLoop.makePromise(of: Channel.self)
@@ -446,6 +525,67 @@ final class ForwardingTests: XCTestCase {
         udp.stop()
     }
 
+    func testTCPListenerFallsBackWhenSockmapLoaderThrows() throws {
+        let echo = try ServerBootstrap(group: group)
+            .childChannelInitializer { channel in
+                channel.pipeline.addHandler(TCPEchoHandler())
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+        defer { try? echo.close().wait() }
+
+        let configuration = makeResolvedConfiguration(
+            protocols: [.tcp],
+            upstreamPort: echo.localAddress!.port!
+        )
+        let listener = TCPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: true,
+            loadSockmapAccelerator: {
+                throw TCPSockmapAccelerator.AcceleratorError.unsupportedChannel
+            }
+        )
+        try listener.start()
+        defer {
+            listener.stopAccepting()
+            listener.forceCloseConnections()
+        }
+
+        let recorder = DataRecorder(testCase: self)
+        let client = try ClientBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(TCPRecordingHandler(recorder: recorder))
+            }
+            .connect(to: listener.localAddresses[0])
+            .wait()
+        defer { try? client.close().wait() }
+
+        var buffer = client.allocator.buffer(capacity: 8)
+        buffer.writeString("fallback")
+        try client.writeAndFlush(buffer).wait()
+
+        recorder.wait()
+        XCTAssertEqual(recorder.string, "fallback")
+    }
+
+    func testOptionalEBPFLoadersWhenExplicitlyEnabled() throws {
+        #if os(Linux)
+        guard ProcessInfo.processInfo.environment["CURTSY_ENABLE_EBPF_TESTS"] == "1" else {
+            throw XCTSkip("set CURTSY_ENABLE_EBPF_TESTS=1 on a Linux host with eBPF permissions")
+        }
+
+        let reusePortProgram = try ReusePortBPFProgram.load(workerCount: 1)
+        reusePortProgram?.close()
+
+        let sockmapAccelerator = try TCPSockmapAccelerator.load(maxEntries: 8)
+        XCTAssertNotNil(sockmapAccelerator)
+        #else
+        throw XCTSkip("eBPF loader tests only run on Linux")
+        #endif
+    }
+
     private func makeUDPClient(message: String, destination: SocketAddress) throws -> (channel: Channel, recorder: DataRecorder) {
         let recorder = DataRecorder(testCase: self)
         let channel = try DatagramBootstrap(group: group)
@@ -464,7 +604,8 @@ final class ForwardingTests: XCTestCase {
         protocols: [ForwardProtocol],
         upstreamHost: String = "127.0.0.1",
         upstreamPort: Int,
-        udpSessionSeconds: Int = 5
+        udpSessionSeconds: Int = 5,
+        limits: LimitConfiguration = .init()
     ) -> ResolvedConfiguration {
         var timeouts = TimeoutConfiguration()
         timeouts.tcpIdleSeconds = 5
@@ -474,7 +615,8 @@ final class ForwardingTests: XCTestCase {
             protocols: protocols,
             listen: EndpointConfiguration(host: "127.0.0.1", port: 0),
             upstream: EndpointConfiguration(host: upstreamHost, port: upstreamPort),
-            timeouts: timeouts
+            timeouts: timeouts,
+            limits: limits
         )
         return try! ResolvedConfiguration.resolve(configuration)
     }

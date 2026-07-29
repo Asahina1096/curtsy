@@ -35,6 +35,8 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.limits.tcpListenBacklog, 4_096)
         XCTAssertEqual(configuration.limits.maxTCPBufferedBytes, 256 * 1_024 * 1_024)
         XCTAssertEqual(configuration.limits.maxUDPAssociations, 4_096)
+        XCTAssertEqual(configuration.limits.maxUDPPendingDatagrams, 64)
+        XCTAssertEqual(configuration.limits.maxUDPPendingBytes, 1 * 1_024 * 1_024)
         XCTAssertEqual(configuration.logging.level, "info")
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .auto)
     }
@@ -50,7 +52,12 @@ final class ConfigurationTests: XCTestCase {
           tcpIdleSeconds: 20
           udpSessionSeconds: 15
           shutdownGraceSeconds: 3
-        limits: { tcpListenBacklog: 2048, maxTCPBufferedBytes: 67108864, maxUDPAssociations: 128 }
+        limits:
+          tcpListenBacklog: 2048
+          maxTCPBufferedBytes: 67108864
+          maxUDPAssociations: 128
+          maxUDPPendingDatagrams: 8
+          maxUDPPendingBytes: 4096
         performance: { tcpSockmapAcceleration: enabled }
         logging: { level: debug }
         """)
@@ -60,6 +67,8 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.limits.tcpListenBacklog, 2_048)
         XCTAssertEqual(configuration.limits.maxTCPBufferedBytes, 64 * 1_024 * 1_024)
         XCTAssertEqual(configuration.limits.maxUDPAssociations, 128)
+        XCTAssertEqual(configuration.limits.maxUDPPendingDatagrams, 8)
+        XCTAssertEqual(configuration.limits.maxUDPPendingBytes, 4_096)
         XCTAssertEqual(configuration.logging.level, "debug")
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .enabled)
     }
@@ -118,6 +127,20 @@ final class ConfigurationTests: XCTestCase {
             """,
             """
             version: 1
+            protocols: [udp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            limits: { maxUDPPendingDatagrams: 0 }
+            """,
+            """
+            version: 1
+            protocols: [udp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            limits: { maxUDPPendingBytes: 0 }
+            """,
+            """
+            version: 1
             protocols: [tcp]
             listen: { host: "127.0.0.1", port: 0 }
             upstream: { host: "127.0.0.1", port: 9001 }
@@ -128,6 +151,13 @@ final class ConfigurationTests: XCTestCase {
             listen: { host: "127.0.0.1", port: 9000 }
             upstream: { host: "127.0.0.1", port: 9001 }
             timeouts: { udpSessionSeconds: 0 }
+            """,
+            """
+            version: 1
+            protocols: [tcp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            timeouts: { tcpIdleSeconds: 9223372037 }
             """,
             """
             version: 1
