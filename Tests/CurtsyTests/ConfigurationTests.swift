@@ -155,6 +155,31 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertTrue(original.listenBindingDiffers(from: changed))
     }
 
+    func testTreatsListenAliasesForSameAddressAsSameBinding() throws {
+        let originalConfiguration = ForwarderConfiguration(
+            version: 1,
+            protocols: [.tcp],
+            listen: EndpointConfiguration(host: "listener.internal", port: 9000),
+            upstream: EndpointConfiguration(host: "upstream.internal", port: 9001)
+        )
+        let aliasConfiguration = ForwarderConfiguration(
+            version: 1,
+            protocols: [.tcp],
+            listen: EndpointConfiguration(host: "listener-alias.internal", port: 9000),
+            upstream: EndpointConfiguration(host: "upstream.internal", port: 9001)
+        )
+        let resolver: (String, Int) throws -> SocketAddress = { host, port in
+            try SocketAddress(
+                ipAddress: host == "upstream.internal" ? "127.0.0.10" : "127.0.0.1",
+                port: port
+            )
+        }
+        let original = try ResolvedConfiguration.resolve(originalConfiguration, resolver: resolver)
+        let alias = try ResolvedConfiguration.resolve(aliasConfiguration, resolver: resolver)
+
+        XCTAssertFalse(original.listenBindingDiffers(from: alias))
+    }
+
     private func makeConfiguration(upstreamHost: String) -> ForwarderConfiguration {
         ForwarderConfiguration(
             version: 1,

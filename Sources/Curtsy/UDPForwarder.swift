@@ -72,13 +72,19 @@ final class UDPListener: @unchecked Sendable {
     }
 
     func update(configuration: ResolvedConfiguration, resetAssociations: Bool) {
+        let timeoutChanged = runtime.current().configuration.timeouts.udpSessionSeconds
+            != configuration.configuration.timeouts.udpSessionSeconds
         runtime.update(configuration)
-        guard resetAssociations else { return }
+        guard resetAssociations || timeoutChanged else { return }
         let pairs = Array(zip(listenerChannels, handlers))
         for (channel, handler) in pairs {
             let promise = channel.eventLoop.makePromise(of: Void.self)
             channel.eventLoop.execute {
-                handler.resetAssociations()
+                if resetAssociations {
+                    handler.resetAssociations()
+                } else {
+                    handler.rescheduleAssociationExpiries(on: channel.eventLoop)
+                }
                 promise.succeed(())
             }
             try? promise.futureResult.wait()
@@ -117,6 +123,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     private struct ActiveAssociation {
         let identifier: UInt64
         let channel: Channel
+        var lastActivity: NIODeadline
         var expiry: Scheduled<Void>
     }
 
@@ -240,10 +247,18 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
             let buffers = pendingAssociation?.buffers ?? []
             switch result {
             case .success(let channel):
-                let expiry = self.scheduleExpiry(client: client, on: eventLoop)
+                let lastActivity = eventLoop.now
+                let deadline = self.expirationDeadline(lastActivity: lastActivity)
+                let expiry = self.scheduleExpiry(
+                    client: client,
+                    identifier: associationIdentifier,
+                    deadline: deadline,
+                    on: eventLoop
+                )
                 self.active[client] = ActiveAssociation(
                     identifier: associationIdentifier,
                     channel: channel,
+                    lastActivity: lastActivity,
                     expiry: expiry
                 )
                 self.warnedAtLimit = false
@@ -293,21 +308,65 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         warnedAtLimit = false
     }
 
-    private func scheduleExpiry(client: SocketAddress, on eventLoop: EventLoop) -> Scheduled<Void> {
-        let seconds = runtime.current().configuration.timeouts.udpSessionSeconds
-        return eventLoop.scheduleTask(in: .seconds(Int64(seconds))) { [weak self] in
-            guard let self, let association = self.active.removeValue(forKey: client) else { return }
-            association.channel.close(promise: nil)
-            self.budget.release()
-            self.warnedAtLimit = false
-            self.log.debug("udp association expired client=\(client.curtsyDescription)")
+    func rescheduleAssociationExpiries(on eventLoop: EventLoop) {
+        eventLoop.assertInEventLoop()
+        let now = eventLoop.now
+        for client in Array(active.keys) {
+            guard var association = active[client] else { continue }
+            association.expiry.cancel()
+            let deadline = expirationDeadline(lastActivity: association.lastActivity)
+            if deadline <= now {
+                expireAssociation(client: client, identifier: association.identifier)
+                continue
+            }
+            association.expiry = scheduleExpiry(
+                client: client,
+                identifier: association.identifier,
+                deadline: deadline,
+                on: eventLoop
+            )
+            active[client] = association
         }
+    }
+
+    private func scheduleExpiry(
+        client: SocketAddress,
+        identifier: UInt64,
+        deadline: NIODeadline,
+        on eventLoop: EventLoop
+    ) -> Scheduled<Void> {
+        return eventLoop.scheduleTask(deadline: deadline) { [weak self] in
+            self?.expireAssociation(client: client, identifier: identifier)
+        }
+    }
+
+    private func expirationDeadline(lastActivity: NIODeadline) -> NIODeadline {
+        let seconds = runtime.current().configuration.timeouts.udpSessionSeconds
+        return lastActivity + .seconds(Int64(seconds))
+    }
+
+    private func expireAssociation(client: SocketAddress, identifier: UInt64) {
+        guard
+            active[client]?.identifier == identifier,
+            let association = active.removeValue(forKey: client)
+        else { return }
+        association.channel.close(promise: nil)
+        budget.release()
+        warnedAtLimit = false
+        log.debug("udp association expired client=\(client.curtsyDescription)")
     }
 
     private func refreshAssociation(client: SocketAddress, identifier: UInt64, on eventLoop: EventLoop) {
         guard var association = active[client], association.identifier == identifier else { return }
         association.expiry.cancel()
-        association.expiry = scheduleExpiry(client: client, on: eventLoop)
+        association.lastActivity = eventLoop.now
+        let deadline = expirationDeadline(lastActivity: association.lastActivity)
+        association.expiry = scheduleExpiry(
+            client: client,
+            identifier: identifier,
+            deadline: deadline,
+            on: eventLoop
+        )
         active[client] = association
     }
 

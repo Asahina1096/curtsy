@@ -32,7 +32,7 @@ struct ResolvedConfiguration: Sendable {
     }
 
     func listenBindingDiffers(from other: ResolvedConfiguration) -> Bool {
-        configuration.listen != other.configuration.listen || listenAddresses != other.listenAddresses
+        listenAddresses != other.listenAddresses
     }
 }
 

@@ -251,6 +251,97 @@ final class ForwardingTests: XCTestCase {
         _ = try? upstream.finish()
     }
 
+    func testUDPTimeoutReloadReschedulesActiveAssociation() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let connectionPromise = eventLoop.makePromise(of: Channel.self)
+        let budget = UDPAssociationBudget()
+        let initial = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: 9,
+            udpSessionSeconds: 10
+        )
+        let runtime = RuntimeConfiguration(initial)
+        let handler = UDPRelayHandler(
+            runtime: runtime,
+            budget: budget,
+            log: LogStore(level: "critical"),
+            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
+        )
+        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
+        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
+        var buffer = listener.allocator.buffer(capacity: 4)
+        buffer.writeString("test")
+
+        XCTAssertNoThrow(
+            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
+        )
+        let upstream = EmbeddedChannel(loop: eventLoop)
+        connectionPromise.succeed(upstream)
+        eventLoop.run()
+        XCTAssertEqual(budget.count, 1)
+
+        eventLoop.advanceTime(by: .seconds(6))
+        let shortened = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: 9,
+            udpSessionSeconds: 5
+        )
+        runtime.update(shortened)
+        handler.rescheduleAssociationExpiries(on: eventLoop)
+
+        XCTAssertEqual(budget.count, 0)
+        XCTAssertFalse(upstream.isActive)
+        XCTAssertNoThrow(try listener.finish())
+        _ = try? upstream.finish()
+    }
+
+    func testUDPTimeoutReloadCanExtendActiveAssociation() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let connectionPromise = eventLoop.makePromise(of: Channel.self)
+        let budget = UDPAssociationBudget()
+        let initial = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: 9,
+            udpSessionSeconds: 5
+        )
+        let runtime = RuntimeConfiguration(initial)
+        let handler = UDPRelayHandler(
+            runtime: runtime,
+            budget: budget,
+            log: LogStore(level: "critical"),
+            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
+        )
+        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
+        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
+        var buffer = listener.allocator.buffer(capacity: 4)
+        buffer.writeString("test")
+
+        XCTAssertNoThrow(
+            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
+        )
+        let upstream = EmbeddedChannel(loop: eventLoop)
+        connectionPromise.succeed(upstream)
+        eventLoop.run()
+        XCTAssertEqual(budget.count, 1)
+
+        eventLoop.advanceTime(by: .seconds(4))
+        let extended = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: 9,
+            udpSessionSeconds: 10
+        )
+        runtime.update(extended)
+        handler.rescheduleAssociationExpiries(on: eventLoop)
+
+        eventLoop.advanceTime(by: .seconds(2))
+        XCTAssertEqual(budget.count, 1)
+        eventLoop.advanceTime(by: .seconds(4))
+        XCTAssertEqual(budget.count, 0)
+        XCTAssertFalse(upstream.isActive)
+        XCTAssertNoThrow(try listener.finish())
+        _ = try? upstream.finish()
+    }
+
     func testTCPListeningBacklogCanBeUpdatedInPlace() throws {
         let configuration = makeResolvedConfiguration(protocols: [.tcp], upstreamPort: 9)
         let listener = TCPListener(
@@ -312,10 +403,14 @@ final class ForwardingTests: XCTestCase {
         return (channel, recorder)
     }
 
-    private func makeResolvedConfiguration(protocols: [ForwardProtocol], upstreamPort: Int) -> ResolvedConfiguration {
+    private func makeResolvedConfiguration(
+        protocols: [ForwardProtocol],
+        upstreamPort: Int,
+        udpSessionSeconds: Int = 5
+    ) -> ResolvedConfiguration {
         var timeouts = TimeoutConfiguration()
         timeouts.tcpIdleSeconds = 5
-        timeouts.udpSessionSeconds = 5
+        timeouts.udpSessionSeconds = udpSessionSeconds
         let configuration = ForwarderConfiguration(
             version: 1,
             protocols: protocols,
