@@ -147,10 +147,13 @@ final class ForwarderService: @unchecked Sendable {
             return
         }
 
+        let replaceTCP = newProtocols.contains(.tcp)
+            && tcpListener != nil
+            && old.tcpAccelerationDiffers(from: candidate)
         var addedTCP: TCPListener?
         var addedUDP: UDPListener?
         do {
-            if newProtocols.contains(.tcp), tcpListener == nil {
+            if newProtocols.contains(.tcp), tcpListener == nil || replaceTCP {
                 let listener = TCPListener(group: group, configuration: candidate, log: log)
                 try listener.start()
                 addedTCP = listener
@@ -163,7 +166,7 @@ final class ForwarderService: @unchecked Sendable {
 
             let backlogChanged = old.configuration.limits.tcpListenBacklog
                 != candidate.configuration.limits.tcpListenBacklog
-            if newProtocols.contains(.tcp), backlogChanged {
+            if newProtocols.contains(.tcp), backlogChanged, addedTCP == nil {
                 try (addedTCP ?? tcpListener)?.updateListeningBacklog(
                     candidate.configuration.limits.tcpListenBacklog
                 )
@@ -175,7 +178,14 @@ final class ForwarderService: @unchecked Sendable {
             throw error
         }
 
-        if let addedTCP { tcpListener = addedTCP }
+        if let addedTCP {
+            let oldTCP = tcpListener
+            tcpListener = addedTCP
+            if let oldTCP {
+                oldTCP.stopAccepting()
+                retire(oldTCP)
+            }
+        }
         if let addedUDP { udpListener = addedUDP }
 
         let upstreamChanged = old.upstreamAddress != candidate.upstreamAddress

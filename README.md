@@ -41,7 +41,9 @@ TCP 转发路径使用大块自适应读取、批量 flush 和背压控制，目
 
 多连接场景下，Curtsy 会为每个事件循环创建一个 `SO_REUSEPORT` TCP 监听 socket，并在 Linux 上通过 `SO_ATTACH_REUSEPORT_EBPF` 加载 socket-filter eBPF 程序，按连接四元组 hash 直接分流到对应 worker，避免单监听 socket 成为 accept 瓶颈以及连接建立后的跨线程迁移。worker 数量默认等于可用 CPU 核数。
 
-在具备 eBPF 权限的 Linux 上，Curtsy 还会创建 `BPF_MAP_TYPE_SOCKHASH`，并为每对客户端/上游 TCP socket 挂载 `SK_SKB` stream parser 与 verdict 程序。双向数据通过 `bpf_sk_redirect_hash` 在内核中直接转发，绕过 SwiftNIO relay 的 `tcp_recvmsg`、`tcp_sendmsg` 和用户缓冲区复制。BPF 同时记录双向最后活动时间，因此加速连接仍遵守 `tcpIdleSeconds`；半关闭和 FIN 继续由 NIO 通道生命周期处理。
+在具备 eBPF 权限的 Linux 上，Curtsy 还可创建 `BPF_MAP_TYPE_SOCKHASH`，并为每对客户端/上游 TCP socket 挂载 `SK_SKB` stream parser 与 verdict 程序。双向数据通过 `bpf_sk_redirect_hash` 在内核中直接转发，绕过 SwiftNIO relay 的 `tcp_recvmsg`、`tcp_sendmsg` 和用户缓冲区复制。BPF 同时记录双向最后活动时间，因此加速连接仍遵守 `tcpIdleSeconds`；半关闭和 FIN 继续由 NIO 通道生命周期处理。
+
+`performance.tcpSockmapAcceleration` 控制该路径：`enabled` 强制尝试启用，`disabled` 始终使用用户态 relay，默认的 `auto` 会对非回环上游启用、对回环上游禁用。回环流量在实测中受 sockmap workqueue 和 socket lock 限制，尤其会降低多连接吞吐。热加载改变此项或改变 `auto` 的判断结果时，已有 TCP 连接保持原模式，新连接使用新模式；UDP listener 和已有 UDP 会话不会因此重建。
 
 加载 eBPF 通常需要 root，或内核版本对应的 `CAP_BPF`、`CAP_NET_ADMIN` 等 capability。权限不足、内核不支持或单连接 sockhash 配对失败时，Curtsy 会记录日志并自动回退到现有用户态 relay；监听分流也会回退到内核原生的 `SO_REUSEPORT` hash，转发服务不会因此启动失败。
 

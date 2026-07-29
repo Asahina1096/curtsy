@@ -60,6 +60,34 @@ final class ForwardingTests: XCTestCase {
         XCTAssertEqual(recorder.string, "hello curtsy")
     }
 
+    func testTCPListenerUsesResolvedSockmapDecisionAndAllowsTestOverride() {
+        let loopback = makeResolvedConfiguration(protocols: [.tcp], upstreamPort: 9)
+        var loadCount = 0
+
+        _ = TCPListener(
+            group: group,
+            configuration: loopback,
+            log: LogStore(level: "critical"),
+            loadSockmapAccelerator: {
+                loadCount += 1
+                return nil
+            }
+        )
+        XCTAssertEqual(loadCount, 0)
+
+        _ = TCPListener(
+            group: group,
+            configuration: loopback,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: true,
+            loadSockmapAccelerator: {
+                loadCount += 1
+                return nil
+            }
+        )
+        XCTAssertEqual(loadCount, 1)
+    }
+
     func testTCPLargeTransferCompletesThroughBatchedFlushes() throws {
         let echo = try ServerBootstrap(group: group)
             .childChannelInitializer { channel in

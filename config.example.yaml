@@ -19,5 +19,8 @@ limits:
   tcpListenBacklog: 4096
   maxUDPAssociations: 4096
 
+performance:
+  tcpSockmapAcceleration: auto
+
 logging:
   level: info

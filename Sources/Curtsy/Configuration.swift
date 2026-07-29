@@ -52,6 +52,28 @@ struct LogConfiguration: Codable, Equatable, Sendable {
     }
 }
 
+enum TCPSockmapAccelerationMode: String, Codable, Sendable {
+    case auto
+    case enabled
+    case disabled
+}
+
+struct PerformanceConfiguration: Codable, Equatable, Sendable {
+    var tcpSockmapAcceleration: TCPSockmapAccelerationMode = .auto
+
+    init(tcpSockmapAcceleration: TCPSockmapAccelerationMode = .auto) {
+        self.tcpSockmapAcceleration = tcpSockmapAcceleration
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tcpSockmapAcceleration = try container.decodeIfPresent(
+            TCPSockmapAccelerationMode.self,
+            forKey: .tcpSockmapAcceleration
+        ) ?? .auto
+    }
+}
+
 struct ForwarderConfiguration: Codable, Equatable, Sendable {
     let version: Int
     let protocols: [ForwardProtocol]
@@ -60,6 +82,7 @@ struct ForwarderConfiguration: Codable, Equatable, Sendable {
     var timeouts: TimeoutConfiguration
     var limits: LimitConfiguration
     var logging: LogConfiguration
+    var performance: PerformanceConfiguration
 
     init(
         version: Int,
@@ -68,7 +91,8 @@ struct ForwarderConfiguration: Codable, Equatable, Sendable {
         upstream: EndpointConfiguration,
         timeouts: TimeoutConfiguration = .init(),
         limits: LimitConfiguration = .init(),
-        logging: LogConfiguration = .init()
+        logging: LogConfiguration = .init(),
+        performance: PerformanceConfiguration = .init()
     ) {
         self.version = version
         self.protocols = protocols
@@ -77,6 +101,7 @@ struct ForwarderConfiguration: Codable, Equatable, Sendable {
         self.timeouts = timeouts
         self.limits = limits
         self.logging = logging
+        self.performance = performance
     }
 
     init(from decoder: Decoder) throws {
@@ -88,6 +113,10 @@ struct ForwarderConfiguration: Codable, Equatable, Sendable {
         timeouts = try container.decodeIfPresent(TimeoutConfiguration.self, forKey: .timeouts) ?? .init()
         limits = try container.decodeIfPresent(LimitConfiguration.self, forKey: .limits) ?? .init()
         logging = try container.decodeIfPresent(LogConfiguration.self, forKey: .logging) ?? .init()
+        performance = try container.decodeIfPresent(
+            PerformanceConfiguration.self,
+            forKey: .performance
+        ) ?? .init()
     }
 }
 
@@ -110,12 +139,15 @@ enum ConfigurationError: Error, CustomStringConvertible, Equatable {
 
 enum ConfigurationLoader {
     private static let allowedKeys: [String: Set<String>] = [
-        "": ["version", "protocols", "listen", "upstream", "timeouts", "limits", "logging"],
+        "": [
+            "version", "protocols", "listen", "upstream", "timeouts", "limits", "logging", "performance",
+        ],
         "listen": ["host", "port"],
         "upstream": ["host", "port"],
         "timeouts": ["connectSeconds", "tcpIdleSeconds", "udpSessionSeconds", "shutdownGraceSeconds"],
         "limits": ["tcpListenBacklog", "maxUDPAssociations"],
-        "logging": ["level"]
+        "logging": ["level"],
+        "performance": ["tcpSockmapAcceleration"]
     ]
 
     static func load(path: String) throws -> ForwarderConfiguration {

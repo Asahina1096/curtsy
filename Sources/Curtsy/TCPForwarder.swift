@@ -22,9 +22,11 @@ private enum TCPPerformanceTuning {
     // Four 1 MiB buffers retain the same 4 MiB maximum read batch as the
     // previous sixteen 256 KiB buffers while requiring fewer read syscalls.
     static let maxMessagesPerRead: UInt = 4
+    // Keep one full read batch below the high watermark. A 1 MiB watermark
+    // made nearly every batch toggle autoRead and issue redundant epoll_ctl calls.
     static let writeBufferWaterMark = ChannelOptions.Types.WriteBufferWaterMark(
-        low: 256 * 1_024,
-        high: 1_024 * 1_024
+        low: 1 * 1_024 * 1_024,
+        high: 4 * 1_024 * 1_024
     )
 }
 
@@ -42,15 +44,19 @@ final class TCPListener: @unchecked Sendable {
         group: EventLoopGroup,
         configuration: ResolvedConfiguration,
         log: LogStore,
-        enableSockmapAcceleration: Bool = true
+        enableSockmapAcceleration: Bool? = nil,
+        loadSockmapAccelerator: () throws -> TCPSockmapAccelerator? = {
+            try TCPSockmapAccelerator.load()
+        }
     ) {
         self.group = group
         runtime = RuntimeConfiguration(configuration)
         self.log = log
         configuredBacklog = configuration.configuration.limits.tcpListenBacklog
-        if enableSockmapAcceleration {
+        let shouldEnableSockmap = enableSockmapAcceleration ?? configuration.shouldEnableTCPSockmap
+        if shouldEnableSockmap {
             do {
-                sockmapAccelerator = try TCPSockmapAccelerator.load()
+                sockmapAccelerator = try loadSockmapAccelerator()
                 if sockmapAccelerator != nil {
                     log.info("tcp sockmap acceleration enabled")
                 }
@@ -60,6 +66,7 @@ final class TCPListener: @unchecked Sendable {
             }
         } else {
             sockmapAccelerator = nil
+            log.info("tcp sockmap acceleration disabled")
         }
     }
 

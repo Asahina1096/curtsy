@@ -35,6 +35,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.limits.tcpListenBacklog, 4_096)
         XCTAssertEqual(configuration.limits.maxUDPAssociations, 4_096)
         XCTAssertEqual(configuration.logging.level, "info")
+        XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .auto)
     }
 
     func testLoadsOverrides() throws {
@@ -49,6 +50,7 @@ final class ConfigurationTests: XCTestCase {
           udpSessionSeconds: 15
           shutdownGraceSeconds: 3
         limits: { tcpListenBacklog: 2048, maxUDPAssociations: 128 }
+        performance: { tcpSockmapAcceleration: enabled }
         logging: { level: debug }
         """)
 
@@ -57,6 +59,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.limits.tcpListenBacklog, 2_048)
         XCTAssertEqual(configuration.limits.maxUDPAssociations, 128)
         XCTAssertEqual(configuration.logging.level, "debug")
+        XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .enabled)
     }
 
     func testRejectsUnknownKey() {
@@ -67,6 +70,16 @@ final class ConfigurationTests: XCTestCase {
         upstream: { host: "127.0.0.1", port: 9001 }
         """)) { error in
             XCTAssertEqual(error as? ConfigurationError, .unknownKey(path: "listen.typo"))
+        }
+
+        XCTAssertThrowsError(try ConfigurationLoader.load(yaml: """
+        version: 1
+        protocols: [tcp]
+        listen: { host: "127.0.0.1", port: 9000 }
+        upstream: { host: "127.0.0.1", port: 9001 }
+        performance: { sockmap: enabled }
+        """)) { error in
+            XCTAssertEqual(error as? ConfigurationError, .unknownKey(path: "performance.sockmap"))
         }
     }
 
@@ -113,6 +126,13 @@ final class ConfigurationTests: XCTestCase {
             listen: { host: "127.0.0.1", port: 9000 }
             upstream: { host: "127.0.0.1", port: 9001 }
             logging: { level: verbose }
+            """,
+            """
+            version: 1
+            protocols: [tcp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            performance: { tcpSockmapAcceleration: sometimes }
             """
         ]
 
@@ -130,6 +150,45 @@ final class ConfigurationTests: XCTestCase {
 
         let hostname = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "localhost"))
         XCTAssertNotNil(hostname.upstreamAddress.port)
+    }
+
+    func testSockmapAutoDisablesLoopbackAndEnablesRemoteUpstreams() throws {
+        let ipv4 = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "127.42.0.1"))
+        XCTAssertFalse(ipv4.shouldEnableTCPSockmap)
+
+        let ipv6 = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "::1"))
+        XCTAssertFalse(ipv6.shouldEnableTCPSockmap)
+
+        let hostname = try ResolvedConfiguration.resolve(
+            makeConfiguration(upstreamHost: "loopback.internal")
+        ) { _, port in
+            try SocketAddress(ipAddress: "127.0.0.1", port: port)
+        }
+        XCTAssertFalse(hostname.shouldEnableTCPSockmap)
+
+        let remote = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "192.0.2.1"))
+        XCTAssertTrue(remote.shouldEnableTCPSockmap)
+    }
+
+    func testSockmapExplicitModesOverrideAddressSelection() throws {
+        var enabled = makeConfiguration(upstreamHost: "127.0.0.1")
+        enabled.performance = PerformanceConfiguration(tcpSockmapAcceleration: .enabled)
+        XCTAssertTrue(try ResolvedConfiguration.resolve(enabled).shouldEnableTCPSockmap)
+
+        var disabled = makeConfiguration(upstreamHost: "192.0.2.1")
+        disabled.performance = PerformanceConfiguration(tcpSockmapAcceleration: .disabled)
+        XCTAssertFalse(try ResolvedConfiguration.resolve(disabled).shouldEnableTCPSockmap)
+    }
+
+    func testSockmapDecisionChangeControlsTCPListenerReplacement() throws {
+        let loopback = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "127.0.0.1"))
+        let remote = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "192.0.2.1"))
+        XCTAssertTrue(loopback.tcpAccelerationDiffers(from: remote))
+
+        var disabledRemoteConfiguration = makeConfiguration(upstreamHost: "192.0.2.1")
+        disabledRemoteConfiguration.performance = PerformanceConfiguration(tcpSockmapAcceleration: .disabled)
+        let disabledRemote = try ResolvedConfiguration.resolve(disabledRemoteConfiguration)
+        XCTAssertFalse(loopback.tcpAccelerationDiffers(from: disabledRemote))
     }
 
     func testDetectsListenHostnameResolutionChange() throws {

@@ -34,6 +34,30 @@ struct ResolvedConfiguration: Sendable {
     func listenBindingDiffers(from other: ResolvedConfiguration) -> Bool {
         listenAddresses != other.listenAddresses
     }
+
+    var shouldEnableTCPSockmap: Bool {
+        switch configuration.performance.tcpSockmapAcceleration {
+        case .enabled:
+            return true
+        case .disabled:
+            return false
+        case .auto:
+            return !upstreamAddress.curtsyIsLoopback
+        }
+    }
+
+    func tcpAccelerationDiffers(from other: ResolvedConfiguration) -> Bool {
+        shouldEnableTCPSockmap != other.shouldEnableTCPSockmap
+    }
+}
+
+extension SocketAddress {
+    fileprivate var curtsyIsLoopback: Bool {
+        guard let address = ipAddress?.lowercased() else { return false }
+        return address.hasPrefix("127.")
+            || address == "::1"
+            || address.hasPrefix("::ffff:127.")
+    }
 }
 
 final class RuntimeConfiguration: @unchecked Sendable {
