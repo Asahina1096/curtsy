@@ -525,18 +525,19 @@ int32_t curtsy_sockmap_idle_remaining_ns(
 }
 
 
-struct curtsy_bpf_observer {
-    int counters_fd;
-    int program_fds[4];
-    int event_fds[4];
-};
-
 enum curtsy_observer_counter_index {
     CURTSY_OBSERVER_TCP_SENDMSG = 0,
     CURTSY_OBSERVER_TCP_RECVMSG = 1,
     CURTSY_OBSERVER_UDP_SENDMSG = 2,
     CURTSY_OBSERVER_UDP_RECVMSG = 3,
     CURTSY_OBSERVER_COUNTER_COUNT = 4,
+};
+
+struct curtsy_bpf_observer {
+    int counters_fd;
+    int program_fds[CURTSY_OBSERVER_COUNTER_COUNT];
+    int *event_fds[CURTSY_OBSERVER_COUNTER_COUNT];
+    int event_fd_counts[CURTSY_OBSERVER_COUNTER_COUNT];
 };
 
 static int curtsy_perf_event_open(
@@ -566,10 +567,11 @@ static int curtsy_load_observer_program(
     size_t verifier_log_capacity
 ) {
     struct bpf_insn instructions[] = {
-        /* Ignore events not caused by this Curtsy process. */
+        /* Ignore events not caused by this Curtsy process: jump straight to
+         * the return-0 tail (instruction 14), not the counter increment. */
         CURTSY_CALL(BPF_FUNC_get_current_pid_tgid),
         CURTSY_INSN(BPF_ALU64 | BPF_RSH | BPF_K, BPF_REG_0, 0, 0, 32),
-        CURTSY_JMP_IMM(BPF_JNE, BPF_REG_0, (int32_t)target_pid, 10),
+        CURTSY_JMP_IMM(BPF_JNE, BPF_REG_0, (int32_t)target_pid, 11),
 
         /* key = counter_index */
         CURTSY_MOV64_REG(BPF_REG_6, BPF_REG_10),
@@ -611,36 +613,69 @@ static int curtsy_load_observer_program(
     return curtsy_bpf(BPF_PROG_LOAD, &attributes);
 }
 
-static int curtsy_attach_kprobe(int program_fd, const char *function_name) {
+// Attaches the program to a kprobe PMU event on every online CPU
+// (pid == -1 with cpu == -1 is rejected by perf_event_open). Returns 0 and
+// hands the per-CPU event fds to the caller, or -1 with errno set.
+static int curtsy_attach_kprobe(
+    int program_fd,
+    const char *function_name,
+    int **event_fds_out,
+    int *event_fd_count_out
+) {
     int kprobe_type = curtsy_read_uint_from_file("/sys/bus/event_source/devices/kprobe/type");
     if (kprobe_type < 0) {
         errno = ENOTSUP;
         return -1;
     }
 
-    struct perf_event_attr attributes;
-    memset(&attributes, 0, sizeof(attributes));
-    attributes.type = (uint32_t)kprobe_type;
-    attributes.size = sizeof(attributes);
-    attributes.config1 = (uint64_t)(uintptr_t)function_name;
-    attributes.sample_period = 1;
-    attributes.wakeup_events = 1;
+    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count < 1) {
+        errno = ENOTSUP;
+        return -1;
+    }
 
-    int event_fd = curtsy_perf_event_open(&attributes, -1, -1, -1, PERF_FLAG_FD_CLOEXEC);
-    if (event_fd < 0) return -1;
-    if (ioctl(event_fd, PERF_EVENT_IOC_SET_BPF, program_fd) != 0) {
+    int *fds = calloc((size_t)cpu_count, sizeof(int));
+    if (fds == NULL) return -1;
+    int attached = 0;
+    for (long cpu = 0; cpu < cpu_count; cpu++) {
+        struct perf_event_attr attributes;
+        memset(&attributes, 0, sizeof(attributes));
+        attributes.type = (uint32_t)kprobe_type;
+        attributes.size = sizeof(attributes);
+        attributes.config1 = (uint64_t)(uintptr_t)function_name;
+        attributes.sample_period = 1;
+        attributes.wakeup_events = 1;
+
+        int event_fd = curtsy_perf_event_open(&attributes, -1, (int)cpu, -1, PERF_FLAG_FD_CLOEXEC);
+        if (event_fd < 0) goto failure;
+        if (ioctl(event_fd, PERF_EVENT_IOC_SET_BPF, program_fd) != 0) {
+            int saved_errno = errno;
+            close(event_fd);
+            errno = saved_errno;
+            goto failure;
+        }
+        if (ioctl(event_fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+            int saved_errno = errno;
+            close(event_fd);
+            errno = saved_errno;
+            goto failure;
+        }
+        fds[cpu] = event_fd;
+        attached++;
+    }
+    *event_fds_out = fds;
+    *event_fd_count_out = attached;
+    return 0;
+
+failure: {
         int saved_errno = errno;
-        close(event_fd);
+        for (int i = 0; i < attached; i++) {
+            close(fds[i]);
+        }
+        free(fds);
         errno = saved_errno;
         return -1;
     }
-    if (ioctl(event_fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
-        int saved_errno = errno;
-        close(event_fd);
-        errno = saved_errno;
-        return -1;
-    }
-    return event_fd;
 }
 
 curtsy_bpf_observer *curtsy_bpf_observer_create(
@@ -658,7 +693,6 @@ curtsy_bpf_observer *curtsy_bpf_observer_create(
     observer->counters_fd = -1;
     for (int i = 0; i < CURTSY_OBSERVER_COUNTER_COUNT; i++) {
         observer->program_fds[i] = -1;
-        observer->event_fds[i] = -1;
     }
 
     observer->counters_fd = curtsy_create_map(
@@ -685,8 +719,24 @@ curtsy_bpf_observer *curtsy_bpf_observer_create(
             verifier_log_capacity
         );
         if (observer->program_fds[i] < 0) goto failure;
-        observer->event_fds[i] = curtsy_attach_kprobe(observer->program_fds[i], functions[i]);
-        if (observer->event_fds[i] < 0) goto failure;
+        if (curtsy_attach_kprobe(
+                observer->program_fds[i],
+                functions[i],
+                &observer->event_fds[i],
+                &observer->event_fd_counts[i]
+            ) != 0) {
+            /* The verifier log still holds the successful load output, which
+             * is noise at this point; report the failing stage instead. */
+            if (verifier_log != NULL && verifier_log_capacity > 0) {
+                snprintf(
+                    verifier_log,
+                    verifier_log_capacity,
+                    "stage=kprobe_attach function=%s",
+                    functions[i]
+                );
+            }
+            goto failure;
+        }
     }
     return observer;
 
@@ -701,7 +751,10 @@ failure: {
 void curtsy_bpf_observer_destroy(curtsy_bpf_observer *observer) {
     if (observer == NULL) return;
     for (int i = 0; i < CURTSY_OBSERVER_COUNTER_COUNT; i++) {
-        if (observer->event_fds[i] >= 0) close(observer->event_fds[i]);
+        for (int j = 0; j < observer->event_fd_counts[i]; j++) {
+            close(observer->event_fds[i][j]);
+        }
+        free(observer->event_fds[i]);
         if (observer->program_fds[i] >= 0) close(observer->program_fds[i]);
     }
     if (observer->counters_fd >= 0) close(observer->counters_fd);

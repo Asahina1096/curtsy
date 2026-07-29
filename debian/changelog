@@ -1,3 +1,28 @@
+curtsy (0.2.2) unstable; urgency=medium
+
+  * Report the failing stage in the tuning daemon eBPF observer warning
+    (kprobe attach vs program load) to make deployment diagnostics
+    unambiguous.
+
+ -- Curtsy contributors <maintainers@example.invalid>  Wed, 29 Jul 2026 17:25:10 +0000
+
+curtsy (0.2.1) unstable; urgency=medium
+
+  * Fix tuning daemon eBPF observer never loading: correct an off-by-one
+    jump offset that made the verifier reject the kprobe programs, and
+    attach the kprobe PMU events per online CPU (perf_event_open rejects
+    pid == -1 with cpu == -1).
+
+ -- Curtsy contributors <maintainers@example.invalid>  Wed, 29 Jul 2026 17:15:30 +0000
+
+curtsy (0.2.0) unstable; urgency=medium
+
+  * Add UDP sockmap acceleration: established UDP associations are steered
+    in the kernel via a verdict-only SK_SKB program, controlled by the new
+    performance.udpSockmapAcceleration option (default auto).
+
+ -- Curtsy contributors <maintainers@example.invalid>  Wed, 29 Jul 2026 16:59:49 +0000
+
 curtsy (0.1.0) unstable; urgency=medium
 
   * Initial Debian package.
