@@ -30,5 +30,6 @@ upstream:
 #   maxUDPPendingBytes: auto       # legacy: unused by the batched UDP transport
 # performance:
 #   tcpSockmapAcceleration: auto
+#   udpSockmapAcceleration: auto
 # logging:
 #   level: info

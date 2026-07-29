@@ -161,6 +161,9 @@ enum TCPSockmapAccelerationMode: String, Codable, Sendable {
     case disabled
 }
 
+// Same mode applies to both protocols' sockmap acceleration.
+typealias SockmapAccelerationMode = TCPSockmapAccelerationMode
+
 struct RuntimeOptions: Codable, Equatable, Sendable {
     var workerThreads: Int = 0
     var tuningDaemon: Bool = true
@@ -182,9 +185,14 @@ struct RuntimeOptions: Codable, Equatable, Sendable {
 
 struct PerformanceConfiguration: Codable, Equatable, Sendable {
     var tcpSockmapAcceleration: TCPSockmapAccelerationMode = .auto
+    var udpSockmapAcceleration: SockmapAccelerationMode = .auto
 
-    init(tcpSockmapAcceleration: TCPSockmapAccelerationMode = .auto) {
+    init(
+        tcpSockmapAcceleration: TCPSockmapAccelerationMode = .auto,
+        udpSockmapAcceleration: SockmapAccelerationMode = .auto
+    ) {
         self.tcpSockmapAcceleration = tcpSockmapAcceleration
+        self.udpSockmapAcceleration = udpSockmapAcceleration
     }
 
     init(from decoder: Decoder) throws {
@@ -192,6 +200,10 @@ struct PerformanceConfiguration: Codable, Equatable, Sendable {
         tcpSockmapAcceleration = try container.decodeIfPresent(
             TCPSockmapAccelerationMode.self,
             forKey: .tcpSockmapAcceleration
+        ) ?? .auto
+        udpSockmapAcceleration = try container.decodeIfPresent(
+            SockmapAccelerationMode.self,
+            forKey: .udpSockmapAcceleration
         ) ?? .auto
     }
 }
@@ -285,7 +297,7 @@ enum ConfigurationLoader {
         ],
         "logging": ["level"],
         "runtime": ["workerThreads", "tuningDaemon", "tuningIntervalSeconds"],
-        "performance": ["tcpSockmapAcceleration"]
+        "performance": ["tcpSockmapAcceleration", "udpSockmapAcceleration"]
     ]
 
     static func load(path: String) throws -> ForwarderConfiguration {

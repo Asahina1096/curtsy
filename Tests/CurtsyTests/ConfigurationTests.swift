@@ -45,6 +45,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertTrue(configuration.limits.autoTuning.maxTCPBufferedBytes)
         XCTAssertEqual(configuration.logging.level, "info")
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .auto)
+        XCTAssertEqual(configuration.performance.udpSockmapAcceleration, .auto)
     }
 
     func testLoadsOverrides() throws {
@@ -65,7 +66,7 @@ final class ConfigurationTests: XCTestCase {
           maxUDPPendingDatagrams: 8
           maxUDPPendingBytes: 4096
         runtime: { workerThreads: 2, tuningDaemon: false, tuningIntervalSeconds: 10 }
-        performance: { tcpSockmapAcceleration: enabled }
+        performance: { tcpSockmapAcceleration: enabled, udpSockmapAcceleration: disabled }
         logging: { level: debug }
         """)
 
@@ -82,6 +83,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.runtime.tuningIntervalSeconds, 10)
         XCTAssertFalse(configuration.limits.autoTuning.maxTCPBufferedBytes)
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .enabled)
+        XCTAssertEqual(configuration.performance.udpSockmapAcceleration, .disabled)
     }
 
     func testAcceptsExplicitAutoValues() throws {
@@ -237,6 +239,13 @@ final class ConfigurationTests: XCTestCase {
             listen: { host: "127.0.0.1", port: 9000 }
             upstream: { host: "127.0.0.1", port: 9001 }
             performance: { tcpSockmapAcceleration: sometimes }
+            """,
+            """
+            version: 1
+            protocols: [udp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            performance: { udpSockmapAcceleration: sometimes }
             """
         ]
 
@@ -282,6 +291,17 @@ final class ConfigurationTests: XCTestCase {
         var disabled = makeConfiguration(upstreamHost: "192.0.2.1")
         disabled.performance = PerformanceConfiguration(tcpSockmapAcceleration: .disabled)
         XCTAssertFalse(try ResolvedConfiguration.resolve(disabled).shouldEnableTCPSockmap)
+
+        var udpEnabled = makeConfiguration(upstreamHost: "127.0.0.1")
+        udpEnabled.performance = PerformanceConfiguration(udpSockmapAcceleration: .enabled)
+        XCTAssertTrue(try ResolvedConfiguration.resolve(udpEnabled).shouldEnableUDPSockmap)
+
+        var udpDisabled = makeConfiguration(upstreamHost: "192.0.2.1")
+        udpDisabled.performance = PerformanceConfiguration(udpSockmapAcceleration: .disabled)
+        XCTAssertFalse(try ResolvedConfiguration.resolve(udpDisabled).shouldEnableUDPSockmap)
+
+        let udpAuto = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "192.0.2.1"))
+        XCTAssertTrue(udpAuto.shouldEnableUDPSockmap)
     }
 
     func testDetectsListenHostnameResolutionChange() throws {

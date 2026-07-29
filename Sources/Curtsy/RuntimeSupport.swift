@@ -44,6 +44,15 @@ struct ResolvedConfiguration: Sendable {
         }
     }
 
+    var shouldEnableUDPSockmap: Bool {
+        switch configuration.performance.udpSockmapAcceleration {
+        case .enabled, .auto:
+            return true
+        case .disabled:
+            return false
+        }
+    }
+
 }
 
 final class RuntimeConfiguration: @unchecked Sendable {

@@ -100,6 +100,14 @@ TCP 转发路径使用大块自适应读取、批量 flush 和背压控制，目
 
 高 RTT 链路需要足够大的系统 TCP 自动调优上限。例如 1 Gbps、100 ms RTT 的链路至少需要约 12.5 MB 的 TCP 窗口，可按部署环境检查并调整 `net.ipv4.tcp_rmem`、`net.ipv4.tcp_wmem`、`net.core.rmem_max` 和 `net.core.wmem_max`。Curtsy 不会自行覆盖这些系统级参数。
 
+## UDP 性能
+
+UDP 转发由独立 I/O 线程驱动：epoll 管理全部监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发，会话在首个报文到达时同步建立。
+
+在具备 eBPF 权限且内核 ≥ 5.12 的 Linux 上，Curtsy 还可以为 UDP 会话启用 sockmap 内核转发：首个报文仍由用户态建立会话，随后为该客户端创建一个 connect 到其地址的专用 socket（内核 demux 按四元组精确匹配优先于通配 listener），并把客户端 socket 与上游 socket 配对放入 `BPF_MAP_TYPE_SOCKHASH`；`SK_SKB` verdict 程序用 `bpf_sk_redirect_hash` 把两个方向的报文直接转发到对端发送路径，不再经过用户态。BPF 记录双向最后活动时间，加速会话仍遵守 `udpSessionSeconds`；会话过期后关闭专用 socket，后续报文自动回落到 listener 重建会话。
+
+`performance.udpSockmapAcceleration` 控制该路径，语义与 TCP 版本相同（`enabled` / `disabled` / 默认 `auto`）。在 Linux 6.8 回环实测中（iperf3 UDP 20G 注入），启用后吞吐从约 6.6 Gbit/s 提升到约 28 Gbit/s，转发进程 CPU 占用同时大幅下降。权限不足、内核不支持或单会话配对失败时逐层回退到用户态 relay，服务启动不受影响；重定向失败而落入用户态的零星报文由引擎兜底转发。热加载改变此项时，已有 UDP 会话会被清除并按新模式重建。
+
 ## 配置约束
 
 - 当前版本只支持一条监听规则和一个上游。

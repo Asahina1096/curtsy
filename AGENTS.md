@@ -48,16 +48,17 @@ SwiftPM 标准布局，共两个源 target 和一个测试 target：
   - `ForwarderService.swift`：服务编排器。持有 `MultiThreadedEventLoopGroup`（线程数 = CPU 核数），处理 `SIGHUP` 热加载与 `SIGINT`/`SIGTERM` 优雅退出（最多等待 `shutdownGraceSeconds`）。
   - `TCPForwarder.swift`：`TCPListener`（每事件循环一个 `SO_REUSEPORT` 监听 socket）、`TCPFrontendHandler` / `TCPRelayHandler`（双向 relay、背压、`IdleStateHandler` 空闲超时）、`TCPBufferBudget`（全局用户态缓冲预算，默认 256 MiB）。
   - `UDPForwarder.swift`：`UDPListener` / `UDPRelayEngine`（独立 I/O 线程用 epoll 管理监听与上游 socket，`recvmmsg`/`sendmmsg` 批量收发，64 报文批次；按客户端四元组隔离会话，50ms 周期扫描空闲回收，`maxUDPAssociations` 上限）、`UDPAssociationBudget`。
-  - `TCPSockmapAccelerator.swift` / `ReusePortBPF.swift`：eBPF 加速路径的 Swift 封装（sockmap 内核转发、reuseport 分流程序）。loader 失败（无权限、内核不支持）时抛错，由调用方回退到用户态路径。
-- `Sources/CBPFSupport/`：C target，直接调用 `bpf()` syscall 加载 eBPF 程序并管理 `BPF_MAP_TYPE_SOCKHASH`，头文件在 `include/CBPFSupport.h`。Swift 侧通过它创建/配对/解除 sockmap 连接并查询空闲剩余时间；另封装 UDP 批量 I/O（`recvmmsg`/`sendmmsg`）与 epoll/eventfd/UDP socket 创建等类型敏感的原语，Swift 侧不直接碰这些 C 类型。
+  - `TCPSockmapAccelerator.swift` / `UDPSockmapAccelerator.swift` / `ReusePortBPF.swift`：eBPF 加速路径的 Swift 封装（TCP/UDP sockmap 内核转发、reuseport 分流程序）。loader 失败（无权限、内核不支持）时抛错，由调用方回退到用户态路径。
+- `Sources/CBPFSupport/`：C target，直接调用 `bpf()` syscall 加载 eBPF 程序并管理 `BPF_MAP_TYPE_SOCKHASH`，头文件在 `include/CBPFSupport.h`。Swift 侧通过它创建/配对/解除 sockmap 连接并查询空闲剩余时间；UDP sockmap 使用仅 verdict 的 SK_SKB 程序（`BPF_SK_SKB_VERDICT`，需内核 ≥ 5.12），复用与 TCP 相同的 cookie 配对与活动时间戳逻辑。另封装 UDP 批量 I/O（`recvmmsg`/`sendmmsg`）与 epoll/eventfd/UDP socket 创建（含 per-client connected socket）等类型敏感的原语，Swift 侧不直接碰这些 C 类型。
 - `Tests/CurtsyTests/`：XCTest 测试（见"测试策略"一节）。
 
 ## 运行时架构要点
 
-- 热加载（`SIGHUP`）：监听地址变化时先绑新端口再停旧监听；失败则整体回滚到旧配置。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 sockmap 模式时已有 TCP 连接保持原模式，UDP listener 和会话不受影响。
+- 热加载（`SIGHUP`）：监听地址变化时先绑新端口再停旧监听；失败则整体回滚到旧配置。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 TCP sockmap 模式时已有 TCP 连接保持原模式；改变 UDP sockmap 模式时已有 UDP 会话被清除并按新模式重建。
 - 优雅退出：先停止 accept，等待已有 TCP 连接，超时（`shutdownGraceSeconds`）后强制关闭。
 - TCP 性能：大块自适应读缓冲、批量 flush、水位线背压控制；多 worker 时通过 `SO_ATTACH_REUSEPORT_EBPF` 按连接四元组 hash 分流，失败时回退内核原生 `SO_REUSEPORT` hash。
 - UDP 性能：独立 I/O 线程（`curtsy-udp-io`）用 epoll 驱动全部监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发；会话建立是同步的（UDP connect 无握手），不存在待转发缓冲窗口。
+- UDP sockmap 加速（`performance.udpSockmapAcceleration`，语义同 TCP）：首报文走用户态建会话，随后为该客户端创建 connect 到其地址的专用 socket（bind 到监听地址，内核 demux 四元组精确匹配优先于通配 listener），与上游 socket 配对放入 UDP 专用 sockhash；verdict 程序双向重定向到对端发送路径，数据面不再过用户态。会话过期改为读 BPF 活动时间；过期或解除配对后报文自动回落 listener 重建会话。配对失败的会话、verdict 未命中（SK_PASS）的报文均由用户态引擎兜底转发。改变此项配置时已有 UDP 会话被清除并按新模式重建。
 - sockmap 加速（`performance.tcpSockmapAcceleration`）：`enabled` / `disabled` / `auto`（默认，对所有上游尝试启用，包括回环）。无权限或内核不支持时自动回退用户态 relay，不影响服务启动。sockmap 内核转发不占用用户态缓冲预算，BPF 记录双向最后活动时间，加速连接仍遵守 `tcpIdleSeconds`。
 - 并发约定：跨线程共享状态使用 `NIOLockedValueBox` 或 `ManagedAtomic`；事件循环上的可变状态只在对应 `EventLoop` 上访问；关键类标注 `@unchecked Sendable`。
 

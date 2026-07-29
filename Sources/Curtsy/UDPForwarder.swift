@@ -30,12 +30,25 @@ final class UDPListener: @unchecked Sendable {
     private let runtime: RuntimeConfiguration
     private let engine: UDPRelayEngine
 
-    init(group: EventLoopGroup, configuration: ResolvedConfiguration, log: LogStore) {
+    init(
+        group: EventLoopGroup,
+        configuration: ResolvedConfiguration,
+        log: LogStore,
+        enableSockmapAcceleration: Bool? = nil,
+        loadSockmapAccelerator: @escaping (Int) throws -> UDPSockmapAccelerator = { maxEntries in
+            try UDPSockmapAccelerator.load(maxEntries: maxEntries)
+        }
+    ) {
         // The batched transport runs its own I/O thread instead of event loop
         // channels; the group parameter only keeps call sites unchanged.
         _ = group
         runtime = RuntimeConfiguration(configuration)
-        engine = UDPRelayEngine(runtime: runtime, log: log)
+        engine = UDPRelayEngine(
+            runtime: runtime,
+            log: log,
+            enableSockmapAcceleration: enableSockmapAcceleration,
+            loadSockmapAccelerator: loadSockmapAccelerator
+        )
     }
 
     func start() throws {
@@ -46,6 +59,7 @@ final class UDPListener: @unchecked Sendable {
         // Timeout changes apply on the engine's next expiry sweep, which reads
         // the current snapshot; only upstream changes need association resets.
         runtime.update(configuration)
+        engine.updateAccelerator()
         if resetAssociations {
             engine.resetAssociations()
         }
@@ -68,6 +82,7 @@ final class UDPRelayEngine: @unchecked Sendable {
     private enum Command {
         case stop
         case resetAssociations
+        case reloadAccelerator
     }
 
     private struct Association {
@@ -76,6 +91,10 @@ final class UDPRelayEngine: @unchecked Sendable {
         let clientAddressLength: socklen_t
         let listenFD: Int32
         let upstreamFD: Int32
+        // Connected per-client socket and its kernel pairing; present only
+        // when this association is steered by the sockmap verdict program.
+        let clientFD: Int32?
+        let sockmap: UDPSockmapAssociation?
         var lastActivityMilliseconds: UInt64
     }
 
@@ -87,6 +106,8 @@ final class UDPRelayEngine: @unchecked Sendable {
     private let log: LogStore
     private let budget = UDPAssociationBudget()
     private let pendingCommands = NIOLockedValueBox<[Command]>([])
+    private let enableSockmapAccelerationOverride: Bool?
+    private let loadSockmapAccelerator: (Int) throws -> UDPSockmapAccelerator
     // running is set before the I/O thread starts and cleared in its defer
     // before teardown; the wake fd stays open until stop() joins the thread,
     // so a signal write can never land on a closed or reused descriptor.
@@ -101,11 +122,23 @@ final class UDPRelayEngine: @unchecked Sendable {
     private var listenFDs: [Int32] = []
     private var associations: [SocketAddress: Association] = [:]
     private var upstreamToClient: [Int32: SocketAddress] = [:]
+    private var clientFDToClient: [Int32: SocketAddress] = [:]
+    private var listenBoundAddresses: [Int32: sockaddr_storage] = [:]
+    private var sockmapAccelerator: UDPSockmapAccelerator?
     private var warnedAtLimit = false
 
-    init(runtime: RuntimeConfiguration, log: LogStore) {
+    init(
+        runtime: RuntimeConfiguration,
+        log: LogStore,
+        enableSockmapAcceleration: Bool? = nil,
+        loadSockmapAccelerator: @escaping (Int) throws -> UDPSockmapAccelerator = { maxEntries in
+            try UDPSockmapAccelerator.load(maxEntries: maxEntries)
+        }
+    ) {
         self.runtime = runtime
         self.log = log
+        enableSockmapAccelerationOverride = enableSockmapAcceleration
+        self.loadSockmapAccelerator = loadSockmapAccelerator
     }
 
     var localAddresses: [SocketAddress] { boundAddresses.withLockedValue { $0 } }
@@ -116,6 +149,7 @@ final class UDPRelayEngine: @unchecked Sendable {
         let snapshot = runtime.current()
         var addresses: [SocketAddress] = []
         var createdFDs: [Int32] = []
+        var boundStorages: [Int32: sockaddr_storage] = [:]
         var epollFD: Int32 = -1
         var wakeFD: Int32 = -1
 
@@ -132,6 +166,7 @@ final class UDPRelayEngine: @unchecked Sendable {
                         Glibc.close(fd)
                         throw IOError(errnoCode: EAFNOSUPPORT, reason: "udp listen address family")
                     }
+                    boundStorages[fd] = bound
                     addresses.append(boundAddress)
                     return fd
                 }
@@ -165,7 +200,21 @@ final class UDPRelayEngine: @unchecked Sendable {
         self.epollFD = epollFD
         self.wakeFD = wakeFD
         listenFDs = createdFDs
+        listenBoundAddresses = boundStorages
         boundAddresses.withLockedValue { $0 = addresses }
+
+        let shouldEnableSockmap = enableSockmapAccelerationOverride ?? snapshot.shouldEnableUDPSockmap
+        if shouldEnableSockmap {
+            do {
+                sockmapAccelerator = try loadSockmapAccelerator(Self.sockmapMaxEntries(for: snapshot))
+                log.info("udp sockmap acceleration enabled")
+            } catch {
+                log.warning("udp sockmap acceleration unavailable; using userspace relay error=\(error)")
+            }
+        } else {
+            log.info("udp sockmap acceleration disabled")
+        }
+
         lifecycle.withLockedValue { $0 = true }
 
         let thread = Thread { [weak self] in self?.run() }
@@ -175,6 +224,10 @@ final class UDPRelayEngine: @unchecked Sendable {
 
     func resetAssociations() {
         enqueue(.resetAssociations)
+    }
+
+    func updateAccelerator() {
+        enqueue(.reloadAccelerator)
     }
 
     func stop() {
@@ -239,6 +292,8 @@ final class UDPRelayEngine: @unchecked Sendable {
                     return
                 case .resetAssociations:
                     closeAllAssociations()
+                case .reloadAccelerator:
+                    reloadAccelerator()
                 }
             }
 
@@ -246,6 +301,8 @@ final class UDPRelayEngine: @unchecked Sendable {
                 for fd in readyFDs.prefix(Int(ready)) {
                     if fd == wakeFD {
                         curtsy_eventfd_drain(wakeFD)
+                    } else if clientFDToClient[fd] != nil {
+                        drainClient(fd: fd, slots: &recvSlots)
                     } else if upstreamToClient[fd] != nil {
                         drainUpstream(fd: fd, slots: &recvSlots)
                     } else {
@@ -261,10 +318,37 @@ final class UDPRelayEngine: @unchecked Sendable {
         closeAllAssociations()
         for fd in listenFDs { Glibc.close(fd) }
         listenFDs = []
+        listenBoundAddresses = [:]
         if epollFD >= 0 { Glibc.close(epollFD) }
         if wakeFD >= 0 { Glibc.close(wakeFD) }
         epollFD = -1
         wakeFD = -1
+        sockmapAccelerator = nil
+    }
+
+    private static func sockmapMaxEntries(for snapshot: ResolvedConfiguration) -> Int {
+        max(1024, snapshot.configuration.limits.maxUDPAssociations * 2)
+    }
+
+    private func reloadAccelerator() {
+        let snapshot = runtime.current()
+        let requested = enableSockmapAccelerationOverride ?? snapshot.shouldEnableUDPSockmap
+        if requested, sockmapAccelerator == nil {
+            do {
+                sockmapAccelerator = try loadSockmapAccelerator(Self.sockmapMaxEntries(for: snapshot))
+                log.info("udp sockmap acceleration enabled")
+                // Only newly established associations are steered.
+                closeAllAssociations()
+            } catch {
+                log.warning("udp sockmap acceleration unavailable; using userspace relay error=\(error)")
+            }
+        } else if !requested, sockmapAccelerator != nil {
+            log.info("udp sockmap acceleration disabled")
+            // Close first so existing sessions fall back to the userspace
+            // relay before the runtime is destroyed.
+            closeAllAssociations()
+            sockmapAccelerator = nil
+        }
     }
 
     private func drainListen(
@@ -330,6 +414,42 @@ final class UDPRelayEngine: @unchecked Sendable {
         }
         if runLength > 0 {
             _ = curtsy_udp_send_batch(runFD, nil, 0, sendBase, UInt32(runLength))
+        }
+    }
+
+    // Fallback path for an accelerated association: datagrams queued on the
+    // connected client socket before pairing completed (or passed through via
+    // SK_PASS) are relayed by userspace like ordinary listen-socket traffic.
+    private func drainClient(fd: Int32, slots: inout [curtsy_udp_slot]) {
+        guard
+            let client = clientFDToClient[fd],
+            let association = associations[client]
+        else { return }
+        slots.withUnsafeMutableBufferPointer { slotBuffer in
+            while true {
+                let received = curtsy_udp_recv_batch(
+                    fd,
+                    slotBuffer.baseAddress,
+                    UInt32(Self.batchSize)
+                )
+                if received == 0 { return }
+                if received < 0 {
+                    log.error(
+                        "udp client socket read failed client=\(client.curtsyDescription) "
+                            + "error=\(Self.errnoDescription())"
+                    )
+                    closeAssociation(client: client)
+                    return
+                }
+                associations[client]?.lastActivityMilliseconds = Self.monotonicMilliseconds()
+                _ = curtsy_udp_send_batch(
+                    association.upstreamFD,
+                    nil,
+                    0,
+                    slotBuffer.baseAddress,
+                    UInt32(received)
+                )
+            }
         }
     }
 
@@ -404,16 +524,40 @@ final class UDPRelayEngine: @unchecked Sendable {
                 Glibc.close(upstreamFD)
                 throw IOError(errnoCode: errorNumber, reason: "epoll add upstream socket")
             }
+            var clientFD: Int32? = nil
+            var pairing: UDPSockmapAssociation? = nil
+            if let accelerator = sockmapAccelerator, let bindStorage = listenBoundAddresses[listenFD] {
+                do {
+                    (clientFD, pairing) = try accelerateAssociation(
+                        accelerator: accelerator,
+                        bindStorage: bindStorage,
+                        clientAddress: clientAddress,
+                        clientAddressLength: clientAddressLength,
+                        upstreamFD: upstreamFD
+                    )
+                } catch {
+                    // Kernel steering is best-effort per association; fall
+                    // back to the userspace relay for this client.
+                    log.debug(
+                        "udp sockmap pairing failed client=\(client.curtsyDescription) error=\(error)"
+                    )
+                }
+            }
             let association = Association(
                 client: client,
                 clientAddress: clientAddress,
                 clientAddressLength: clientAddressLength,
                 listenFD: listenFD,
                 upstreamFD: upstreamFD,
+                clientFD: clientFD,
+                sockmap: pairing,
                 lastActivityMilliseconds: Self.monotonicMilliseconds()
             )
             associations[client] = association
             upstreamToClient[upstreamFD] = client
+            if let clientFD {
+                clientFDToClient[clientFD] = client
+            }
             warnedAtLimit = false
             log.debug(
                 "udp association opened client=\(client.curtsyDescription) "
@@ -427,9 +571,67 @@ final class UDPRelayEngine: @unchecked Sendable {
         }
     }
 
+    // Creates the connected per-client socket and pairs it with the upstream
+    // socket in the sockmap. Once bound, the kernel demux prefers this
+    // four-tuple socket over the wildcard listener, so subsequent datagrams
+    // from the client are steered by the verdict program.
+    private func accelerateAssociation(
+        accelerator: UDPSockmapAccelerator,
+        bindStorage: sockaddr_storage,
+        clientAddress: sockaddr_storage,
+        clientAddressLength: socklen_t,
+        upstreamFD: Int32
+    ) throws -> (Int32, UDPSockmapAssociation) {
+        let bindLength: socklen_t
+        switch Int32(bindStorage.ss_family) {
+        case AF_INET:
+            bindLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        case AF_INET6:
+            bindLength = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        default:
+            throw IOError(errnoCode: EAFNOSUPPORT, reason: "udp client socket address family")
+        }
+        var bindStorage = bindStorage
+        var clientAddress = clientAddress
+        let fd = withUnsafePointer(to: &bindStorage) { bindPointer in
+            withUnsafePointer(to: &clientAddress) { clientPointer in
+                bindPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { bindAddress in
+                    clientPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { peerAddress in
+                        curtsy_udp_connected_client_socket(
+                            bindAddress,
+                            bindLength,
+                            peerAddress,
+                            clientAddressLength
+                        )
+                    }
+                }
+            }
+        }
+        guard fd >= 0 else {
+            throw IOError(errnoCode: errno, reason: "udp client socket")
+        }
+        do {
+            let pairing = try accelerator.pair(clientFD: fd, upstreamFD: upstreamFD)
+            guard curtsy_epoll_add(epollFD, fd) == 0 else {
+                throw IOError(errnoCode: errno, reason: "epoll add client socket")
+            }
+            return (fd, pairing)
+        } catch {
+            Glibc.close(fd)
+            throw error
+        }
+    }
+
     private func closeAssociation(client: SocketAddress) {
         guard let association = associations.removeValue(forKey: client) else { return }
+        // Stop kernel steering first; further datagrams then fall back to the
+        // userspace relay (or to the listener once the sockets are gone).
+        association.sockmap?.close()
         upstreamToClient.removeValue(forKey: association.upstreamFD)
+        if let clientFD = association.clientFD {
+            clientFDToClient.removeValue(forKey: clientFD)
+            Glibc.close(clientFD)
+        }
         Glibc.close(association.upstreamFD)
         budget.release()
         warnedAtLimit = false
@@ -444,14 +646,26 @@ final class UDPRelayEngine: @unchecked Sendable {
     private func sweepExpiredAssociations() {
         let timeoutSeconds = runtime.current().configuration.timeouts.udpSessionSeconds
         let timeoutMilliseconds = UInt64(max(1, timeoutSeconds)) * 1_000
+        let timeoutNanoseconds = timeoutMilliseconds * 1_000_000
         let now = Self.monotonicMilliseconds()
         for client in Array(associations.keys) {
-            guard
-                let association = associations[client],
-                now &- association.lastActivityMilliseconds >= timeoutMilliseconds
-            else { continue }
-            log.debug("udp association expired client=\(client.curtsyDescription)")
-            closeAssociation(client: client)
+            guard let association = associations[client] else { continue }
+            if let pairing = association.sockmap {
+                // Steered traffic never reaches userspace; the BPF peer state
+                // holds the last-activity timestamp instead.
+                let remaining = try? pairing.idleRemaining(timeoutNanoseconds: timeoutNanoseconds)
+                guard let remaining, remaining > 0 else {
+                    log.debug("udp association expired client=\(client.curtsyDescription)")
+                    closeAssociation(client: client)
+                    continue
+                }
+            } else {
+                guard now &- association.lastActivityMilliseconds < timeoutMilliseconds else {
+                    log.debug("udp association expired client=\(client.curtsyDescription)")
+                    closeAssociation(client: client)
+                    continue
+                }
+            }
         }
     }
 

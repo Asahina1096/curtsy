@@ -170,7 +170,12 @@ final class ForwardingTests: XCTestCase {
         defer { try? echo.close().wait() }
 
         let configuration = makeResolvedConfiguration(protocols: [.udp], upstreamPort: echo.localAddress!.port!)
-        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        let listener = UDPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
         try listener.start()
         defer { listener.stop() }
 
@@ -206,7 +211,8 @@ final class ForwardingTests: XCTestCase {
         let listener = UDPListener(
             group: group,
             configuration: try ResolvedConfiguration.resolve(configuration),
-            log: LogStore(level: "critical")
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
         )
         try listener.start()
         defer { listener.stop() }
@@ -247,7 +253,12 @@ final class ForwardingTests: XCTestCase {
         defer { try? echo.close().wait() }
 
         let configuration = makeResolvedConfiguration(protocols: [.udp], upstreamPort: echo.localAddress!.port!)
-        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        let listener = UDPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
         try listener.start()
         defer { listener.stop() }
 
@@ -281,7 +292,12 @@ final class ForwardingTests: XCTestCase {
             upstreamPort: echo.localAddress!.port!,
             udpSessionSeconds: 1
         )
-        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        let listener = UDPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
         try listener.start()
         defer { listener.stop() }
 
@@ -312,7 +328,12 @@ final class ForwardingTests: XCTestCase {
             upstreamPort: echo.localAddress!.port!,
             udpSessionSeconds: 10
         )
-        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        let listener = UDPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
         try listener.start()
         defer { listener.stop() }
 
@@ -344,7 +365,12 @@ final class ForwardingTests: XCTestCase {
             upstreamPort: echo.localAddress!.port!,
             udpSessionSeconds: 1
         )
-        let listener = UDPListener(group: group, configuration: configuration, log: LogStore(level: "critical"))
+        let listener = UDPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
         try listener.start()
         defer { listener.stop() }
 
@@ -361,6 +387,71 @@ final class ForwardingTests: XCTestCase {
         listener.update(configuration: extended, resetAssociations: false)
         Thread.sleep(forTimeInterval: 1.5)
         XCTAssertEqual(listener.associationCount, 1)
+    }
+
+    func testUDPListenerUsesResolvedSockmapDecisionAndAllowsTestOverride() throws {
+        let loopback = makeResolvedConfiguration(protocols: [.udp], upstreamPort: 9)
+        var loadCount = 0
+        let loader: (Int) throws -> UDPSockmapAccelerator = { _ in
+            loadCount += 1
+            throw UDPSockmapAccelerator.AcceleratorError.systemCall(errorNumber: EPERM)
+        }
+
+        // Auto mode attempts to load even for loopback upstreams.
+        let automatic = UDPListener(
+            group: group,
+            configuration: loopback,
+            log: LogStore(level: "critical"),
+            loadSockmapAccelerator: loader
+        )
+        try automatic.start()
+        defer { automatic.stop() }
+        XCTAssertEqual(loadCount, 1)
+
+        // Failed loads are retried on configuration updates while sockmap stays requested.
+        automatic.update(configuration: loopback, resetAssociations: false)
+        XCTAssertTrue(waitForCondition { loadCount == 2 })
+
+        // Explicit override forces the decision regardless of configuration.
+        let disabled = UDPListener(
+            group: group,
+            configuration: loopback,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false,
+            loadSockmapAccelerator: loader
+        )
+        try disabled.start()
+        defer { disabled.stop() }
+        XCTAssertEqual(loadCount, 2)
+    }
+
+    func testUDPSockmapLoaderFailureFallsBackToUserspaceRelay() throws {
+        let echo = try DatagramBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(UDPEchoHandler())
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+        defer { try? echo.close().wait() }
+
+        let configuration = makeResolvedConfiguration(protocols: [.udp], upstreamPort: echo.localAddress!.port!)
+        let listener = UDPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: true,
+            loadSockmapAccelerator: { _ in
+                throw UDPSockmapAccelerator.AcceleratorError.systemCall(errorNumber: EPERM)
+            }
+        )
+        try listener.start()
+        defer { listener.stop() }
+
+        let client = try makeUDPClient(message: "ping", destination: listener.localAddresses[0])
+        defer { try? client.channel.close().wait() }
+        client.recorder.wait()
+        XCTAssertEqual(client.recorder.string, "ping")
+        XCTAssertTrue(waitForCondition { listener.associationCount == 1 })
     }
 
     func testTCPListeningBacklogCanBeUpdatedInPlace() throws {
@@ -404,7 +495,12 @@ final class ForwardingTests: XCTestCase {
         XCTAssertEqual(tcp.listenerChannelCount, 4)
         tcp.stopAccepting()
 
-        let udp = UDPListener(group: group, configuration: resolved, log: LogStore(level: "critical"))
+        let udp = UDPListener(
+            group: group,
+            configuration: resolved,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
         try udp.start()
         XCTAssertEqual(udp.localAddresses.count, 2)
         udp.stop()

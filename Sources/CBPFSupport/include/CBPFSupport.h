@@ -23,6 +23,15 @@ curtsy_sockmap_runtime *curtsy_sockmap_create(
     size_t verifier_log_capacity
 );
 
+// UDP variant: attaches only a BPF_SK_SKB_VERDICT program (no stream
+// parser), which steers whole datagrams between paired connected UDP
+// sockets. Requires kernel >= 5.12 for UDP verdict support.
+curtsy_sockmap_runtime *curtsy_udp_sockmap_create(
+    uint32_t max_entries,
+    char *verifier_log,
+    size_t verifier_log_capacity
+);
+
 void curtsy_sockmap_destroy(curtsy_sockmap_runtime *runtime);
 
 int32_t curtsy_sockmap_pair(
@@ -121,5 +130,16 @@ int32_t curtsy_udp_listen_socket(
 
 // Creates a datagram socket connected to address (default destination).
 int32_t curtsy_udp_upstream_socket(const struct sockaddr *address, socklen_t address_length);
+
+// Creates a datagram socket bound to bind_address (SO_REUSEADDR; IPV6_V6ONLY
+// for AF_INET6) and connected to peer_address. Used for per-client UDP
+// sockets: the kernel demux prefers this connected four-tuple socket over the
+// wildcard listener, so the client's datagrams land here once it exists.
+int32_t curtsy_udp_connected_client_socket(
+    const struct sockaddr *bind_address,
+    socklen_t bind_address_length,
+    const struct sockaddr *peer_address,
+    socklen_t peer_address_length
+);
 
 #endif

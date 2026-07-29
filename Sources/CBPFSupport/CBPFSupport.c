@@ -33,6 +33,7 @@ struct curtsy_sockmap_runtime {
     int peer_fd;
     int parser_fd;
     int program_fd;
+    int verdict_attach_type;
 };
 
 struct curtsy_peer_state {
@@ -113,13 +114,16 @@ static int curtsy_get_socket_cookie(int socket_fd, uint64_t *cookie) {
     CURTSY_INSN(BPF_LD | BPF_DW | BPF_IMM, DST, BPF_PSEUDO_MAP_FD, 0, FD), \
     CURTSY_INSN(0, 0, 0, 0, 0)
 
-static int curtsy_load_sockmap_program(
+/* Fills instructions with the shared sockmap verdict program: look up the
+ * peer by socket cookie, throttle-refresh activity, redirect to the peer's
+ * transmit path; fall back to SK_PASS until pairing completes.
+ * Returns the instruction count (at most 32). */
+static size_t curtsy_fill_verdict_instructions(
+    struct bpf_insn *instructions,
     int sockhash_fd,
-    int peer_fd,
-    char *verifier_log,
-    size_t verifier_log_capacity
+    int peer_fd
 ) {
-    struct bpf_insn instructions[] = {
+    struct bpf_insn program[] = {
         /* r6 = skb; cookie at fp-8 */
         CURTSY_MOV64_REG(BPF_REG_6, BPF_REG_1),
         CURTSY_CALL(BPF_FUNC_get_socket_cookie),
@@ -162,17 +166,31 @@ static int curtsy_load_sockmap_program(
         CURTSY_MOV64_IMM(BPF_REG_0, SK_PASS),
         CURTSY_EXIT(),
     };
+    size_t count = sizeof(program) / sizeof(program[0]);
+    memcpy(instructions, program, sizeof(program));
+    return count;
+}
+
+static int curtsy_load_verdict_program(
+    int sockhash_fd,
+    int peer_fd,
+    enum bpf_attach_type attach_type,
+    const char *program_name,
+    char *verifier_log,
+    size_t verifier_log_capacity
+) {
+    struct bpf_insn instructions[32];
+    size_t count = curtsy_fill_verdict_instructions(instructions, sockhash_fd, peer_fd);
     static const char license[] = "GPL";
-    static const char program_name[] = "curtsy_sockmap";
 
     union bpf_attr attributes;
     memset(&attributes, 0, sizeof(attributes));
     attributes.prog_type = BPF_PROG_TYPE_SK_SKB;
-    attributes.expected_attach_type = BPF_SK_SKB_STREAM_VERDICT;
-    attributes.insn_cnt = (uint32_t)(sizeof(instructions) / sizeof(instructions[0]));
+    attributes.expected_attach_type = attach_type;
+    attributes.insn_cnt = (uint32_t)count;
     attributes.insns = (uint64_t)(uintptr_t)instructions;
     attributes.license = (uint64_t)(uintptr_t)license;
-    memcpy(attributes.prog_name, program_name, sizeof(program_name));
+    strncpy(attributes.prog_name, program_name, BPF_OBJ_NAME_LEN - 1);
     if (verifier_log != NULL && verifier_log_capacity > 0) {
         verifier_log[0] = '\0';
         attributes.log_level = 1;
@@ -274,8 +292,9 @@ int32_t curtsy_load_reuseport_bpf(
     return (int32_t)syscall(SYS_bpf, BPF_PROG_LOAD, &attributes, sizeof(attributes));
 }
 
-curtsy_sockmap_runtime *curtsy_sockmap_create(
+static curtsy_sockmap_runtime *curtsy_sockmap_create_internal(
     uint32_t max_entries,
+    int for_udp,
     char *verifier_log,
     size_t verifier_log_capacity
 ) {
@@ -292,9 +311,14 @@ curtsy_sockmap_runtime *curtsy_sockmap_create(
     runtime->peer_fd = -1;
     runtime->parser_fd = -1;
     runtime->program_fd = -1;
+    runtime->verdict_attach_type = for_udp ? BPF_SK_SKB_VERDICT : BPF_SK_SKB_STREAM_VERDICT;
 
     runtime->sockhash_fd = curtsy_create_map(
-        BPF_MAP_TYPE_SOCKHASH, sizeof(uint64_t), sizeof(uint32_t), max_entries, "curtsy_socks"
+        BPF_MAP_TYPE_SOCKHASH,
+        sizeof(uint64_t),
+        sizeof(uint32_t),
+        max_entries,
+        for_udp ? "curtsy_udpsocks" : "curtsy_socks"
     );
     if (runtime->sockhash_fd < 0) {
         goto failure;
@@ -304,18 +328,22 @@ curtsy_sockmap_runtime *curtsy_sockmap_create(
         sizeof(uint64_t),
         sizeof(struct curtsy_peer_state),
         max_entries,
-        "curtsy_peers"
+        for_udp ? "curtsy_udppeer" : "curtsy_peers"
     );
     if (runtime->peer_fd < 0) {
         goto failure;
     }
-    runtime->parser_fd = curtsy_load_sockmap_parser(verifier_log, verifier_log_capacity);
-    if (runtime->parser_fd < 0) {
-        goto failure;
+    if (!for_udp) {
+        runtime->parser_fd = curtsy_load_sockmap_parser(verifier_log, verifier_log_capacity);
+        if (runtime->parser_fd < 0) {
+            goto failure;
+        }
     }
-    runtime->program_fd = curtsy_load_sockmap_program(
+    runtime->program_fd = curtsy_load_verdict_program(
         runtime->sockhash_fd,
         runtime->peer_fd,
+        (enum bpf_attach_type)runtime->verdict_attach_type,
+        for_udp ? "curtsy_udp" : "curtsy_sockmap",
         verifier_log,
         verifier_log_capacity
     );
@@ -323,18 +351,21 @@ curtsy_sockmap_runtime *curtsy_sockmap_create(
         goto failure;
     }
 
+    if (runtime->parser_fd >= 0) {
+        union bpf_attr attributes;
+        memset(&attributes, 0, sizeof(attributes));
+        attributes.target_fd = (uint32_t)runtime->sockhash_fd;
+        attributes.attach_bpf_fd = (uint32_t)runtime->parser_fd;
+        attributes.attach_type = BPF_SK_SKB_STREAM_PARSER;
+        if (curtsy_bpf(BPF_PROG_ATTACH, &attributes) != 0) {
+            goto failure;
+        }
+    }
     union bpf_attr attributes;
     memset(&attributes, 0, sizeof(attributes));
     attributes.target_fd = (uint32_t)runtime->sockhash_fd;
-    attributes.attach_bpf_fd = (uint32_t)runtime->parser_fd;
-    attributes.attach_type = BPF_SK_SKB_STREAM_PARSER;
-    if (curtsy_bpf(BPF_PROG_ATTACH, &attributes) != 0) {
-        goto failure;
-    }
-    memset(&attributes, 0, sizeof(attributes));
-    attributes.target_fd = (uint32_t)runtime->sockhash_fd;
     attributes.attach_bpf_fd = (uint32_t)runtime->program_fd;
-    attributes.attach_type = BPF_SK_SKB_STREAM_VERDICT;
+    attributes.attach_type = (enum bpf_attach_type)runtime->verdict_attach_type;
     if (curtsy_bpf(BPF_PROG_ATTACH, &attributes) != 0) goto failure;
     return runtime;
 
@@ -346,6 +377,22 @@ failure: {
     }
 }
 
+curtsy_sockmap_runtime *curtsy_sockmap_create(
+    uint32_t max_entries,
+    char *verifier_log,
+    size_t verifier_log_capacity
+) {
+    return curtsy_sockmap_create_internal(max_entries, 0, verifier_log, verifier_log_capacity);
+}
+
+curtsy_sockmap_runtime *curtsy_udp_sockmap_create(
+    uint32_t max_entries,
+    char *verifier_log,
+    size_t verifier_log_capacity
+) {
+    return curtsy_sockmap_create_internal(max_entries, 1, verifier_log, verifier_log_capacity);
+}
+
 void curtsy_sockmap_destroy(curtsy_sockmap_runtime *runtime) {
     if (runtime == NULL) {
         return;
@@ -355,7 +402,7 @@ void curtsy_sockmap_destroy(curtsy_sockmap_runtime *runtime) {
         memset(&attributes, 0, sizeof(attributes));
         attributes.target_fd = (uint32_t)runtime->sockhash_fd;
         attributes.attach_bpf_fd = (uint32_t)runtime->program_fd;
-        attributes.attach_type = BPF_SK_SKB_STREAM_VERDICT;
+        attributes.attach_type = (enum bpf_attach_type)runtime->verdict_attach_type;
         (void)curtsy_bpf(BPF_PROG_DETACH, &attributes);
     }
     if (runtime->parser_fd >= 0 && runtime->sockhash_fd >= 0) {
@@ -842,4 +889,36 @@ int32_t curtsy_udp_upstream_socket(const struct sockaddr *address, socklen_t add
         return -1;
     }
     return fd;
+}
+
+int32_t curtsy_udp_connected_client_socket(
+    const struct sockaddr *bind_address,
+    socklen_t bind_address_length,
+    const struct sockaddr *peer_address,
+    socklen_t peer_address_length
+) {
+    if (bind_address == NULL || peer_address == NULL ||
+        bind_address->sa_family != peer_address->sa_family) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = socket(bind_address->sa_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    int yes = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) != 0) goto fail;
+    if (bind_address->sa_family == AF_INET6) {
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes)) != 0) goto fail;
+    }
+    if (bind(fd, bind_address, bind_address_length) != 0) goto fail;
+    if (connect(fd, peer_address, peer_address_length) != 0) goto fail;
+    return fd;
+
+fail:
+    {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+    return -1;
 }
