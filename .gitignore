@@ -20,3 +20,12 @@ DerivedData/
 # Runtime files
 *.log
 *.pid
+
+# Debian packaging
+/*.deb
+/debian/.debhelper/
+/debian/*.debhelper
+/debian/curtsy/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.substvars

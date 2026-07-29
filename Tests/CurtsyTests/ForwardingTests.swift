@@ -581,6 +581,9 @@ final class ForwardingTests: XCTestCase {
 
         let sockmapAccelerator = try TCPSockmapAccelerator.load(maxEntries: 8)
         XCTAssertNotNil(sockmapAccelerator)
+
+        let observer = try BPFObserver.load()
+        _ = try observer.readCounters()
         #else
         throw XCTSkip("eBPF loader tests only run on Linux")
         #endif

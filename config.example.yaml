@@ -1,29 +1,34 @@
-version: 1
-protocols: [tcp, udp]
-
 listen:
-  host: "*"
   port: 9000
 
 upstream:
   host: "example.com"
-  port: 9000
 
-timeouts:
-  connectSeconds: 5
-  tcpIdleSeconds: 300
-  udpSessionSeconds: 60
-  shutdownGraceSeconds: 10
-
-limits:
-  tcpListenBacklog: 4096
-  maxTCPBufferedBytes: 268435456
-  maxUDPAssociations: 4096
-  maxUDPPendingDatagrams: 64
-  maxUDPPendingBytes: 1048576
-
-performance:
-  tcpSockmapAcceleration: auto
-
-logging:
-  level: info
+# Optional overrides. Omitted values are auto-tuned continuously at runtime.
+# version: 1
+# protocols: [tcp, udp]
+# listen:
+#   host: "*"
+#   port: 9000
+# upstream:
+#   host: "example.com"
+#   port: 9000
+# runtime:
+#   workerThreads: auto
+#   tuningDaemon: true
+#   tuningIntervalSeconds: 5
+# timeouts:
+#   connectSeconds: 5
+#   tcpIdleSeconds: 300
+#   udpSessionSeconds: 60
+#   shutdownGraceSeconds: 10
+# limits:
+#   tcpListenBacklog: auto
+#   maxTCPBufferedBytes: auto
+#   maxUDPAssociations: auto
+#   maxUDPPendingDatagrams: auto
+#   maxUDPPendingBytes: auto
+# performance:
+#   tcpSockmapAcceleration: auto
+# logging:
+#   level: info

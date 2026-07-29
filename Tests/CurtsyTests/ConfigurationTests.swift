@@ -17,26 +17,32 @@ final class ConfigurationTests: XCTestCase {
 
     func testLoadsDefaults() throws {
         let configuration = try ConfigurationLoader.load(yaml: """
-        version: 1
-        protocols: [tcp, udp]
         listen:
-          host: "127.0.0.1"
           port: 9000
         upstream:
           host: "localhost"
-          port: 9001
         """)
+        let autoLimits = AutoTune.limits()
 
+        XCTAssertEqual(configuration.version, 1)
         XCTAssertEqual(configuration.protocols, [.tcp, .udp])
+        XCTAssertEqual(configuration.listen.host, "*")
+        XCTAssertEqual(configuration.listen.port, 9000)
+        XCTAssertEqual(configuration.upstream.host, "localhost")
+        XCTAssertEqual(configuration.upstream.port, 9000)
         XCTAssertEqual(configuration.timeouts.connectSeconds, 5)
         XCTAssertEqual(configuration.timeouts.tcpIdleSeconds, 300)
         XCTAssertEqual(configuration.timeouts.udpSessionSeconds, 60)
         XCTAssertEqual(configuration.timeouts.shutdownGraceSeconds, 10)
-        XCTAssertEqual(configuration.limits.tcpListenBacklog, 4_096)
-        XCTAssertEqual(configuration.limits.maxTCPBufferedBytes, 256 * 1_024 * 1_024)
-        XCTAssertEqual(configuration.limits.maxUDPAssociations, 4_096)
-        XCTAssertEqual(configuration.limits.maxUDPPendingDatagrams, 64)
-        XCTAssertEqual(configuration.limits.maxUDPPendingBytes, 1 * 1_024 * 1_024)
+        XCTAssertEqual(configuration.limits.tcpListenBacklog, autoLimits.tcpListenBacklog)
+        XCTAssertEqual(configuration.limits.maxTCPBufferedBytes, autoLimits.maxTCPBufferedBytes)
+        XCTAssertEqual(configuration.limits.maxUDPAssociations, autoLimits.maxUDPAssociations)
+        XCTAssertEqual(configuration.limits.maxUDPPendingDatagrams, autoLimits.maxUDPPendingDatagrams)
+        XCTAssertEqual(configuration.limits.maxUDPPendingBytes, autoLimits.maxUDPPendingBytes)
+        XCTAssertEqual(configuration.runtime.workerThreads, 0)
+        XCTAssertTrue(configuration.runtime.tuningDaemon)
+        XCTAssertEqual(configuration.runtime.tuningIntervalSeconds, 5)
+        XCTAssertTrue(configuration.limits.autoTuning.maxTCPBufferedBytes)
         XCTAssertEqual(configuration.logging.level, "info")
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .auto)
     }
@@ -58,6 +64,7 @@ final class ConfigurationTests: XCTestCase {
           maxUDPAssociations: 128
           maxUDPPendingDatagrams: 8
           maxUDPPendingBytes: 4096
+        runtime: { workerThreads: 2, tuningDaemon: false, tuningIntervalSeconds: 10 }
         performance: { tcpSockmapAcceleration: enabled }
         logging: { level: debug }
         """)
@@ -70,7 +77,51 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.limits.maxUDPPendingDatagrams, 8)
         XCTAssertEqual(configuration.limits.maxUDPPendingBytes, 4_096)
         XCTAssertEqual(configuration.logging.level, "debug")
+        XCTAssertEqual(configuration.runtime.workerThreads, 2)
+        XCTAssertFalse(configuration.runtime.tuningDaemon)
+        XCTAssertEqual(configuration.runtime.tuningIntervalSeconds, 10)
+        XCTAssertFalse(configuration.limits.autoTuning.maxTCPBufferedBytes)
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .enabled)
+    }
+
+    func testAcceptsExplicitAutoValues() throws {
+        let configuration = try ConfigurationLoader.load(yaml: """
+        listen: { port: 9000 }
+        upstream: { host: "localhost", port: 9001 }
+        runtime: { workerThreads: auto }
+        limits:
+          tcpListenBacklog: auto
+          maxTCPBufferedBytes: auto
+          maxUDPAssociations: auto
+          maxUDPPendingDatagrams: auto
+          maxUDPPendingBytes: auto
+        """)
+        let autoLimits = AutoTune.limits()
+
+        XCTAssertEqual(configuration.runtime.workerThreads, 0)
+        XCTAssertEqual(configuration.limits.tcpListenBacklog, autoLimits.tcpListenBacklog)
+        XCTAssertEqual(configuration.limits.maxTCPBufferedBytes, autoLimits.maxTCPBufferedBytes)
+        XCTAssertEqual(configuration.limits.maxUDPAssociations, autoLimits.maxUDPAssociations)
+        XCTAssertEqual(configuration.limits.maxUDPPendingDatagrams, autoLimits.maxUDPPendingDatagrams)
+        XCTAssertEqual(configuration.limits.maxUDPPendingBytes, autoLimits.maxUDPPendingBytes)
+    }
+
+    func testAutoTuneCalculatesConservativeDefaults() {
+        let tiny = AutoTune.limits(
+            snapshot: AutoTuneSnapshot(processorCount: 1, totalMemoryBytes: 512 * 1_024 * 1_024)
+        )
+        XCTAssertEqual(tiny.tcpListenBacklog, 4_096)
+        XCTAssertEqual(tiny.maxTCPBufferedBytes, 64 * 1_024 * 1_024)
+        XCTAssertEqual(tiny.maxUDPAssociations, 1_024)
+
+        let large = AutoTune.limits(
+            snapshot: AutoTuneSnapshot(processorCount: 96, totalMemoryBytes: 256 * 1_024 * 1_024 * 1_024)
+        )
+        XCTAssertEqual(large.tcpListenBacklog, 65_535)
+        XCTAssertEqual(large.maxTCPBufferedBytes, 512 * 1_024 * 1_024)
+        XCTAssertEqual(large.maxUDPAssociations, 65_536)
+        XCTAssertEqual(AutoTune.workerThreads(configured: 0, snapshot: .init(processorCount: 96)), 32)
+        XCTAssertEqual(AutoTune.workerThreads(configured: 6, snapshot: .init(processorCount: 96)), 6)
     }
 
     func testRejectsUnknownKey() {
@@ -165,6 +216,20 @@ final class ConfigurationTests: XCTestCase {
             listen: { host: "127.0.0.1", port: 9000 }
             upstream: { host: "127.0.0.1", port: 9001 }
             logging: { level: verbose }
+            """,
+            """
+            version: 1
+            protocols: [tcp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            runtime: { workerThreads: -1 }
+            """,
+            """
+            version: 1
+            protocols: [tcp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            runtime: { tuningIntervalSeconds: 0 }
             """,
             """
             version: 1

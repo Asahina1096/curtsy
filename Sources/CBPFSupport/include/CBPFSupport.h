@@ -46,4 +46,26 @@ int32_t curtsy_sockmap_idle_remaining_ns(
     uint64_t *remaining_ns
 );
 
+typedef struct curtsy_bpf_observer curtsy_bpf_observer;
+
+typedef struct curtsy_bpf_observer_counters {
+    uint64_t tcp_sendmsg;
+    uint64_t tcp_recvmsg;
+    uint64_t udp_sendmsg;
+    uint64_t udp_recvmsg;
+} curtsy_bpf_observer_counters;
+
+curtsy_bpf_observer *curtsy_bpf_observer_create(
+    uint32_t target_pid,
+    char *verifier_log,
+    size_t verifier_log_capacity
+);
+
+void curtsy_bpf_observer_destroy(curtsy_bpf_observer *observer);
+
+int32_t curtsy_bpf_observer_read(
+    curtsy_bpf_observer *observer,
+    curtsy_bpf_observer_counters *counters
+);
+
 #endif

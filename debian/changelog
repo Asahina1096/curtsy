@@ -1,0 +1,5 @@
+curtsy (0.1.0) unstable; urgency=medium
+
+  * Initial Debian package.
+
+ -- Curtsy contributors <maintainers@example.invalid>  Wed, 29 Jul 2026 00:00:00 +0000

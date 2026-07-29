@@ -9,6 +9,58 @@ enum ForwardProtocol: String, Codable, CaseIterable, Hashable, Sendable {
 struct EndpointConfiguration: Codable, Equatable, Sendable {
     let host: String
     let port: Int
+
+    init(host: String, port: Int) {
+        self.host = host
+        self.port = port
+    }
+}
+
+private struct ListenEndpointConfiguration: Decodable {
+    var host: String = "*"
+    let port: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case host
+        case port
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decodeIfPresent(String.self, forKey: .host) ?? "*"
+        port = try container.decode(Int.self, forKey: .port)
+    }
+}
+
+private struct UpstreamEndpointConfiguration: Decodable {
+    let host: String
+    let port: Int?
+}
+
+private extension KeyedDecodingContainer {
+    func decodeAutoTunedInt(forKey key: Key, default defaultValue: Int) throws -> (value: Int, isAuto: Bool) {
+        guard contains(key) else { return (defaultValue, true) }
+        if let value = try? decode(Int.self, forKey: key) {
+            return (value, false)
+        }
+        let value = try decode(String.self, forKey: key)
+        guard value.lowercased() == "auto" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: self,
+                debugDescription: "expected an integer or auto"
+            )
+        }
+        return (defaultValue, true)
+    }
+}
+
+struct LimitAutoTuning: Equatable, Sendable {
+    var tcpListenBacklog: Bool = true
+    var maxTCPBufferedBytes: Bool = true
+    var maxUDPAssociations: Bool = true
+    var maxUDPPendingDatagrams: Bool = true
+    var maxUDPPendingBytes: Bool = true
 }
 
 struct TimeoutConfiguration: Codable, Equatable, Sendable {
@@ -34,25 +86,61 @@ struct LimitConfiguration: Codable, Equatable, Sendable {
     var maxUDPAssociations: Int = 4_096
     var maxUDPPendingDatagrams: Int = 64
     var maxUDPPendingBytes: Int = 1 * 1_024 * 1_024
+    var autoTuning = LimitAutoTuning()
 
-    init() {}
+    private enum CodingKeys: String, CodingKey {
+        case tcpListenBacklog
+        case maxTCPBufferedBytes
+        case maxUDPAssociations
+        case maxUDPPendingDatagrams
+        case maxUDPPendingBytes
+    }
+
+    init() {
+        let auto = AutoTune.limits()
+        tcpListenBacklog = auto.tcpListenBacklog
+        maxTCPBufferedBytes = auto.maxTCPBufferedBytes
+        maxUDPAssociations = auto.maxUDPAssociations
+        maxUDPPendingDatagrams = auto.maxUDPPendingDatagrams
+        maxUDPPendingBytes = auto.maxUDPPendingBytes
+        autoTuning = LimitAutoTuning()
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        tcpListenBacklog = try container.decodeIfPresent(Int.self, forKey: .tcpListenBacklog) ?? 4_096
-        maxTCPBufferedBytes = try container.decodeIfPresent(
-            Int.self,
-            forKey: .maxTCPBufferedBytes
-        ) ?? 256 * 1_024 * 1_024
-        maxUDPAssociations = try container.decodeIfPresent(Int.self, forKey: .maxUDPAssociations) ?? 4_096
-        maxUDPPendingDatagrams = try container.decodeIfPresent(
-            Int.self,
-            forKey: .maxUDPPendingDatagrams
-        ) ?? 64
-        maxUDPPendingBytes = try container.decodeIfPresent(
-            Int.self,
-            forKey: .maxUDPPendingBytes
-        ) ?? 1 * 1_024 * 1_024
+        let auto = AutoTune.limits()
+        let backlog = try container.decodeAutoTunedInt(
+            forKey: .tcpListenBacklog,
+            default: auto.tcpListenBacklog
+        )
+        let tcpBytes = try container.decodeAutoTunedInt(
+            forKey: .maxTCPBufferedBytes,
+            default: auto.maxTCPBufferedBytes
+        )
+        let udpAssociations = try container.decodeAutoTunedInt(
+            forKey: .maxUDPAssociations,
+            default: auto.maxUDPAssociations
+        )
+        let pendingDatagrams = try container.decodeAutoTunedInt(
+            forKey: .maxUDPPendingDatagrams,
+            default: auto.maxUDPPendingDatagrams
+        )
+        let pendingBytes = try container.decodeAutoTunedInt(
+            forKey: .maxUDPPendingBytes,
+            default: auto.maxUDPPendingBytes
+        )
+        tcpListenBacklog = backlog.value
+        maxTCPBufferedBytes = tcpBytes.value
+        maxUDPAssociations = udpAssociations.value
+        maxUDPPendingDatagrams = pendingDatagrams.value
+        maxUDPPendingBytes = pendingBytes.value
+        autoTuning = LimitAutoTuning(
+            tcpListenBacklog: backlog.isAuto,
+            maxTCPBufferedBytes: tcpBytes.isAuto,
+            maxUDPAssociations: udpAssociations.isAuto,
+            maxUDPPendingDatagrams: pendingDatagrams.isAuto,
+            maxUDPPendingBytes: pendingBytes.isAuto
+        )
     }
 }
 
@@ -71,6 +159,25 @@ enum TCPSockmapAccelerationMode: String, Codable, Sendable {
     case auto
     case enabled
     case disabled
+}
+
+struct RuntimeOptions: Codable, Equatable, Sendable {
+    var workerThreads: Int = 0
+    var tuningDaemon: Bool = true
+    var tuningIntervalSeconds: Int = 5
+
+    init(workerThreads: Int = 0, tuningDaemon: Bool = true, tuningIntervalSeconds: Int = 5) {
+        self.workerThreads = workerThreads
+        self.tuningDaemon = tuningDaemon
+        self.tuningIntervalSeconds = tuningIntervalSeconds
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workerThreads = try container.decodeAutoTunedInt(forKey: .workerThreads, default: 0).value
+        tuningDaemon = try container.decodeIfPresent(Bool.self, forKey: .tuningDaemon) ?? true
+        tuningIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .tuningIntervalSeconds) ?? 5
+    }
 }
 
 struct PerformanceConfiguration: Codable, Equatable, Sendable {
@@ -97,6 +204,7 @@ struct ForwarderConfiguration: Codable, Equatable, Sendable {
     var timeouts: TimeoutConfiguration
     var limits: LimitConfiguration
     var logging: LogConfiguration
+    var runtime: RuntimeOptions
     var performance: PerformanceConfiguration
 
     init(
@@ -107,6 +215,7 @@ struct ForwarderConfiguration: Codable, Equatable, Sendable {
         timeouts: TimeoutConfiguration = .init(),
         limits: LimitConfiguration = .init(),
         logging: LogConfiguration = .init(),
+        runtime: RuntimeOptions = .init(),
         performance: PerformanceConfiguration = .init()
     ) {
         self.version = version
@@ -116,18 +225,25 @@ struct ForwarderConfiguration: Codable, Equatable, Sendable {
         self.timeouts = timeouts
         self.limits = limits
         self.logging = logging
+        self.runtime = runtime
         self.performance = performance
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        version = try container.decode(Int.self, forKey: .version)
-        protocols = try container.decode([ForwardProtocol].self, forKey: .protocols)
-        listen = try container.decode(EndpointConfiguration.self, forKey: .listen)
-        upstream = try container.decode(EndpointConfiguration.self, forKey: .upstream)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        protocols = try container.decodeIfPresent([ForwardProtocol].self, forKey: .protocols) ?? [.tcp, .udp]
+        let listenEndpoint = try container.decode(ListenEndpointConfiguration.self, forKey: .listen)
+        let upstreamEndpoint = try container.decode(UpstreamEndpointConfiguration.self, forKey: .upstream)
+        listen = EndpointConfiguration(host: listenEndpoint.host, port: listenEndpoint.port)
+        upstream = EndpointConfiguration(
+            host: upstreamEndpoint.host,
+            port: upstreamEndpoint.port ?? listenEndpoint.port
+        )
         timeouts = try container.decodeIfPresent(TimeoutConfiguration.self, forKey: .timeouts) ?? .init()
         limits = try container.decodeIfPresent(LimitConfiguration.self, forKey: .limits) ?? .init()
         logging = try container.decodeIfPresent(LogConfiguration.self, forKey: .logging) ?? .init()
+        runtime = try container.decodeIfPresent(RuntimeOptions.self, forKey: .runtime) ?? .init()
         performance = try container.decodeIfPresent(
             PerformanceConfiguration.self,
             forKey: .performance
@@ -155,7 +271,7 @@ enum ConfigurationError: Error, CustomStringConvertible, Equatable {
 enum ConfigurationLoader {
     private static let allowedKeys: [String: Set<String>] = [
         "": [
-            "version", "protocols", "listen", "upstream", "timeouts", "limits", "logging", "performance",
+            "version", "protocols", "listen", "upstream", "timeouts", "limits", "logging", "runtime", "performance",
         ],
         "listen": ["host", "port"],
         "upstream": ["host", "port"],
@@ -168,6 +284,7 @@ enum ConfigurationLoader {
             "maxUDPPendingBytes",
         ],
         "logging": ["level"],
+        "runtime": ["workerThreads", "tuningDaemon", "tuningIntervalSeconds"],
         "performance": ["tcpSockmapAcceleration"]
     ]
 
@@ -251,6 +368,12 @@ enum ConfigurationLoader {
         }
         guard configuration.limits.maxUDPPendingBytes > 0 else {
             throw ConfigurationError.invalidValue("limits.maxUDPPendingBytes must be positive")
+        }
+        guard configuration.runtime.workerThreads >= 0 else {
+            throw ConfigurationError.invalidValue("runtime.workerThreads must be zero for auto or positive")
+        }
+        guard configuration.runtime.tuningIntervalSeconds > 0 else {
+            throw ConfigurationError.invalidValue("runtime.tuningIntervalSeconds must be positive")
         }
         let validLogLevels = Set(["trace", "debug", "info", "notice", "warning", "error", "critical"])
         guard validLogLevels.contains(configuration.logging.level.lowercased()) else {

@@ -15,24 +15,34 @@ final class ForwarderService: @unchecked Sendable {
     private let controlQueue = DispatchQueue(label: "curtsy.control")
     private let stopped = DispatchSemaphore(value: 0)
     private let log: LogStore
+    private let workerThreads: Int
     private let tcpBufferBudget: TCPBufferBudget
     private var configuration: ResolvedConfiguration
     private var tcpListener: TCPListener?
     private var udpListener: UDPListener?
     private var retiredTCPListeners: [TCPListener] = []
     private var retiredTCPReapScheduled = false
+    private var tuningDaemon: TuningDaemon?
     private var signalSources: [DispatchSourceSignal] = []
     private var shuttingDown = false
 
     init(configurationPath: String, configuration: ForwarderConfiguration) throws {
         self.configurationPath = configurationPath
         self.configuration = try ResolvedConfiguration.resolve(configuration)
-        self.group = MultiThreadedEventLoopGroup(numberOfThreads: max(1, System.coreCount))
+        self.workerThreads = AutoTune.workerThreads(configured: configuration.runtime.workerThreads)
+        self.group = MultiThreadedEventLoopGroup(numberOfThreads: workerThreads)
         self.log = LogStore(level: configuration.logging.level)
         self.tcpBufferBudget = TCPBufferBudget(limit: configuration.limits.maxTCPBufferedBytes)
     }
 
     func run() throws {
+        log.info(
+            "runtime tuned worker_threads=\(workerThreads) "
+                + "tcp_listen_backlog=\(configuration.configuration.limits.tcpListenBacklog) "
+                + "max_tcp_buffered_bytes=\(configuration.configuration.limits.maxTCPBufferedBytes) "
+                + "max_udp_associations=\(configuration.configuration.limits.maxUDPAssociations)"
+        )
+
         do {
             try startInitialListeners()
         } catch {
@@ -41,8 +51,11 @@ final class ForwarderService: @unchecked Sendable {
         }
 
         installSignalHandlers()
+        startTuningDaemonIfNeeded()
         log.info("forwarder started protocols=\(configuration.configuration.protocols.map(\.rawValue).joined(separator: ",")) upstream=\(configuration.upstreamAddress.curtsyDescription)")
         stopped.wait()
+        tuningDaemon?.stop()
+        tuningDaemon = nil
         signalSources.forEach { $0.cancel() }
         try group.syncShutdownGracefully()
     }
@@ -72,6 +85,28 @@ final class ForwarderService: @unchecked Sendable {
             udpListener?.stop()
             throw error
         }
+    }
+
+    private func startTuningDaemonIfNeeded() {
+        guard configuration.configuration.runtime.tuningDaemon else { return }
+        let daemon = TuningDaemon(
+            queue: controlQueue,
+            intervalSeconds: configuration.configuration.runtime.tuningIntervalSeconds,
+            log: log,
+            snapshotProvider: { [weak self] in
+                guard let self else { return nil }
+                return TuningSnapshot(
+                    configuration: self.configuration,
+                    tcpBufferedBytes: self.tcpBufferBudget.used,
+                    udpAssociations: self.udpListener?.associationCount ?? 0
+                )
+            },
+            applyLimits: { [weak self] limits in
+                self?.applyTunedLimits(limits)
+            }
+        )
+        tuningDaemon = daemon
+        daemon.start()
     }
 
     private func installSignalHandlers() {
@@ -117,6 +152,16 @@ final class ForwarderService: @unchecked Sendable {
         let old = configuration
         let endpointChanged = old.listenBindingDiffers(from: candidate)
         let newProtocols = Set(candidate.configuration.protocols)
+        let requestedWorkerThreads = AutoTune.workerThreads(configured: candidate.configuration.runtime.workerThreads)
+        if requestedWorkerThreads != workerThreads {
+            log.warning(
+                "runtime worker thread change requires restart "
+                    + "current=\(workerThreads) requested=\(requestedWorkerThreads)"
+            )
+        }
+        if candidate.configuration.runtime.tuningDaemon != (tuningDaemon != nil) {
+            log.warning("runtime tuning daemon enablement change requires restart")
+        }
 
         if endpointChanged {
             var newTCP: TCPListener?
@@ -216,6 +261,8 @@ final class ForwarderService: @unchecked Sendable {
     private func shutdown(reason: String) {
         guard !shuttingDown else { return }
         shuttingDown = true
+        tuningDaemon?.stop()
+        tuningDaemon = nil
         log.info("shutdown requested signal=\(reason)")
 
         if let listener = tcpListener {
@@ -239,6 +286,30 @@ final class ForwarderService: @unchecked Sendable {
         }
         log.info("forwarder stopped")
         stopped.signal()
+    }
+
+    private func applyTunedLimits(_ limits: LimitConfiguration) {
+        var updated = configuration.configuration
+        let previousBacklog = updated.limits.tcpListenBacklog
+        updated.limits = limits
+        if limits.tcpListenBacklog != previousBacklog {
+            do {
+                try tcpListener?.updateListeningBacklog(limits.tcpListenBacklog)
+            } catch {
+                log.warning("tuning daemon backlog update failed error=\(error)")
+                updated.limits.tcpListenBacklog = previousBacklog
+            }
+        }
+
+        tcpBufferBudget.updateLimit(updated.limits.maxTCPBufferedBytes)
+        let applied = ResolvedConfiguration(
+            configuration: updated,
+            listenAddresses: configuration.listenAddresses,
+            upstreamAddress: configuration.upstreamAddress
+        )
+        tcpListener?.update(configuration: applied)
+        udpListener?.update(configuration: applied, resetAssociations: false)
+        configuration = applied
     }
 
     private func retire(_ listener: TCPListener) {

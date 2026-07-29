@@ -1,0 +1,10 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: curtsy
+Source: local
+
+Files: *
+Copyright: 2026 Curtsy contributors
+License: project-local
+ This repository does not currently include a standalone upstream license file.
+ Packaging metadata is provided for local builds and deployment by the project
+ owner.

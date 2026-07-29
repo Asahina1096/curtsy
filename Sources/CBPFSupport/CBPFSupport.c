@@ -17,8 +17,10 @@ int32_t curtsy_so_reuseport(void) {
 #include <linux/bpf.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <linux/perf_event.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -472,6 +474,210 @@ int32_t curtsy_sockmap_idle_remaining_ns(
     return 0;
 }
 
+
+struct curtsy_bpf_observer {
+    int counters_fd;
+    int program_fds[4];
+    int event_fds[4];
+};
+
+enum curtsy_observer_counter_index {
+    CURTSY_OBSERVER_TCP_SENDMSG = 0,
+    CURTSY_OBSERVER_TCP_RECVMSG = 1,
+    CURTSY_OBSERVER_UDP_SENDMSG = 2,
+    CURTSY_OBSERVER_UDP_RECVMSG = 3,
+    CURTSY_OBSERVER_COUNTER_COUNT = 4,
+};
+
+static int curtsy_perf_event_open(
+    struct perf_event_attr *attributes,
+    pid_t pid,
+    int cpu,
+    int group_fd,
+    unsigned long flags
+) {
+    return (int)syscall(SYS_perf_event_open, attributes, pid, cpu, group_fd, flags);
+}
+
+static int curtsy_read_uint_from_file(const char *path) {
+    FILE *file = fopen(path, "r");
+    if (file == NULL) return -1;
+    int value = -1;
+    if (fscanf(file, "%d", &value) != 1) value = -1;
+    fclose(file);
+    return value;
+}
+
+static int curtsy_load_observer_program(
+    int counters_fd,
+    uint32_t target_pid,
+    uint32_t counter_index,
+    char *verifier_log,
+    size_t verifier_log_capacity
+) {
+    struct bpf_insn instructions[] = {
+        /* Ignore events not caused by this Curtsy process. */
+        CURTSY_CALL(BPF_FUNC_get_current_pid_tgid),
+        CURTSY_INSN(BPF_ALU64 | BPF_RSH | BPF_K, BPF_REG_0, 0, 0, 32),
+        CURTSY_JMP_IMM(BPF_JNE, BPF_REG_0, (int32_t)target_pid, 10),
+
+        /* key = counter_index */
+        CURTSY_MOV64_REG(BPF_REG_6, BPF_REG_10),
+        CURTSY_INSN(BPF_ALU64 | BPF_ADD | BPF_K, BPF_REG_6, 0, 0, -4),
+        CURTSY_MOV64_IMM(BPF_REG_1, counter_index),
+        CURTSY_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4),
+
+        /* counter = counters[key] */
+        CURTSY_LD_MAP_FD(BPF_REG_1, counters_fd),
+        CURTSY_MOV64_REG(BPF_REG_2, BPF_REG_6),
+        CURTSY_CALL(BPF_FUNC_map_lookup_elem),
+        CURTSY_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 2),
+
+        /* (*counter)++ */
+        CURTSY_MOV64_IMM(BPF_REG_1, 1),
+        CURTSY_INSN(BPF_STX | BPF_XADD | BPF_DW, BPF_REG_0, BPF_REG_1, 0, 0),
+
+        CURTSY_MOV64_IMM(BPF_REG_0, 0),
+        CURTSY_EXIT(),
+    };
+    static const char license[] = "GPL";
+    static const char program_name[] = "curtsy_tune";
+
+    union bpf_attr attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.prog_type = BPF_PROG_TYPE_KPROBE;
+    attributes.insn_cnt = (uint32_t)(sizeof(instructions) / sizeof(instructions[0]));
+    attributes.insns = (uint64_t)(uintptr_t)instructions;
+    attributes.license = (uint64_t)(uintptr_t)license;
+    memcpy(attributes.prog_name, program_name, sizeof(program_name));
+    if (verifier_log != NULL && verifier_log_capacity > 0) {
+        verifier_log[0] = '\0';
+        attributes.log_level = 1;
+        attributes.log_buf = (uint64_t)(uintptr_t)verifier_log;
+        attributes.log_size = verifier_log_capacity > UINT32_MAX
+            ? UINT32_MAX
+            : (uint32_t)verifier_log_capacity;
+    }
+    return curtsy_bpf(BPF_PROG_LOAD, &attributes);
+}
+
+static int curtsy_attach_kprobe(int program_fd, const char *function_name) {
+    int kprobe_type = curtsy_read_uint_from_file("/sys/bus/event_source/devices/kprobe/type");
+    if (kprobe_type < 0) {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    struct perf_event_attr attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.type = (uint32_t)kprobe_type;
+    attributes.size = sizeof(attributes);
+    attributes.config1 = (uint64_t)(uintptr_t)function_name;
+    attributes.sample_period = 1;
+    attributes.wakeup_events = 1;
+
+    int event_fd = curtsy_perf_event_open(&attributes, -1, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (event_fd < 0) return -1;
+    if (ioctl(event_fd, PERF_EVENT_IOC_SET_BPF, program_fd) != 0) {
+        int saved_errno = errno;
+        close(event_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (ioctl(event_fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+        int saved_errno = errno;
+        close(event_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return event_fd;
+}
+
+curtsy_bpf_observer *curtsy_bpf_observer_create(
+    uint32_t target_pid,
+    char *verifier_log,
+    size_t verifier_log_capacity
+) {
+    if (target_pid == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    curtsy_bpf_observer *observer = calloc(1, sizeof(*observer));
+    if (observer == NULL) return NULL;
+    observer->counters_fd = -1;
+    for (int i = 0; i < CURTSY_OBSERVER_COUNTER_COUNT; i++) {
+        observer->program_fds[i] = -1;
+        observer->event_fds[i] = -1;
+    }
+
+    observer->counters_fd = curtsy_create_map(
+        BPF_MAP_TYPE_ARRAY,
+        sizeof(uint32_t),
+        sizeof(uint64_t),
+        CURTSY_OBSERVER_COUNTER_COUNT,
+        "curtsy_tune"
+    );
+    if (observer->counters_fd < 0) goto failure;
+
+    static const char *functions[CURTSY_OBSERVER_COUNTER_COUNT] = {
+        "tcp_sendmsg",
+        "tcp_recvmsg",
+        "udp_sendmsg",
+        "udp_recvmsg",
+    };
+    for (uint32_t i = 0; i < CURTSY_OBSERVER_COUNTER_COUNT; i++) {
+        observer->program_fds[i] = curtsy_load_observer_program(
+            observer->counters_fd,
+            target_pid,
+            i,
+            verifier_log,
+            verifier_log_capacity
+        );
+        if (observer->program_fds[i] < 0) goto failure;
+        observer->event_fds[i] = curtsy_attach_kprobe(observer->program_fds[i], functions[i]);
+        if (observer->event_fds[i] < 0) goto failure;
+    }
+    return observer;
+
+failure: {
+        int saved_errno = errno;
+        curtsy_bpf_observer_destroy(observer);
+        errno = saved_errno;
+        return NULL;
+    }
+}
+
+void curtsy_bpf_observer_destroy(curtsy_bpf_observer *observer) {
+    if (observer == NULL) return;
+    for (int i = 0; i < CURTSY_OBSERVER_COUNTER_COUNT; i++) {
+        if (observer->event_fds[i] >= 0) close(observer->event_fds[i]);
+        if (observer->program_fds[i] >= 0) close(observer->program_fds[i]);
+    }
+    if (observer->counters_fd >= 0) close(observer->counters_fd);
+    free(observer);
+}
+
+int32_t curtsy_bpf_observer_read(
+    curtsy_bpf_observer *observer,
+    curtsy_bpf_observer_counters *counters
+) {
+    if (observer == NULL || counters == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t values[CURTSY_OBSERVER_COUNTER_COUNT] = {0, 0, 0, 0};
+    for (uint32_t i = 0; i < CURTSY_OBSERVER_COUNTER_COUNT; i++) {
+        if (curtsy_map_lookup(observer->counters_fd, &i, &values[i]) != 0) return -1;
+    }
+    counters->tcp_sendmsg = values[CURTSY_OBSERVER_TCP_SENDMSG];
+    counters->tcp_recvmsg = values[CURTSY_OBSERVER_TCP_RECVMSG];
+    counters->udp_sendmsg = values[CURTSY_OBSERVER_UDP_SENDMSG];
+    counters->udp_recvmsg = values[CURTSY_OBSERVER_UDP_RECVMSG];
+    return 0;
+}
+
+
 #else
 
 int32_t curtsy_so_attach_reuseport_ebpf(void) {
@@ -534,6 +740,31 @@ int32_t curtsy_sockmap_idle_remaining_ns(
 ) {
     (void)runtime; (void)client_cookie; (void)upstream_cookie;
     (void)idle_timeout_ns; (void)remaining_ns;
+    errno = ENOTSUP;
+    return -1;
+}
+
+
+typedef struct curtsy_bpf_observer curtsy_bpf_observer;
+
+curtsy_bpf_observer *curtsy_bpf_observer_create(
+    uint32_t target_pid,
+    char *verifier_log,
+    size_t verifier_log_capacity
+) {
+    (void)target_pid;
+    if (verifier_log != NULL && verifier_log_capacity > 0) verifier_log[0] = '\0';
+    errno = ENOTSUP;
+    return NULL;
+}
+
+void curtsy_bpf_observer_destroy(curtsy_bpf_observer *observer) { (void)observer; }
+
+int32_t curtsy_bpf_observer_read(
+    curtsy_bpf_observer *observer,
+    curtsy_bpf_observer_counters *counters
+) {
+    (void)observer; (void)counters;
     errno = ENOTSUP;
     return -1;
 }

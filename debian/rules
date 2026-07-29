@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	swift package clean
+
+override_dh_auto_build:
+	swift build -c release --static-swift-stdlib
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	swift test
+endif
+
+override_dh_auto_install:
+	install -D -m 0755 .build/release/curtsy debian/curtsy/usr/bin/curtsy
+	install -D -m 0644 config.example.yaml debian/curtsy/etc/curtsy/config.yaml
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_dwz:
+	# Swift 6 emits .debug_names sections that dwz cannot currently process.
