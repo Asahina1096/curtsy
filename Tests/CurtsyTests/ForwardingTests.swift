@@ -186,7 +186,7 @@ final class ForwardingTests: XCTestCase {
             runtime: RuntimeConfiguration(configuration),
             budget: budget,
             log: LogStore(level: "critical"),
-            connectUpstream: { _, _, _, _, _ in connectionPromise.futureResult }
+            connectUpstream: { _, _, _, _, _, _ in connectionPromise.futureResult }
         )
         let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
         let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
@@ -209,6 +209,67 @@ final class ForwardingTests: XCTestCase {
         XCTAssertEqual(budget.count, 0)
         XCTAssertNoThrow(try listener.finish())
         _ = try? staleUpstream.finish()
+    }
+
+    func testUDPUpstreamActivityRefreshesAssociationExpiry() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let connectionPromise = eventLoop.makePromise(of: Channel.self)
+        let activity = NIOLockedValueBox<(@Sendable () -> Void)?>(nil)
+        let budget = UDPAssociationBudget()
+        let configuration = makeResolvedConfiguration(protocols: [.udp], upstreamPort: 9)
+        let handler = UDPRelayHandler(
+            runtime: RuntimeConfiguration(configuration),
+            budget: budget,
+            log: LogStore(level: "critical"),
+            connectUpstream: { _, _, _, _, _, recordActivity in
+                activity.withLockedValue { $0 = recordActivity }
+                return connectionPromise.futureResult
+            }
+        )
+        let listener = EmbeddedChannel(handler: handler, loop: eventLoop)
+        let clientAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 12_345)
+        var buffer = listener.allocator.buffer(capacity: 4)
+        buffer.writeString("test")
+
+        XCTAssertNoThrow(
+            try listener.writeInbound(AddressedEnvelope(remoteAddress: clientAddress, data: buffer))
+        )
+        let upstream = EmbeddedChannel(loop: eventLoop)
+        connectionPromise.succeed(upstream)
+        eventLoop.run()
+        XCTAssertEqual(budget.count, 1)
+
+        eventLoop.advanceTime(by: .seconds(4))
+        activity.withLockedValue { $0 }?()
+        eventLoop.run()
+        eventLoop.advanceTime(by: .seconds(4))
+        XCTAssertEqual(budget.count, 1)
+
+        eventLoop.advanceTime(by: .seconds(2))
+        XCTAssertEqual(budget.count, 0)
+        XCTAssertNoThrow(try listener.finish())
+        _ = try? upstream.finish()
+    }
+
+    func testTCPListeningBacklogCanBeUpdatedInPlace() throws {
+        let configuration = makeResolvedConfiguration(protocols: [.tcp], upstreamPort: 9)
+        let listener = TCPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
+        try listener.start()
+        defer {
+            listener.stopAccepting()
+            listener.forceCloseConnections()
+        }
+        let addresses = listener.localAddresses
+
+        try listener.updateListeningBacklog(128)
+
+        XCTAssertEqual(listener.currentListeningBacklog, 128)
+        XCTAssertEqual(listener.localAddresses, addresses)
     }
 
     func testWildcardCreatesIPv4AndIPv6Listeners() throws {

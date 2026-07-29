@@ -5,20 +5,34 @@ import NIOCore
 
 struct ResolvedConfiguration: Sendable {
     let configuration: ForwarderConfiguration
+    let listenAddresses: [SocketAddress]
     let upstreamAddress: SocketAddress
 
-    static func resolve(_ configuration: ForwarderConfiguration) throws -> ResolvedConfiguration {
-        if configuration.listen.host != "*" {
-            _ = try SocketAddress.makeAddressResolvingHost(
-                configuration.listen.host,
-                port: configuration.listen.port
-            )
+    static func resolve(
+        _ configuration: ForwarderConfiguration,
+        resolver: (String, Int) throws -> SocketAddress = {
+            try SocketAddress.makeAddressResolvingHost($0, port: $1)
         }
-        let upstream = try SocketAddress.makeAddressResolvingHost(
-            configuration.upstream.host,
-            port: configuration.upstream.port
+    ) throws -> ResolvedConfiguration {
+        let listenAddresses: [SocketAddress]
+        if configuration.listen.host == "*" {
+            listenAddresses = [
+                try SocketAddress(ipAddress: "0.0.0.0", port: configuration.listen.port),
+                try SocketAddress(ipAddress: "::", port: configuration.listen.port)
+            ]
+        } else {
+            listenAddresses = [try resolver(configuration.listen.host, configuration.listen.port)]
+        }
+        let upstream = try resolver(configuration.upstream.host, configuration.upstream.port)
+        return ResolvedConfiguration(
+            configuration: configuration,
+            listenAddresses: listenAddresses,
+            upstreamAddress: upstream
         )
-        return ResolvedConfiguration(configuration: configuration, upstreamAddress: upstream)
+    }
+
+    func listenBindingDiffers(from other: ResolvedConfiguration) -> Bool {
+        configuration.listen != other.configuration.listen || listenAddresses != other.listenAddresses
     }
 }
 

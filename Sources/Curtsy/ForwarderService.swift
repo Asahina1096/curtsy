@@ -108,7 +108,7 @@ final class ForwarderService: @unchecked Sendable {
 
     private func apply(_ candidate: ResolvedConfiguration) throws {
         let old = configuration
-        let endpointChanged = old.configuration.listen != candidate.configuration.listen
+        let endpointChanged = old.listenBindingDiffers(from: candidate)
         let newProtocols = Set(candidate.configuration.protocols)
 
         if endpointChanged {
@@ -159,6 +159,14 @@ final class ForwarderService: @unchecked Sendable {
                 let listener = UDPListener(group: group, configuration: candidate, log: log)
                 try listener.start()
                 addedUDP = listener
+            }
+
+            let backlogChanged = old.configuration.limits.tcpListenBacklog
+                != candidate.configuration.limits.tcpListenBacklog
+            if newProtocols.contains(.tcp), backlogChanged {
+                try (addedTCP ?? tcpListener)?.updateListeningBacklog(
+                    candidate.configuration.limits.tcpListenBacklog
+                )
             }
         } catch {
             addedTCP?.stopAccepting()

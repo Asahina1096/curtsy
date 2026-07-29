@@ -7,7 +7,6 @@
 int32_t curtsy_socket_level(void);
 int32_t curtsy_so_reuseport(void);
 int32_t curtsy_so_attach_reuseport_ebpf(void);
-int32_t curtsy_so_cookie(void);
 
 int32_t curtsy_load_reuseport_bpf(
     uint32_t socket_count,
@@ -27,8 +26,10 @@ void curtsy_sockmap_destroy(curtsy_sockmap_runtime *runtime);
 
 int32_t curtsy_sockmap_pair(
     curtsy_sockmap_runtime *runtime,
-    uint64_t client_cookie,
-    uint64_t upstream_cookie
+    int32_t client_fd,
+    int32_t upstream_fd,
+    uint64_t *client_cookie,
+    uint64_t *upstream_cookie
 );
 
 void curtsy_sockmap_unpair(

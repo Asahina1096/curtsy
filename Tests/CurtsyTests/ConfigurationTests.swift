@@ -1,3 +1,4 @@
+import NIOCore
 import XCTest
 @testable import Curtsy
 
@@ -129,6 +130,29 @@ final class ConfigurationTests: XCTestCase {
 
         let hostname = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "localhost"))
         XCTAssertNotNil(hostname.upstreamAddress.port)
+    }
+
+    func testDetectsListenHostnameResolutionChange() throws {
+        let configuration = ForwarderConfiguration(
+            version: 1,
+            protocols: [.tcp],
+            listen: EndpointConfiguration(host: "listener.internal", port: 9000),
+            upstream: EndpointConfiguration(host: "upstream.internal", port: 9001)
+        )
+        let original = try ResolvedConfiguration.resolve(configuration) { host, port in
+            try SocketAddress(
+                ipAddress: host == "listener.internal" ? "127.0.0.1" : "127.0.0.10",
+                port: port
+            )
+        }
+        let changed = try ResolvedConfiguration.resolve(configuration) { host, port in
+            try SocketAddress(
+                ipAddress: host == "listener.internal" ? "127.0.0.2" : "127.0.0.10",
+                port: port
+            )
+        }
+
+        XCTAssertTrue(original.listenBindingDiffers(from: changed))
     }
 
     private func makeConfiguration(upstreamHost: String) -> ForwarderConfiguration {

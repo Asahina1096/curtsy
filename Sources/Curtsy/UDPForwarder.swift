@@ -39,30 +39,29 @@ final class UDPListener: @unchecked Sendable {
     }
 
     func start() throws {
-        let configuration = runtime.current().configuration
-        let hosts = configuration.listen.host == "*" ? ["0.0.0.0", "::"] : [configuration.listen.host]
+        let resolved = runtime.current()
         var bound: [Channel] = []
         var installedHandlers: [UDPRelayHandler] = []
 
         do {
-            for host in hosts {
+            for listenAddress in resolved.listenAddresses {
                 let handler = UDPRelayHandler(runtime: runtime, budget: associationBudget, log: log)
                 var bootstrap = DatagramBootstrap(group: group)
                     .channelOption(.socketOption(.so_reuseaddr), value: 1)
                     .channelInitializer { channel in
                         channel.pipeline.addHandler(handler)
                     }
-                if host == "::" {
+                if case .v6 = listenAddress {
                     bootstrap = bootstrap.channelOption(
                         ChannelOptions.Types.SocketOption(level: .ipv6, name: .ipv6_v6only),
                         value: 1
                     )
                 }
 
-                let channel = try bootstrap.bind(host: host, port: configuration.listen.port).wait()
+                let channel = try bootstrap.bind(to: listenAddress).wait()
                 bound.append(channel)
                 installedHandlers.append(handler)
-                log.info("udp listening on \(channel.localAddress?.curtsyDescription ?? host)")
+                log.info("udp listening on \(channel.localAddress?.curtsyDescription ?? listenAddress.curtsyDescription)")
             }
             listenerChannels = bound
             handlers = installedHandlers
@@ -108,19 +107,22 @@ typealias UDPUpstreamConnector = (
     SocketAddress,
     Channel,
     SocketAddress,
-    LogStore
+    LogStore,
+    @escaping @Sendable () -> Void
 ) -> EventLoopFuture<Channel>
 
 final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
 
     private struct ActiveAssociation {
+        let identifier: UInt64
         let channel: Channel
         var expiry: Scheduled<Void>
     }
 
     private struct PendingAssociation {
         let generation: UInt64
+        let identifier: UInt64
         var buffers: [ByteBuffer]
     }
 
@@ -133,6 +135,7 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     private weak var listenerChannel: Channel?
     private var warnedAtLimit = false
     private var generation: UInt64 = 0
+    private var nextAssociationIdentifier: UInt64 = 0
 
     init(
         runtime: RuntimeConfiguration,
@@ -154,10 +157,12 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         let envelope = unwrapInboundIn(data)
         let client = envelope.remoteAddress
 
-        if var association = active[client] {
-            association.expiry.cancel()
-            association.expiry = scheduleExpiry(client: client, on: context.eventLoop)
-            active[client] = association
+        if let association = active[client] {
+            refreshAssociation(
+                client: client,
+                identifier: association.identifier,
+                on: context.eventLoop
+            )
             association.channel.writeAndFlush(envelope.data).whenFailure { [log] error in
                 log.error("udp upstream write failed client=\(client.curtsyDescription) error=\(error)")
             }
@@ -180,9 +185,40 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         }
 
         let pendingGeneration = generation
-        pending[client] = PendingAssociation(generation: pendingGeneration, buffers: [envelope.data])
+        nextAssociationIdentifier &+= 1
+        let associationIdentifier = nextAssociationIdentifier
+        pending[client] = PendingAssociation(
+            generation: pendingGeneration,
+            identifier: associationIdentifier,
+            buffers: [envelope.data]
+        )
         let eventLoop = context.eventLoop
-        connectUpstream(eventLoop, snapshot.upstreamAddress, context.channel, client, log).whenComplete { [weak self] result in
+        let recordUpstreamActivity: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            if eventLoop.inEventLoop {
+                refreshAssociation(
+                    client: client,
+                    identifier: associationIdentifier,
+                    on: eventLoop
+                )
+                return
+            }
+            eventLoop.execute { [self] in
+                refreshAssociation(
+                    client: client,
+                    identifier: associationIdentifier,
+                    on: eventLoop
+                )
+            }
+        }
+        connectUpstream(
+            eventLoop,
+            snapshot.upstreamAddress,
+            context.channel,
+            client,
+            log,
+            recordUpstreamActivity
+        ).whenComplete { [weak self] result in
             guard let self else {
                 if case .success(let channel) = result {
                     channel.close(promise: nil)
@@ -191,7 +227,8 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
             }
             guard
                 self.generation == pendingGeneration,
-                self.pending[client]?.generation == pendingGeneration
+                self.pending[client]?.generation == pendingGeneration,
+                self.pending[client]?.identifier == associationIdentifier
             else {
                 if case .success(let channel) = result {
                     channel.close(promise: nil)
@@ -199,11 +236,16 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
                 return
             }
 
-            let buffers = self.pending.removeValue(forKey: client)?.buffers ?? []
+            let pendingAssociation = self.pending.removeValue(forKey: client)
+            let buffers = pendingAssociation?.buffers ?? []
             switch result {
             case .success(let channel):
                 let expiry = self.scheduleExpiry(client: client, on: eventLoop)
-                self.active[client] = ActiveAssociation(channel: channel, expiry: expiry)
+                self.active[client] = ActiveAssociation(
+                    identifier: associationIdentifier,
+                    channel: channel,
+                    expiry: expiry
+                )
                 self.warnedAtLimit = false
                 channel.closeFuture.whenComplete { [weak self, weak channel] _ in
                     guard let self, let channel else { return }
@@ -262,17 +304,26 @@ final class UDPRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         }
     }
 
+    private func refreshAssociation(client: SocketAddress, identifier: UInt64, on eventLoop: EventLoop) {
+        guard var association = active[client], association.identifier == identifier else { return }
+        association.expiry.cancel()
+        association.expiry = scheduleExpiry(client: client, on: eventLoop)
+        active[client] = association
+    }
+
     private static func makeUpstreamConnection(
         eventLoop: EventLoop,
         upstreamAddress: SocketAddress,
         listener: Channel,
         clientAddress: SocketAddress,
-        log: LogStore
+        log: LogStore,
+        recordActivity: @escaping @Sendable () -> Void
     ) -> EventLoopFuture<Channel> {
         let upstreamHandler = UDPUpstreamHandler(
             listener: listener,
             clientAddress: clientAddress,
-            log: log
+            log: log,
+            recordActivity: recordActivity
         )
         let bootstrap = DatagramBootstrap(group: eventLoop)
             .channelOption(.autoRead, value: false)
@@ -292,15 +343,23 @@ private final class UDPUpstreamHandler: ChannelInboundHandler, @unchecked Sendab
     private let listener: Channel
     private let clientAddress: SocketAddress
     private let log: LogStore
+    private let recordActivity: @Sendable () -> Void
 
-    init(listener: Channel, clientAddress: SocketAddress, log: LogStore) {
+    init(
+        listener: Channel,
+        clientAddress: SocketAddress,
+        log: LogStore,
+        recordActivity: @escaping @Sendable () -> Void
+    ) {
         self.listener = listener
         self.clientAddress = clientAddress
         self.log = log
+        self.recordActivity = recordActivity
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let upstreamEnvelope = unwrapInboundIn(data)
+        recordActivity()
         let response = AddressedEnvelope(remoteAddress: clientAddress, data: upstreamEnvelope.data)
         listener.writeAndFlush(response).whenFailure { [log] error in
             log.error("udp client write failed client=\(self.clientAddress.curtsyDescription) error=\(error)")

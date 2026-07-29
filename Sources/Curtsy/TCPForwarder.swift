@@ -2,6 +2,12 @@ import Atomics
 import NIOCore
 import NIOPosix
 
+#if canImport(Glibc)
+import Glibc
+#else
+import Darwin
+#endif
+
 private enum TCPPerformanceTuning {
     // Large reads and batched flushes keep syscall and event-loop overhead low enough
     // for a single connection to sustain gigabit throughput.
@@ -30,6 +36,7 @@ final class TCPListener: @unchecked Sendable {
     private let activeChannels = ChannelRegistry()
     private let accepting = ManagedAtomic(true)
     private var listenerChannels: [Channel] = []
+    private var configuredBacklog: Int
 
     init(
         group: EventLoopGroup,
@@ -40,6 +47,7 @@ final class TCPListener: @unchecked Sendable {
         self.group = group
         runtime = RuntimeConfiguration(configuration)
         self.log = log
+        configuredBacklog = configuration.configuration.limits.tcpListenBacklog
         if enableSockmapAcceleration {
             do {
                 sockmapAccelerator = try TCPSockmapAccelerator.load()
@@ -56,8 +64,8 @@ final class TCPListener: @unchecked Sendable {
     }
 
     func start() throws {
-        let configuration = runtime.current().configuration
-        let hosts = configuration.listen.host == "*" ? ["0.0.0.0", "::"] : [configuration.listen.host]
+        let resolved = runtime.current()
+        let configuration = resolved.configuration
         let eventLoops = Array(group.makeIterator())
         let workerCount = eventLoops.count
         var bound: [Channel] = []
@@ -76,9 +84,9 @@ final class TCPListener: @unchecked Sendable {
         defer { reusePortProgram?.close() }
 
         do {
-            for host in hosts {
+            for listenAddress in resolved.listenAddresses {
                 var hostChannels: [Channel] = []
-                var port = configuration.listen.port
+                var bindAddress = listenAddress
 
                 for eventLoop in eventLoops {
                     var bootstrap = ServerBootstrap(group: eventLoop, childGroup: eventLoop)
@@ -98,18 +106,18 @@ final class TCPListener: @unchecked Sendable {
                             }
                         }
 
-                    if host == "::" {
+                    if case .v6 = listenAddress {
                         bootstrap = bootstrap.serverChannelOption(
                             ChannelOptions.Types.SocketOption(level: .ipv6, name: .ipv6_v6only),
                             value: 1
                         )
                     }
 
-                    let channel = try bootstrap.bind(host: host, port: port).wait()
+                    let channel = try bootstrap.bind(to: bindAddress).wait()
                     hostChannels.append(channel)
                     bound.append(channel)
-                    if configuration.listen.port == 0 {
-                        port = channel.localAddress?.port ?? port
+                    if listenAddress.port == 0, let localAddress = channel.localAddress {
+                        bindAddress = localAddress
                     }
                 }
 
@@ -119,10 +127,11 @@ final class TCPListener: @unchecked Sendable {
                         try reusePortProgram.attach(to: channel)
                         balancer = "ebpf"
                     } catch {
-                        log.warning("tcp reuseport eBPF attach failed; using kernel hash host=\(host) error=\(error)")
+                        log.warning("tcp reuseport eBPF attach failed; using kernel hash address=\(listenAddress.curtsyDescription) error=\(error)")
                     }
                 }
-                let address = hostChannels.first?.localAddress?.curtsyDescription ?? host
+                let address = hostChannels.first?.localAddress?.curtsyDescription
+                    ?? listenAddress.curtsyDescription
                 log.info("tcp listening on \(address) workers=\(workerCount) balancer=\(balancer)")
             }
             listenerChannels = bound
@@ -137,6 +146,26 @@ final class TCPListener: @unchecked Sendable {
     func update(configuration: ResolvedConfiguration) {
         runtime.update(configuration)
     }
+
+    func updateListeningBacklog(_ backlog: Int) throws {
+        guard backlog != configuredBacklog else { return }
+        let oldBacklog = configuredBacklog
+        var updatedChannels: [Channel] = []
+        do {
+            for channel in listenerChannels {
+                try setListeningBacklog(backlog, on: channel)
+                updatedChannels.append(channel)
+            }
+            configuredBacklog = backlog
+        } catch {
+            for channel in updatedChannels {
+                try? setListeningBacklog(oldBacklog, on: channel)
+            }
+            throw error
+        }
+    }
+
+    var currentListeningBacklog: Int { configuredBacklog }
 
     func stopAccepting() {
         accepting.store(false, ordering: .releasing)
@@ -173,6 +202,27 @@ final class TCPListener: @unchecked Sendable {
         return client.pipeline.addHandler(
             TCPFrontendHandler(snapshot: snapshot, log: log, sockmapAccelerator: sockmapAccelerator)
         )
+    }
+
+    private func setListeningBacklog(_ backlog: Int, on channel: Channel) throws {
+        try channel.eventLoop.submit {
+            let result = try channel.pipeline.syncOperations.withUnsafeTransportIfAvailable(
+                of: NIOBSDSocket.Handle.self
+            ) { descriptor -> Bool in
+                #if canImport(Glibc)
+                let status = Glibc.listen(descriptor, Int32(backlog))
+                #else
+                let status = Darwin.listen(descriptor, Int32(backlog))
+                #endif
+                guard status == 0 else {
+                    throw IOError(errnoCode: errno, reason: "listen backlog update")
+                }
+                return true
+            }
+            guard result == true else {
+                throw IOError(errnoCode: ENOTSUP, reason: "channel does not expose its socket")
+            }
+        }.wait()
     }
 }
 

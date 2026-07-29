@@ -12,20 +12,9 @@ int32_t curtsy_so_reuseport(void) {
     return SO_REUSEPORT;
 }
 
-int32_t curtsy_so_cookie(void) {
-#if defined(__linux__)
-    return SO_COOKIE;
-#else
-    return -1;
-#endif
-}
-
 #if defined(__linux__)
 
 #include <linux/bpf.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -94,51 +83,16 @@ static void curtsy_map_delete(int map_fd, const void *key) {
     (void)curtsy_bpf(BPF_MAP_DELETE_ELEM, &attributes);
 }
 
-static int curtsy_dup_socket_for_cookie(uint64_t wanted_cookie) {
-    DIR *directory = opendir("/proc/self/fd");
-    if (directory == NULL) {
+static int curtsy_get_socket_cookie(int socket_fd, uint64_t *cookie) {
+    socklen_t cookie_length = sizeof(*cookie);
+    if (getsockopt(socket_fd, SOL_SOCKET, SO_COOKIE, cookie, &cookie_length) != 0) {
         return -1;
     }
-
-    int result = -1;
-    int directory_fd = dirfd(directory);
-    struct dirent *entry;
-    while ((entry = readdir(directory)) != NULL) {
-        char *end = NULL;
-        long parsed = strtol(entry->d_name, &end, 10);
-        if (end == entry->d_name || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
-            continue;
-        }
-        int candidate = (int)parsed;
-        if (candidate == directory_fd) {
-            continue;
-        }
-
-        uint64_t cookie = 0;
-        socklen_t cookie_length = sizeof(cookie);
-        if (getsockopt(candidate, SOL_SOCKET, SO_COOKIE, &cookie, &cookie_length) != 0 ||
-            cookie_length != sizeof(cookie) || cookie != wanted_cookie) {
-            continue;
-        }
-
-        int duplicate = fcntl(candidate, F_DUPFD_CLOEXEC, 0);
-        if (duplicate < 0) {
-            continue;
-        }
-        cookie = 0;
-        cookie_length = sizeof(cookie);
-        if (getsockopt(duplicate, SOL_SOCKET, SO_COOKIE, &cookie, &cookie_length) == 0 &&
-            cookie_length == sizeof(cookie) && cookie == wanted_cookie) {
-            result = duplicate;
-            break;
-        }
-        close(duplicate);
+    if (cookie_length != sizeof(*cookie) || *cookie == 0) {
+        errno = EINVAL;
+        return -1;
     }
-
-    int saved_errno = errno;
-    closedir(directory);
-    errno = result >= 0 ? 0 : (saved_errno != 0 ? saved_errno : ENOENT);
-    return result;
+    return 0;
 }
 
 #define CURTSY_INSN(CODE, DST, SRC, OFF, IMM) \
@@ -416,24 +370,27 @@ void curtsy_sockmap_destroy(curtsy_sockmap_runtime *runtime) {
 
 int32_t curtsy_sockmap_pair(
     curtsy_sockmap_runtime *runtime,
-    uint64_t client_cookie,
-    uint64_t upstream_cookie
+    int32_t client_fd,
+    int32_t upstream_fd,
+    uint64_t *client_cookie_out,
+    uint64_t *upstream_cookie_out
 ) {
-    if (runtime == NULL || client_cookie == 0 || upstream_cookie == 0 ||
-        client_cookie == upstream_cookie) {
+    if (runtime == NULL || client_fd < 0 || upstream_fd < 0 ||
+        client_cookie_out == NULL || upstream_cookie_out == NULL) {
         errno = EINVAL;
         return -1;
     }
 
-    int client_fd = curtsy_dup_socket_for_cookie(client_cookie);
-    if (client_fd < 0) {
+    uint64_t client_cookie = 0;
+    uint64_t upstream_cookie = 0;
+    if (curtsy_get_socket_cookie(client_fd, &client_cookie) != 0) {
         return -1;
     }
-    int upstream_fd = curtsy_dup_socket_for_cookie(upstream_cookie);
-    if (upstream_fd < 0) {
-        int saved_errno = errno;
-        close(client_fd);
-        errno = saved_errno;
+    if (curtsy_get_socket_cookie(upstream_fd, &upstream_cookie) != 0) {
+        return -1;
+    }
+    if (client_cookie == upstream_cookie) {
+        errno = EINVAL;
         return -1;
     }
 
@@ -458,15 +415,13 @@ int32_t curtsy_sockmap_pair(
         goto failure;
     }
 
-    close(upstream_fd);
-    close(client_fd);
+    *client_cookie_out = client_cookie;
+    *upstream_cookie_out = upstream_cookie;
     return 0;
 
 failure: {
         int saved_errno = errno;
         curtsy_sockmap_unpair(runtime, client_cookie, upstream_cookie);
-        close(upstream_fd);
-        close(client_fd);
         errno = saved_errno;
         return -1;
     }
@@ -551,10 +506,13 @@ void curtsy_sockmap_destroy(curtsy_sockmap_runtime *runtime) { (void)runtime; }
 
 int32_t curtsy_sockmap_pair(
     curtsy_sockmap_runtime *runtime,
-    uint64_t client_cookie,
-    uint64_t upstream_cookie
+    int32_t client_fd,
+    int32_t upstream_fd,
+    uint64_t *client_cookie,
+    uint64_t *upstream_cookie
 ) {
-    (void)runtime; (void)client_cookie; (void)upstream_cookie;
+    (void)runtime; (void)client_fd; (void)upstream_fd;
+    (void)client_cookie; (void)upstream_cookie;
     errno = ENOTSUP;
     return -1;
 }

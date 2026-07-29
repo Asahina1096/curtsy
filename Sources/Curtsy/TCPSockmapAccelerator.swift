@@ -53,28 +53,60 @@ final class TCPSockmapAccelerator: @unchecked Sendable {
     }
 
     func pair(client: Channel, upstream: Channel) -> EventLoopFuture<TCPSockmapConnection> {
-        guard
-            let clientProvider = client as? SocketOptionProvider,
-            let upstreamProvider = upstream as? SocketOptionProvider
-        else {
+        guard client.eventLoop === upstream.eventLoop else {
             return client.eventLoop.makeFailedFuture(AcceleratorError.unsupportedChannel)
         }
 
-        let level = SocketOptionLevel(curtsy_socket_level())
-        let name = SocketOptionName(curtsy_so_cookie())
-        let clientCookie: EventLoopFuture<UInt64> = clientProvider.unsafeGetSocketOption(level: level, name: name)
-        let upstreamCookie: EventLoopFuture<UInt64> = upstreamProvider.unsafeGetSocketOption(level: level, name: name)
-
-        return clientCookie.and(upstreamCookie).flatMapThrowing { [self] cookies in
-            guard curtsy_sockmap_pair(runtime, cookies.0, cookies.1) == 0 else {
-                throw AcceleratorError.systemCall(errorNumber: errno)
-            }
-            return TCPSockmapConnection(
-                accelerator: self,
-                clientCookie: cookies.0,
-                upstreamCookie: cookies.1
-            )
+        return client.eventLoop.submit { [self] in
+            try pairOnEventLoop(client: client, upstream: upstream)
         }
+    }
+
+    private func pairOnEventLoop(client: Channel, upstream: Channel) throws -> TCPSockmapConnection {
+        client.eventLoop.assertInEventLoop()
+        let clientTransportResult = try client.pipeline.syncOperations.withUnsafeTransportIfAvailable(
+            of: NIOBSDSocket.Handle.self,
+            { clientDescriptor in
+                try upstream.pipeline.syncOperations.withUnsafeTransportIfAvailable(
+                    of: NIOBSDSocket.Handle.self,
+                    { upstreamDescriptor in
+                        try makeConnection(
+                            clientDescriptor: clientDescriptor,
+                            upstreamDescriptor: upstreamDescriptor
+                        )
+                    }
+                )
+            }
+        )
+        guard
+            let maybeConnection = clientTransportResult,
+            let connection = maybeConnection
+        else {
+            throw AcceleratorError.unsupportedChannel
+        }
+        return connection
+    }
+
+    private func makeConnection(
+        clientDescriptor: NIOBSDSocket.Handle,
+        upstreamDescriptor: NIOBSDSocket.Handle
+    ) throws -> TCPSockmapConnection {
+        var clientCookie: UInt64 = 0
+        var upstreamCookie: UInt64 = 0
+        guard curtsy_sockmap_pair(
+            runtime,
+            Int32(clientDescriptor),
+            Int32(upstreamDescriptor),
+            &clientCookie,
+            &upstreamCookie
+        ) == 0 else {
+            throw AcceleratorError.systemCall(errorNumber: errno)
+        }
+        return TCPSockmapConnection(
+            accelerator: self,
+            clientCookie: clientCookie,
+            upstreamCookie: upstreamCookie
+        )
     }
 
     fileprivate func unpair(clientCookie: UInt64, upstreamCookie: UInt64) {
