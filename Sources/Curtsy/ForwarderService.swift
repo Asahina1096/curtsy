@@ -15,6 +15,7 @@ final class ForwarderService: @unchecked Sendable {
     private let controlQueue = DispatchQueue(label: "curtsy.control")
     private let stopped = DispatchSemaphore(value: 0)
     private let log: LogStore
+    private let tcpBufferBudget: TCPBufferBudget
     private var configuration: ResolvedConfiguration
     private var tcpListener: TCPListener?
     private var udpListener: UDPListener?
@@ -28,6 +29,7 @@ final class ForwarderService: @unchecked Sendable {
         self.configuration = try ResolvedConfiguration.resolve(configuration)
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: max(1, System.coreCount))
         self.log = LogStore(level: configuration.logging.level)
+        self.tcpBufferBudget = TCPBufferBudget(limit: configuration.limits.maxTCPBufferedBytes)
     }
 
     func run() throws {
@@ -49,7 +51,12 @@ final class ForwarderService: @unchecked Sendable {
         var startedTCP: TCPListener?
         do {
             if configuration.configuration.protocols.contains(.tcp) {
-                let listener = TCPListener(group: group, configuration: configuration, log: log)
+                let listener = TCPListener(
+                    group: group,
+                    configuration: configuration,
+                    log: log,
+                    bufferBudget: tcpBufferBudget
+                )
                 try listener.start()
                 startedTCP = listener
             }
@@ -116,7 +123,12 @@ final class ForwarderService: @unchecked Sendable {
             var newUDP: UDPListener?
             do {
                 if newProtocols.contains(.tcp) {
-                    let listener = TCPListener(group: group, configuration: candidate, log: log)
+                    let listener = TCPListener(
+                        group: group,
+                        configuration: candidate,
+                        log: log,
+                        bufferBudget: tcpBufferBudget
+                    )
                     try listener.start()
                     newTCP = listener
                 } else {
@@ -143,18 +155,21 @@ final class ForwarderService: @unchecked Sendable {
             udpListener?.stop()
             tcpListener = newTCP
             udpListener = newUDP
+            tcpBufferBudget.updateLimit(candidate.configuration.limits.maxTCPBufferedBytes)
             configuration = candidate
             return
         }
 
-        let replaceTCP = newProtocols.contains(.tcp)
-            && tcpListener != nil
-            && old.tcpAccelerationDiffers(from: candidate)
         var addedTCP: TCPListener?
         var addedUDP: UDPListener?
         do {
-            if newProtocols.contains(.tcp), tcpListener == nil || replaceTCP {
-                let listener = TCPListener(group: group, configuration: candidate, log: log)
+            if newProtocols.contains(.tcp), tcpListener == nil {
+                let listener = TCPListener(
+                    group: group,
+                    configuration: candidate,
+                    log: log,
+                    bufferBudget: tcpBufferBudget
+                )
                 try listener.start()
                 addedTCP = listener
             }
@@ -178,17 +193,11 @@ final class ForwarderService: @unchecked Sendable {
             throw error
         }
 
-        if let addedTCP {
-            let oldTCP = tcpListener
-            tcpListener = addedTCP
-            if let oldTCP {
-                oldTCP.stopAccepting()
-                retire(oldTCP)
-            }
-        }
+        if let addedTCP { tcpListener = addedTCP }
         if let addedUDP { udpListener = addedUDP }
 
         let upstreamChanged = old.upstreamAddress != candidate.upstreamAddress
+        tcpBufferBudget.updateLimit(candidate.configuration.limits.maxTCPBufferedBytes)
         tcpListener?.update(configuration: candidate)
         udpListener?.update(configuration: candidate, resetAssociations: upstreamChanged)
 

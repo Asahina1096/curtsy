@@ -1,4 +1,5 @@
 import Atomics
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 
@@ -30,11 +31,58 @@ private enum TCPPerformanceTuning {
     )
 }
 
+final class TCPBufferBudget: @unchecked Sendable {
+    private let usedBytes = ManagedAtomic(0)
+    private let configuredLimit: ManagedAtomic<Int>
+
+    init(limit: Int) {
+        precondition(limit > 0)
+        configuredLimit = ManagedAtomic(limit)
+    }
+
+    func tryAcquire(_ byteCount: Int) -> Bool {
+        guard byteCount > 0 else { return true }
+        while true {
+            let current = usedBytes.load(ordering: .relaxed)
+            let limit = configuredLimit.load(ordering: .relaxed)
+            guard current <= limit, byteCount <= limit - current else { return false }
+            let result = usedBytes.compareExchange(
+                expected: current,
+                desired: current + byteCount,
+                ordering: .relaxed
+            )
+            if result.exchanged { return true }
+        }
+    }
+
+    func release(_ byteCount: Int) {
+        guard byteCount > 0 else { return }
+        let previous = usedBytes.loadThenWrappingDecrement(by: byteCount, ordering: .relaxed)
+        precondition(previous >= byteCount, "TCP buffer budget released more than acquired")
+    }
+
+    func updateLimit(_ limit: Int) {
+        precondition(limit > 0)
+        configuredLimit.store(limit, ordering: .relaxed)
+    }
+
+    var limit: Int { configuredLimit.load(ordering: .relaxed) }
+    var used: Int { usedBytes.load(ordering: .relaxed) }
+}
+
 final class TCPListener: @unchecked Sendable {
+    private struct State {
+        var configuration: ResolvedConfiguration
+        var sockmapRequested: Bool
+        var sockmapAccelerator: TCPSockmapAccelerator?
+    }
+
     private let group: EventLoopGroup
-    private let runtime: RuntimeConfiguration
+    private let state: NIOLockedValueBox<State>
     private let log: LogStore
-    private let sockmapAccelerator: TCPSockmapAccelerator?
+    private let bufferBudget: TCPBufferBudget
+    private let enableSockmapAccelerationOverride: Bool?
+    private let loadSockmapAccelerator: () throws -> TCPSockmapAccelerator?
     private let activeChannels = ChannelRegistry()
     private let accepting = ManagedAtomic(true)
     private var listenerChannels: [Channel] = []
@@ -45,33 +93,46 @@ final class TCPListener: @unchecked Sendable {
         configuration: ResolvedConfiguration,
         log: LogStore,
         enableSockmapAcceleration: Bool? = nil,
-        loadSockmapAccelerator: () throws -> TCPSockmapAccelerator? = {
+        bufferBudget: TCPBufferBudget? = nil,
+        loadSockmapAccelerator: @escaping () throws -> TCPSockmapAccelerator? = {
             try TCPSockmapAccelerator.load()
         }
     ) {
         self.group = group
-        runtime = RuntimeConfiguration(configuration)
         self.log = log
+        self.bufferBudget = bufferBudget ?? TCPBufferBudget(
+            limit: configuration.configuration.limits.maxTCPBufferedBytes
+        )
+        enableSockmapAccelerationOverride = enableSockmapAcceleration
+        self.loadSockmapAccelerator = loadSockmapAccelerator
         configuredBacklog = configuration.configuration.limits.tcpListenBacklog
         let shouldEnableSockmap = enableSockmapAcceleration ?? configuration.shouldEnableTCPSockmap
+        let accelerator: TCPSockmapAccelerator?
         if shouldEnableSockmap {
             do {
-                sockmapAccelerator = try loadSockmapAccelerator()
-                if sockmapAccelerator != nil {
+                accelerator = try loadSockmapAccelerator()
+                if accelerator != nil {
                     log.info("tcp sockmap acceleration enabled")
                 }
             } catch {
-                sockmapAccelerator = nil
+                accelerator = nil
                 log.warning("tcp sockmap acceleration unavailable; using userspace relay error=\(error)")
             }
         } else {
-            sockmapAccelerator = nil
+            accelerator = nil
             log.info("tcp sockmap acceleration disabled")
         }
+        state = NIOLockedValueBox(
+            State(
+                configuration: configuration,
+                sockmapRequested: shouldEnableSockmap,
+                sockmapAccelerator: accelerator
+            )
+        )
     }
 
     func start() throws {
-        let resolved = runtime.current()
+        let resolved = state.withLockedValue(\.configuration)
         let configuration = resolved.configuration
         let eventLoops = Array(group.makeIterator())
         let workerCount = eventLoops.count
@@ -151,7 +212,36 @@ final class TCPListener: @unchecked Sendable {
     }
 
     func update(configuration: ResolvedConfiguration) {
-        runtime.update(configuration)
+        let requested = enableSockmapAccelerationOverride ?? configuration.shouldEnableTCPSockmap
+        let current = state.withLockedValue { ($0.sockmapRequested, $0.sockmapAccelerator) }
+        var accelerator = current.1
+
+        if requested {
+            if accelerator == nil {
+                do {
+                    accelerator = try loadSockmapAccelerator()
+                    if accelerator != nil {
+                        log.info("tcp sockmap acceleration enabled")
+                    }
+                } catch {
+                    log.warning("tcp sockmap acceleration unavailable; using userspace relay error=\(error)")
+                }
+            }
+        } else {
+            accelerator = nil
+            if current.0 {
+                log.info("tcp sockmap acceleration disabled")
+            }
+        }
+
+        bufferBudget.updateLimit(configuration.configuration.limits.maxTCPBufferedBytes)
+        state.withLockedValue {
+            $0 = State(
+                configuration: configuration,
+                sockmapRequested: requested,
+                sockmapAccelerator: accelerator
+            )
+        }
     }
 
     func updateListeningBacklog(_ backlog: Int) throws {
@@ -200,14 +290,21 @@ final class TCPListener: @unchecked Sendable {
         guard accepting.load(ordering: .acquiring) else {
             return client.close()
         }
-        let snapshot = runtime.current()
+        let connectionState = state.withLockedValue {
+            ($0.configuration, $0.sockmapAccelerator)
+        }
         log.debug("tcp accepted client=\(client.remoteAddress?.curtsyDescription ?? "unknown")")
         activeChannels.insert(client)
         guard accepting.load(ordering: .acquiring) else {
             return client.close()
         }
         return client.pipeline.addHandler(
-            TCPFrontendHandler(snapshot: snapshot, log: log, sockmapAccelerator: sockmapAccelerator)
+            TCPFrontendHandler(
+                snapshot: connectionState.0,
+                log: log,
+                sockmapAccelerator: connectionState.1,
+                bufferBudget: bufferBudget
+            )
         )
     }
 
@@ -239,15 +336,23 @@ private final class TCPFrontendHandler: ChannelInboundHandler, @unchecked Sendab
     private let snapshot: ResolvedConfiguration
     private let log: LogStore
     private let sockmapAccelerator: TCPSockmapAccelerator?
+    private let bufferBudget: TCPBufferBudget
     private var upstream: Channel?
     private var acceleration: TCPSockmapConnection?
     private var idleCheck: Scheduled<Void>?
     private var bytes: Int64 = 0
+    private var bufferLimitExceeded = false
 
-    init(snapshot: ResolvedConfiguration, log: LogStore, sockmapAccelerator: TCPSockmapAccelerator?) {
+    init(
+        snapshot: ResolvedConfiguration,
+        log: LogStore,
+        sockmapAccelerator: TCPSockmapAccelerator?,
+        bufferBudget: TCPBufferBudget
+    ) {
         self.snapshot = snapshot
         self.log = log
         self.sockmapAccelerator = sockmapAccelerator
+        self.bufferBudget = bufferBudget
     }
 
     func channelActive(context: ChannelHandlerContext) {
@@ -274,7 +379,11 @@ private final class TCPFrontendHandler: ChannelInboundHandler, @unchecked Sendab
             switch result {
             case .success(let upstream):
                 let timeout = TimeAmount.seconds(Int64(configuration.timeouts.tcpIdleSeconds))
-                let relayHandler = TCPRelayHandler(peer: clientChannel, log: self.log)
+                let relayHandler = TCPRelayHandler(
+                    peer: clientChannel,
+                    log: self.log,
+                    bufferBudget: self.bufferBudget
+                )
                 do {
                     try upstream.pipeline.syncOperations.addHandler(relayHandler)
                 } catch {
@@ -332,10 +441,16 @@ private final class TCPFrontendHandler: ChannelInboundHandler, @unchecked Sendab
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        guard let upstream else { return }
+        guard let upstream, !bufferLimitExceeded else { return }
         let buffer = unwrapInboundIn(data)
         bytes += Int64(buffer.readableBytes)
-        upstream.write(buffer, promise: nil)
+        guard write(buffer, to: upstream) else {
+            bufferLimitExceeded = true
+            log.warning("tcp buffer budget exhausted limit=\(bufferBudget.limit)")
+            upstream.close(promise: nil)
+            context.close(promise: nil)
+            return
+        }
     }
 
     func channelReadComplete(context: ChannelHandlerContext) {
@@ -400,6 +515,17 @@ private final class TCPFrontendHandler: ChannelInboundHandler, @unchecked Sendab
         log.debug("tcp connected mode=userspace client=\(clientAddress) upstream=\(snapshot.upstreamAddress.curtsyDescription)")
     }
 
+    private func write(_ buffer: ByteBuffer, to channel: Channel) -> Bool {
+        let byteCount = buffer.readableBytes
+        guard bufferBudget.tryAcquire(byteCount) else { return false }
+        let promise = channel.eventLoop.makePromise(of: Void.self)
+        promise.futureResult.whenComplete { [bufferBudget] _ in
+            bufferBudget.release(byteCount)
+        }
+        channel.write(buffer, promise: promise)
+        return true
+    }
+
     private func activateReads(client: Channel, upstream: Channel, clientAddress: String) {
         client.setOption(.autoRead, value: true).and(
             upstream.setOption(.autoRead, value: true)
@@ -461,18 +587,34 @@ private final class TCPRelayHandler: ChannelInboundHandler, @unchecked Sendable 
 
     private let peer: Channel
     private let log: LogStore
+    private let bufferBudget: TCPBufferBudget
     var acceleration: TCPSockmapConnection?
     private var bytes: Int64 = 0
+    private var bufferLimitExceeded = false
 
-    init(peer: Channel, log: LogStore) {
+    init(peer: Channel, log: LogStore, bufferBudget: TCPBufferBudget) {
         self.peer = peer
         self.log = log
+        self.bufferBudget = bufferBudget
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !bufferLimitExceeded else { return }
         let buffer = unwrapInboundIn(data)
         bytes += Int64(buffer.readableBytes)
-        peer.write(buffer, promise: nil)
+        let byteCount = buffer.readableBytes
+        guard bufferBudget.tryAcquire(byteCount) else {
+            bufferLimitExceeded = true
+            log.warning("tcp buffer budget exhausted limit=\(bufferBudget.limit)")
+            peer.close(promise: nil)
+            context.close(promise: nil)
+            return
+        }
+        let promise = peer.eventLoop.makePromise(of: Void.self)
+        promise.futureResult.whenComplete { [bufferBudget] _ in
+            bufferBudget.release(byteCount)
+        }
+        peer.write(buffer, promise: promise)
     }
 
     func channelReadComplete(context: ChannelHandlerContext) {

@@ -46,9 +46,6 @@ struct ResolvedConfiguration: Sendable {
         }
     }
 
-    func tcpAccelerationDiffers(from other: ResolvedConfiguration) -> Bool {
-        shouldEnableTCPSockmap != other.shouldEnableTCPSockmap
-    }
 }
 
 extension SocketAddress {

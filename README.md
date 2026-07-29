@@ -49,6 +49,8 @@ TCP 转发路径使用大块自适应读取、批量 flush 和背压控制，目
 
 `limits.tcpListenBacklog` 默认为 4096，用于吸收突发连接。实际队列仍受系统 `net.core.somaxconn` 和 `net.ipv4.tcp_max_syn_backlog` 限制。连接状态表采用分片锁；低于当前日志等级的连接日志不会再构造消息或获取日志锁，每条 TCP 连接只保留一个空闲计时器。
 
+用户态 TCP relay 的待发送数据受全局 `limits.maxTCPBufferedBytes` 约束，默认 256 MiB。该预算由所有连接和两个转发方向共享；达到上限时，无法安全缓存下一块数据的连接会被关闭，避免大量慢速连接耗尽进程内存。sockmap 内核转发不占用此用户态预算。
+
 高 RTT 链路需要足够大的系统 TCP 自动调优上限。例如 1 Gbps、100 ms RTT 的链路至少需要约 12.5 MB 的 TCP 窗口，可按部署环境检查并调整 `net.ipv4.tcp_rmem`、`net.ipv4.tcp_wmem`、`net.core.rmem_max` 和 `net.core.wmem_max`。Curtsy 不会自行覆盖这些系统级参数。
 
 ## 配置约束

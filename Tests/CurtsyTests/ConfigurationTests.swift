@@ -33,6 +33,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.timeouts.udpSessionSeconds, 60)
         XCTAssertEqual(configuration.timeouts.shutdownGraceSeconds, 10)
         XCTAssertEqual(configuration.limits.tcpListenBacklog, 4_096)
+        XCTAssertEqual(configuration.limits.maxTCPBufferedBytes, 256 * 1_024 * 1_024)
         XCTAssertEqual(configuration.limits.maxUDPAssociations, 4_096)
         XCTAssertEqual(configuration.logging.level, "info")
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .auto)
@@ -49,7 +50,7 @@ final class ConfigurationTests: XCTestCase {
           tcpIdleSeconds: 20
           udpSessionSeconds: 15
           shutdownGraceSeconds: 3
-        limits: { tcpListenBacklog: 2048, maxUDPAssociations: 128 }
+        limits: { tcpListenBacklog: 2048, maxTCPBufferedBytes: 67108864, maxUDPAssociations: 128 }
         performance: { tcpSockmapAcceleration: enabled }
         logging: { level: debug }
         """)
@@ -57,6 +58,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.protocols, [.udp])
         XCTAssertEqual(configuration.timeouts.udpSessionSeconds, 15)
         XCTAssertEqual(configuration.limits.tcpListenBacklog, 2_048)
+        XCTAssertEqual(configuration.limits.maxTCPBufferedBytes, 64 * 1_024 * 1_024)
         XCTAssertEqual(configuration.limits.maxUDPAssociations, 128)
         XCTAssertEqual(configuration.logging.level, "debug")
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .enabled)
@@ -106,6 +108,13 @@ final class ConfigurationTests: XCTestCase {
             listen: { host: "127.0.0.1", port: 9000 }
             upstream: { host: "127.0.0.1", port: 9001 }
             limits: { tcpListenBacklog: 0 }
+            """,
+            """
+            version: 1
+            protocols: [tcp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            limits: { maxTCPBufferedBytes: 0 }
             """,
             """
             version: 1
@@ -178,17 +187,6 @@ final class ConfigurationTests: XCTestCase {
         var disabled = makeConfiguration(upstreamHost: "192.0.2.1")
         disabled.performance = PerformanceConfiguration(tcpSockmapAcceleration: .disabled)
         XCTAssertFalse(try ResolvedConfiguration.resolve(disabled).shouldEnableTCPSockmap)
-    }
-
-    func testSockmapDecisionChangeControlsTCPListenerReplacement() throws {
-        let loopback = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "127.0.0.1"))
-        let remote = try ResolvedConfiguration.resolve(makeConfiguration(upstreamHost: "192.0.2.1"))
-        XCTAssertTrue(loopback.tcpAccelerationDiffers(from: remote))
-
-        var disabledRemoteConfiguration = makeConfiguration(upstreamHost: "192.0.2.1")
-        disabledRemoteConfiguration.performance = PerformanceConfiguration(tcpSockmapAcceleration: .disabled)
-        let disabledRemote = try ResolvedConfiguration.resolve(disabledRemoteConfiguration)
-        XCTAssertFalse(loopback.tcpAccelerationDiffers(from: disabledRemote))
     }
 
     func testDetectsListenHostnameResolutionChange() throws {

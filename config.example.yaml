@@ -17,6 +17,7 @@ timeouts:
 
 limits:
   tcpListenBacklog: 4096
+  maxTCPBufferedBytes: 268435456
   maxUDPAssociations: 4096
 
 performance:

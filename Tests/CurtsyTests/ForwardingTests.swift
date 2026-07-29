@@ -64,7 +64,7 @@ final class ForwardingTests: XCTestCase {
         let loopback = makeResolvedConfiguration(protocols: [.tcp], upstreamPort: 9)
         var loadCount = 0
 
-        _ = TCPListener(
+        let automatic = TCPListener(
             group: group,
             configuration: loopback,
             log: LogStore(level: "critical"),
@@ -74,6 +74,17 @@ final class ForwardingTests: XCTestCase {
             }
         )
         XCTAssertEqual(loadCount, 0)
+
+        let remote = makeResolvedConfiguration(
+            protocols: [.tcp],
+            upstreamHost: "192.0.2.1",
+            upstreamPort: 9
+        )
+        automatic.update(configuration: remote)
+        XCTAssertEqual(loadCount, 1)
+        automatic.update(configuration: loopback)
+        automatic.update(configuration: remote)
+        XCTAssertEqual(loadCount, 2)
 
         _ = TCPListener(
             group: group,
@@ -85,7 +96,25 @@ final class ForwardingTests: XCTestCase {
                 return nil
             }
         )
-        XCTAssertEqual(loadCount, 1)
+        XCTAssertEqual(loadCount, 3)
+    }
+
+    func testTCPBufferBudgetCapsAggregateQueuedBytes() {
+        let budget = TCPBufferBudget(limit: 10)
+
+        XCTAssertTrue(budget.tryAcquire(6))
+        XCTAssertEqual(budget.used, 6)
+        XCTAssertFalse(budget.tryAcquire(5))
+
+        budget.release(6)
+        XCTAssertTrue(budget.tryAcquire(10))
+        budget.updateLimit(5)
+        XCTAssertFalse(budget.tryAcquire(1))
+
+        budget.release(10)
+        XCTAssertTrue(budget.tryAcquire(5))
+        budget.release(5)
+        XCTAssertEqual(budget.used, 0)
     }
 
     func testTCPLargeTransferCompletesThroughBatchedFlushes() throws {
@@ -433,6 +462,7 @@ final class ForwardingTests: XCTestCase {
 
     private func makeResolvedConfiguration(
         protocols: [ForwardProtocol],
+        upstreamHost: String = "127.0.0.1",
         upstreamPort: Int,
         udpSessionSeconds: Int = 5
     ) -> ResolvedConfiguration {
@@ -443,7 +473,7 @@ final class ForwardingTests: XCTestCase {
             version: 1,
             protocols: protocols,
             listen: EndpointConfiguration(host: "127.0.0.1", port: 0),
-            upstream: EndpointConfiguration(host: "127.0.0.1", port: upstreamPort),
+            upstream: EndpointConfiguration(host: upstreamHost, port: upstreamPort),
             timeouts: timeouts
         )
         return try! ResolvedConfiguration.resolve(configuration)
