@@ -1,34 +1,12 @@
-# Swift Package Manager
-.build/
-.swiftpm/
-Packages/
-Package.pins
-
-# Xcode
-DerivedData/
-*.xcodeproj/xcuserdata/
-*.xcworkspace/xcuserdata/
-*.xcuserstate
-
-# Editors and operating systems
-.DS_Store
-*.swp
-*.swo
-.vscode/
-.idea/
-
-# Runtime files
-*.log
-*.pid
-
-# Local performance test artifacts
-.perf-test/
-
-# Debian packaging
+/.build/
+/.zig-cache/
+/zig-out/
+/.toolchain/
+/.perf-test/
 /*.deb
 /debian/.debhelper/
-/debian/*.debhelper
 /debian/curtsy/
+/debian/*.debhelper
+/debian/*.substvars
 /debian/debhelper-build-stamp
 /debian/files
-/debian/*.substvars

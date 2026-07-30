@@ -1,3 +1,7 @@
-tar-ignore = .build
 tar-ignore = .git
-tar-ignore = .swiftpm
+tar-ignore = .build
+tar-ignore = .zig-cache
+tar-ignore = zig-out
+tar-ignore = .toolchain
+tar-ignore = .perf-test
+tar-ignore = *.deb

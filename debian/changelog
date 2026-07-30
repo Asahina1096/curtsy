@@ -1,3 +1,10 @@
+curtsy (0.3.0) noble; urgency=medium
+
+  * Complete the runtime migration to Zig and remove the previous source tree.
+  * Build and test the package with zig build.
+
+ -- Curtsy contributors <maintainers@example.invalid>  Thu, 30 Jul 2026 00:00:00 +0000
+
 curtsy (0.2.2) unstable; urgency=medium
 
   * Report the failing stage in the tuning daemon eBPF observer warning

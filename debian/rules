@@ -1,26 +1,25 @@
 #!/usr/bin/make -f
 
+ZIG ?= $(if $(wildcard .toolchain/zig/zig),.toolchain/zig/zig,zig)
+
 %:
 	dh $@
 
 override_dh_auto_clean:
-	swift package clean
+	rm -rf .zig-cache zig-out
 
 override_dh_auto_build:
-	swift build -c release --static-swift-stdlib
+	$(ZIG) build -Doptimize=ReleaseSafe
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	swift test
+	$(ZIG) build test
 endif
 
 override_dh_auto_install:
-	install -D -m 0755 .build/release/curtsy debian/curtsy/usr/bin/curtsy
+	install -D -m 0755 zig-out/bin/curtsy debian/curtsy/usr/bin/curtsy
 	install -D -m 0644 config.example.yaml debian/curtsy/etc/curtsy/config.yaml
 	install -D -m 0644 debian/60-curtsy.conf debian/curtsy/usr/lib/sysctl.d/60-curtsy.conf
 
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start
-
-override_dh_dwz:
-	# Swift 6 emits .debug_names sections that dwz cannot currently process.

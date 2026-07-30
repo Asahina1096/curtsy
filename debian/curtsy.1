@@ -1,0 +1,65 @@
+.TH CURTSY 1 "July 2026" "curtsy 0.3.0" "User Commands"
+.SH NAME
+curtsy \- transparent TCP and UDP traffic forwarder
+.SH SYNOPSIS
+.B curtsy
+.B --config
+.I PATH
+[
+.B --check-config
+]
+.br
+.B curtsy
+.B --version
+.br
+.B curtsy
+.B --help
+.SH DESCRIPTION
+.B curtsy
+is a Linux TCP and UDP traffic forwarder. It listens on one configured address
+and port and forwards traffic to one configured upstream without terminating
+TLS or inspecting forwarded payloads.
+.SH OPTIONS
+.TP
+.BR -c ", " --config " " \fIPATH\fR
+Read the YAML configuration from
+.IR PATH .
+.TP
+.B --check-config
+Validate the configuration and resolved endpoints, then exit. Configuration
+errors are reported on standard error and use exit status 2.
+.TP
+.B --version
+Print the program version and exit.
+.TP
+.BR -h ", " --help
+Show usage information and exit.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload the configuration. Invalid configuration or bind failures leave the
+running configuration unchanged.
+.TP
+.B SIGINT, SIGTERM
+Stop accepting new connections and exit gracefully. Existing TCP connections
+are allowed to drain until the configured shutdown grace period expires.
+.SH FILES
+.TP
+.I /etc/curtsy/config.yaml
+Default configuration path used by the packaged systemd service.
+.TP
+.I /usr/lib/systemd/system/curtsy.service
+Packaged systemd service unit.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 2
+Configuration loading, validation, or address resolution failed.
+.TP
+.B 64
+Command line usage error.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR journalctl (1)

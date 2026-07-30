@@ -3,7 +3,7 @@ Section: net
 Priority: optional
 Maintainer: Curtsy contributors <maintainers@example.invalid>
 Build-Depends: debhelper-compat (= 13),
- clang
+ zig
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
@@ -11,6 +11,6 @@ Package: curtsy
 Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Description: transparent TCP and UDP traffic forwarder
- Curtsy is a SwiftNIO-based Linux TCP and UDP traffic forwarder. It listens
- on one configured address and port and forwards traffic to one configured
- upstream without terminating TLS or inspecting forwarded payloads.
+ Curtsy is a Zig-based Linux TCP and UDP traffic forwarder. It listens on one
+ configured address and port and forwards traffic to one configured upstream
+ without terminating TLS or inspecting forwarded payloads.
