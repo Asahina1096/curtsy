@@ -243,6 +243,51 @@ final class ForwardingTests: XCTestCase {
         XCTAssertEqual(listener.associationCount, 1)
     }
 
+    func testUDPMultipleIOThreadsSharePortAndBudget() throws {
+        let echo = try DatagramBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(UDPEchoHandler())
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .wait()
+        defer { try? echo.close().wait() }
+
+        var performance = PerformanceConfiguration()
+        performance.udpIOThreads = 2
+        var limits = LimitConfiguration()
+        limits.maxUDPAssociations = 2
+        let configuration = makeResolvedConfiguration(
+            protocols: [.udp],
+            upstreamPort: echo.localAddress!.port!,
+            limits: limits,
+            performance: performance
+        )
+        let listener = UDPListener(
+            group: group,
+            configuration: configuration,
+            log: LogStore(level: "critical"),
+            enableSockmapAcceleration: false
+        )
+        try listener.start()
+        defer { listener.stop() }
+
+        // Both engine threads bind the same address through SO_REUSEPORT, so
+        // the listener still exposes exactly one address.
+        XCTAssertEqual(listener.localAddresses.count, 1)
+
+        let first = try makeUDPClient(message: "first", destination: listener.localAddresses[0])
+        defer { try? first.channel.close().wait() }
+        let second = try makeUDPClient(message: "second", destination: listener.localAddresses[0])
+        defer { try? second.channel.close().wait() }
+
+        first.recorder.wait()
+        second.recorder.wait()
+        XCTAssertEqual(first.recorder.string, "first")
+        XCTAssertEqual(second.recorder.string, "second")
+        // The association limit is shared globally across engine threads.
+        XCTAssertTrue(waitForCondition { listener.associationCount == 2 })
+    }
+
     func testUDPResetAssociationsClearsAndRebuilds() throws {
         let echo = try DatagramBootstrap(group: group)
             .channelInitializer { channel in
@@ -390,7 +435,10 @@ final class ForwardingTests: XCTestCase {
     }
 
     func testUDPListenerUsesResolvedSockmapDecisionAndAllowsTestOverride() throws {
-        let loopback = makeResolvedConfiguration(protocols: [.udp], upstreamPort: 9)
+        // Pin a single I/O thread so the loader call counts stay exact.
+        var performance = PerformanceConfiguration()
+        performance.udpIOThreads = 1
+        let loopback = makeResolvedConfiguration(protocols: [.udp], upstreamPort: 9, performance: performance)
         var loadCount = 0
         let loader: (Int) throws -> UDPSockmapAccelerator = { _ in
             loadCount += 1
@@ -606,7 +654,8 @@ final class ForwardingTests: XCTestCase {
         upstreamHost: String = "127.0.0.1",
         upstreamPort: Int,
         udpSessionSeconds: Int = 5,
-        limits: LimitConfiguration = .init()
+        limits: LimitConfiguration = .init(),
+        performance: PerformanceConfiguration = .init()
     ) -> ResolvedConfiguration {
         var timeouts = TimeoutConfiguration()
         timeouts.tcpIdleSeconds = 5
@@ -617,7 +666,8 @@ final class ForwardingTests: XCTestCase {
             listen: EndpointConfiguration(host: "127.0.0.1", port: 0),
             upstream: EndpointConfiguration(host: upstreamHost, port: upstreamPort),
             timeouts: timeouts,
-            limits: limits
+            limits: limits,
+            performance: performance
         )
         return try! ResolvedConfiguration.resolve(configuration)
     }

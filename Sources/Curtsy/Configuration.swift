@@ -184,15 +184,26 @@ struct RuntimeOptions: Codable, Equatable, Sendable {
 }
 
 struct PerformanceConfiguration: Codable, Equatable, Sendable {
+    static let defaultUDPSocketBufferBytes = 4 * 1_024 * 1_024
+
     var tcpSockmapAcceleration: TCPSockmapAccelerationMode = .auto
     var udpSockmapAcceleration: SockmapAccelerationMode = .auto
+    // Zero keeps the kernel default socket buffers; any positive value is
+    // silently clamped to net.core.rmem_max/wmem_max without CAP_NET_ADMIN.
+    var udpSocketBufferBytes: Int = defaultUDPSocketBufferBytes
+    // Zero auto-tunes to the worker thread count.
+    var udpIOThreads: Int = 0
 
     init(
         tcpSockmapAcceleration: TCPSockmapAccelerationMode = .auto,
-        udpSockmapAcceleration: SockmapAccelerationMode = .auto
+        udpSockmapAcceleration: SockmapAccelerationMode = .auto,
+        udpSocketBufferBytes: Int = defaultUDPSocketBufferBytes,
+        udpIOThreads: Int = 0
     ) {
         self.tcpSockmapAcceleration = tcpSockmapAcceleration
         self.udpSockmapAcceleration = udpSockmapAcceleration
+        self.udpSocketBufferBytes = udpSocketBufferBytes
+        self.udpIOThreads = udpIOThreads
     }
 
     init(from decoder: Decoder) throws {
@@ -205,6 +216,11 @@ struct PerformanceConfiguration: Codable, Equatable, Sendable {
             SockmapAccelerationMode.self,
             forKey: .udpSockmapAcceleration
         ) ?? .auto
+        udpSocketBufferBytes = try container.decodeIfPresent(
+            Int.self,
+            forKey: .udpSocketBufferBytes
+        ) ?? Self.defaultUDPSocketBufferBytes
+        udpIOThreads = try container.decodeAutoTunedInt(forKey: .udpIOThreads, default: 0).value
     }
 }
 
@@ -297,7 +313,9 @@ enum ConfigurationLoader {
         ],
         "logging": ["level"],
         "runtime": ["workerThreads", "tuningDaemon", "tuningIntervalSeconds"],
-        "performance": ["tcpSockmapAcceleration", "udpSockmapAcceleration"]
+        "performance": [
+            "tcpSockmapAcceleration", "udpSockmapAcceleration", "udpSocketBufferBytes", "udpIOThreads",
+        ]
     ]
 
     static func load(path: String) throws -> ForwarderConfiguration {
@@ -372,8 +390,11 @@ enum ConfigurationLoader {
         guard configuration.limits.maxTCPBufferedBytes > 0 else {
             throw ConfigurationError.invalidValue("limits.maxTCPBufferedBytes must be positive")
         }
-        guard configuration.limits.maxUDPAssociations > 0 else {
-            throw ConfigurationError.invalidValue("limits.maxUDPAssociations must be positive")
+        let maxUDPAssociations = Int(UInt32.max / 2)
+        guard (1...maxUDPAssociations).contains(configuration.limits.maxUDPAssociations) else {
+            throw ConfigurationError.invalidValue(
+                "limits.maxUDPAssociations must be between 1 and \(maxUDPAssociations)"
+            )
         }
         guard configuration.limits.maxUDPPendingDatagrams > 0 else {
             throw ConfigurationError.invalidValue("limits.maxUDPPendingDatagrams must be positive")
@@ -386,6 +407,15 @@ enum ConfigurationLoader {
         }
         guard configuration.runtime.tuningIntervalSeconds > 0 else {
             throw ConfigurationError.invalidValue("runtime.tuningIntervalSeconds must be positive")
+        }
+        let maxUDPSocketBufferBytes = 1 << 28
+        guard (0...maxUDPSocketBufferBytes).contains(configuration.performance.udpSocketBufferBytes) else {
+            throw ConfigurationError.invalidValue(
+                "performance.udpSocketBufferBytes must be between 0 (kernel default) and \(maxUDPSocketBufferBytes)"
+            )
+        }
+        guard configuration.performance.udpIOThreads >= 0 else {
+            throw ConfigurationError.invalidValue("performance.udpIOThreads must be zero for auto or positive")
         }
         let validLogLevels = Set(["trace", "debug", "info", "notice", "warning", "error", "critical"])
         guard validLogLevels.contains(configuration.logging.level.lowercased()) else {

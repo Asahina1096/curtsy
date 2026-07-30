@@ -7,7 +7,7 @@ struct CurtsyCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "curtsy",
         abstract: "Transparent TCP and UDP traffic forwarder",
-        version: "0.1.0"
+        version: "0.2.2"
     )
 
     @Option(name: [.short, .long], help: "Path to the YAML configuration file")

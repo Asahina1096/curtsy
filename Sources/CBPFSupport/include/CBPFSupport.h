@@ -118,7 +118,9 @@ int32_t curtsy_eventfd_create(void);
 void curtsy_eventfd_signal(int32_t fd);
 void curtsy_eventfd_drain(int32_t fd);
 
-// Creates a bound datagram socket for address. Sets SO_REUSEADDR and, for
+// Creates a bound datagram socket for address. Sets SO_REUSEADDR and
+// SO_REUSEPORT (one engine thread per worker binds the same address; the
+// kernel hashes each client four-tuple to a stable listener) and, for
 // AF_INET6, IPV6_V6ONLY. On success the bound address (getsockname) is stored
 // in bound/bound_length and the fd is returned.
 int32_t curtsy_udp_listen_socket(
@@ -131,15 +133,22 @@ int32_t curtsy_udp_listen_socket(
 // Creates a datagram socket connected to address (default destination).
 int32_t curtsy_udp_upstream_socket(const struct sockaddr *address, socklen_t address_length);
 
-// Creates a datagram socket bound to bind_address (SO_REUSEADDR; IPV6_V6ONLY
-// for AF_INET6) and connected to peer_address. Used for per-client UDP
-// sockets: the kernel demux prefers this connected four-tuple socket over the
-// wildcard listener, so the client's datagrams land here once it exists.
+// Creates a datagram socket bound to bind_address (SO_REUSEADDR and
+// SO_REUSEPORT, matching the listen sockets it shares the port with;
+// IPV6_V6ONLY for AF_INET6) and connected to peer_address. Used for
+// per-client UDP sockets: the kernel demux prefers this connected four-tuple
+// socket over the wildcard listener, so the client's datagrams land here once
+// it exists.
 int32_t curtsy_udp_connected_client_socket(
     const struct sockaddr *bind_address,
     socklen_t bind_address_length,
     const struct sockaddr *peer_address,
     socklen_t peer_address_length
 );
+
+// Sets SO_RCVBUF and SO_SNDBUF to bytes on a datagram socket. Oversized
+// requests are silently clamped by the kernel unless the process holds
+// CAP_NET_ADMIN; genuine failures return -1 with errno set.
+int32_t curtsy_udp_set_socket_buffers(int32_t fd, int32_t bytes);
 
 #endif

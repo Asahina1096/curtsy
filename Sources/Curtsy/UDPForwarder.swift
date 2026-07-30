@@ -28,7 +28,13 @@ final class UDPAssociationBudget: @unchecked Sendable {
 
 final class UDPListener: @unchecked Sendable {
     private let runtime: RuntimeConfiguration
-    private let engine: UDPRelayEngine
+    private let log: LogStore
+    private let enableSockmapAccelerationOverride: Bool?
+    private let loadSockmapAccelerator: (Int) throws -> UDPSockmapAccelerator
+    // Shared across all engine threads so the configured association limit
+    // stays a global bound rather than a per-thread one.
+    private let budget = UDPAssociationBudget()
+    private var engines: [(runtime: RuntimeConfiguration, engine: UDPRelayEngine)] = []
 
     init(
         group: EventLoopGroup,
@@ -39,38 +45,94 @@ final class UDPListener: @unchecked Sendable {
             try UDPSockmapAccelerator.load(maxEntries: maxEntries)
         }
     ) {
-        // The batched transport runs its own I/O thread instead of event loop
+        // The batched transport runs its own I/O threads instead of event loop
         // channels; the group parameter only keeps call sites unchanged.
         _ = group
         runtime = RuntimeConfiguration(configuration)
-        engine = UDPRelayEngine(
-            runtime: runtime,
-            log: log,
-            enableSockmapAcceleration: enableSockmapAcceleration,
-            loadSockmapAccelerator: loadSockmapAccelerator
-        )
+        self.log = log
+        enableSockmapAccelerationOverride = enableSockmapAcceleration
+        self.loadSockmapAccelerator = loadSockmapAccelerator
     }
 
     func start() throws {
-        try engine.start()
-    }
-
-    func update(configuration: ResolvedConfiguration, resetAssociations: Bool) {
-        // Timeout changes apply on the engine's next expiry sweep, which reads
-        // the current snapshot; only upstream changes need association resets.
-        runtime.update(configuration)
-        engine.updateAccelerator()
-        if resetAssociations {
-            engine.resetAssociations()
+        let snapshot = runtime.current()
+        let threadCount = AutoTune.workerThreads(configured: snapshot.configuration.performance.udpIOThreads)
+        // The first engine binds the configured addresses; the rest bind the
+        // addresses it actually got (relevant when the configured port is 0),
+        // sharing each port through SO_REUSEPORT.
+        try startEngine(runtime: runtime, engineCount: threadCount, announceListen: true)
+        let boundAddresses = engines[0].engine.localAddresses
+        for _ in 1..<threadCount {
+            let resolved = ResolvedConfiguration(
+                configuration: snapshot.configuration,
+                listenAddresses: boundAddresses,
+                upstreamAddress: snapshot.upstreamAddress
+            )
+            try startEngine(
+                runtime: RuntimeConfiguration(resolved),
+                engineCount: threadCount,
+                announceListen: false
+            )
+        }
+        if threadCount > 1 {
+            log.info("udp relay io_threads=\(threadCount)")
         }
     }
 
-    var localAddresses: [SocketAddress] { engine.localAddresses }
+    private func startEngine(
+        runtime: RuntimeConfiguration,
+        engineCount: Int,
+        announceListen: Bool
+    ) throws {
+        let engine = UDPRelayEngine(
+            runtime: runtime,
+            log: log,
+            budget: budget,
+            engineCount: engineCount,
+            enableSockmapAcceleration: enableSockmapAccelerationOverride,
+            loadSockmapAccelerator: loadSockmapAccelerator,
+            announceListen: announceListen
+        )
+        do {
+            try engine.start()
+        } catch {
+            for slot in engines { slot.engine.stop() }
+            engines = []
+            throw error
+        }
+        engines.append((runtime, engine))
+    }
 
-    var associationCount: Int { engine.associationCount }
+    func update(configuration: ResolvedConfiguration, resetAssociations: Bool) {
+        // Timeout changes apply on each engine's next expiry sweep, which reads
+        // the current snapshot; only upstream changes need association resets.
+        runtime.update(configuration)
+        for (index, slot) in engines.enumerated() {
+            if index > 0 {
+                // Keep the concrete addresses this engine bound at start; the
+                // candidate may still carry the configured wildcard port 0.
+                slot.runtime.update(
+                    ResolvedConfiguration(
+                        configuration: configuration.configuration,
+                        listenAddresses: slot.engine.localAddresses,
+                        upstreamAddress: configuration.upstreamAddress
+                    )
+                )
+            }
+            slot.engine.updateAccelerator()
+            if resetAssociations {
+                slot.engine.resetAssociations()
+            }
+        }
+    }
+
+    var localAddresses: [SocketAddress] { engines.first?.engine.localAddresses ?? [] }
+
+    var associationCount: Int { budget.count }
 
     func stop() {
-        engine.stop()
+        for slot in engines { slot.engine.stop() }
+        engines = []
     }
 }
 
@@ -104,7 +166,11 @@ final class UDPRelayEngine: @unchecked Sendable {
 
     private let runtime: RuntimeConfiguration
     private let log: LogStore
-    private let budget = UDPAssociationBudget()
+    private let budget: UDPAssociationBudget
+    // Number of engine threads sharing this listener; used to size the
+    // per-engine sockmap so all maps together match the configured limit.
+    private let engineCount: Int
+    private let announceListen: Bool
     private let pendingCommands = NIOLockedValueBox<[Command]>([])
     private let enableSockmapAccelerationOverride: Bool?
     private let loadSockmapAccelerator: (Int) throws -> UDPSockmapAccelerator
@@ -130,13 +196,19 @@ final class UDPRelayEngine: @unchecked Sendable {
     init(
         runtime: RuntimeConfiguration,
         log: LogStore,
+        budget: UDPAssociationBudget? = nil,
+        engineCount: Int = 1,
         enableSockmapAcceleration: Bool? = nil,
         loadSockmapAccelerator: @escaping (Int) throws -> UDPSockmapAccelerator = { maxEntries in
             try UDPSockmapAccelerator.load(maxEntries: maxEntries)
-        }
+        },
+        announceListen: Bool = true
     ) {
         self.runtime = runtime
         self.log = log
+        self.budget = budget ?? UDPAssociationBudget()
+        self.engineCount = max(1, engineCount)
+        self.announceListen = announceListen
         enableSockmapAccelerationOverride = enableSockmapAcceleration
         self.loadSockmapAccelerator = loadSockmapAccelerator
     }
@@ -171,7 +243,10 @@ final class UDPRelayEngine: @unchecked Sendable {
                     return fd
                 }
                 createdFDs.append(fd)
-                log.info("udp listening on \(addresses.last?.curtsyDescription ?? listenAddress.curtsyDescription)")
+                applySocketBuffers(to: fd, context: "listen=\(listenAddress.curtsyDescription)", warnOnFailure: true)
+                if announceListen {
+                    log.info("udp listening on \(addresses.last?.curtsyDescription ?? listenAddress.curtsyDescription)")
+                }
             }
 
             epollFD = curtsy_epoll_create()
@@ -206,7 +281,7 @@ final class UDPRelayEngine: @unchecked Sendable {
         let shouldEnableSockmap = enableSockmapAccelerationOverride ?? snapshot.shouldEnableUDPSockmap
         if shouldEnableSockmap {
             do {
-                sockmapAccelerator = try loadSockmapAccelerator(Self.sockmapMaxEntries(for: snapshot))
+                sockmapAccelerator = try loadSockmapAccelerator(sockmapMaxEntries(for: snapshot))
                 log.info("udp sockmap acceleration enabled")
             } catch {
                 log.warning("udp sockmap acceleration unavailable; using userspace relay error=\(error)")
@@ -326,8 +401,28 @@ final class UDPRelayEngine: @unchecked Sendable {
         sockmapAccelerator = nil
     }
 
-    private static func sockmapMaxEntries(for snapshot: ResolvedConfiguration) -> Int {
-        max(1024, snapshot.configuration.limits.maxUDPAssociations * 2)
+    private func sockmapMaxEntries(for snapshot: ResolvedConfiguration) -> Int {
+        let associations = snapshot.configuration.limits.maxUDPAssociations / engineCount
+        guard associations <= Int(UInt32.max / 2) else {
+            return Int(UInt32.max)
+        }
+        return max(1024, associations * 2)
+    }
+
+    // Oversized requests are silently clamped to the kernel rmem/wmem maxima,
+    // so only genuine failures (not clamping) surface here.
+    private func applySocketBuffers(to fd: Int32, context: String, warnOnFailure: Bool) {
+        let bytes = runtime.current().configuration.performance.udpSocketBufferBytes
+        guard bytes > 0 else { return }
+        guard curtsy_udp_set_socket_buffers(fd, Int32(bytes)) == 0 else {
+            let message = "udp socket buffer setup failed \(context) bytes=\(bytes) error=\(Self.errnoDescription())"
+            if warnOnFailure {
+                log.warning(message)
+            } else {
+                log.debug(message)
+            }
+            return
+        }
     }
 
     private func reloadAccelerator() {
@@ -335,7 +430,7 @@ final class UDPRelayEngine: @unchecked Sendable {
         let requested = enableSockmapAccelerationOverride ?? snapshot.shouldEnableUDPSockmap
         if requested, sockmapAccelerator == nil {
             do {
-                sockmapAccelerator = try loadSockmapAccelerator(Self.sockmapMaxEntries(for: snapshot))
+                sockmapAccelerator = try loadSockmapAccelerator(sockmapMaxEntries(for: snapshot))
                 log.info("udp sockmap acceleration enabled")
                 // Only newly established associations are steered.
                 closeAllAssociations()
@@ -403,7 +498,14 @@ final class UDPRelayEngine: @unchecked Sendable {
             associations[client]?.lastActivityMilliseconds = Self.monotonicMilliseconds()
             if association.upstreamFD != runFD {
                 if runLength > 0 {
-                    _ = curtsy_udp_send_batch(runFD, nil, 0, sendBase, UInt32(runLength))
+                    sendAllDatagrams(
+                        fd: runFD,
+                        address: nil,
+                        addressLength: 0,
+                        slots: sendBase,
+                        count: runLength,
+                        context: "direction=client_to_upstream"
+                    )
                 }
                 runFD = association.upstreamFD
                 runLength = 0
@@ -413,7 +515,14 @@ final class UDPRelayEngine: @unchecked Sendable {
             runLength += 1
         }
         if runLength > 0 {
-            _ = curtsy_udp_send_batch(runFD, nil, 0, sendBase, UInt32(runLength))
+            sendAllDatagrams(
+                fd: runFD,
+                address: nil,
+                addressLength: 0,
+                slots: sendBase,
+                count: runLength,
+                context: "direction=client_to_upstream"
+            )
         }
     }
 
@@ -442,13 +551,16 @@ final class UDPRelayEngine: @unchecked Sendable {
                     return
                 }
                 associations[client]?.lastActivityMilliseconds = Self.monotonicMilliseconds()
-                _ = curtsy_udp_send_batch(
-                    association.upstreamFD,
-                    nil,
-                    0,
-                    slotBuffer.baseAddress,
-                    UInt32(received)
-                )
+                if let baseAddress = slotBuffer.baseAddress {
+                    sendAllDatagrams(
+                        fd: association.upstreamFD,
+                        address: nil,
+                        addressLength: 0,
+                        slots: baseAddress,
+                        count: Int(received),
+                        context: "direction=client_to_upstream client=\(client.curtsyDescription)"
+                    )
+                }
             }
         }
     }
@@ -476,25 +588,56 @@ final class UDPRelayEngine: @unchecked Sendable {
                 }
                 associations[client]?.lastActivityMilliseconds = Self.monotonicMilliseconds()
                 var clientAddress = association.clientAddress
-                let sent = withUnsafePointer(to: &clientAddress) { storagePointer in
+                withUnsafePointer(to: &clientAddress) { storagePointer in
                     storagePointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address in
-                        curtsy_udp_send_batch(
-                            association.listenFD,
-                            address,
-                            association.clientAddressLength,
-                            slotBuffer.baseAddress,
-                            UInt32(received)
-                        )
+                        if let baseAddress = slotBuffer.baseAddress {
+                            sendAllDatagrams(
+                                fd: association.listenFD,
+                                address: address,
+                                addressLength: association.clientAddressLength,
+                                slots: baseAddress,
+                                count: Int(received),
+                                context: "direction=upstream_to_client client=\(client.curtsyDescription)"
+                            )
+                        }
                     }
-                }
-                if sent < 0, errno != EAGAIN, errno != EWOULDBLOCK {
-                    log.error(
-                        "udp client write failed client=\(client.curtsyDescription) "
-                            + "error=\(Self.errnoDescription())"
-                    )
                 }
             }
         }
+    }
+
+    @discardableResult
+    private func sendAllDatagrams(
+        fd: Int32,
+        address: UnsafePointer<sockaddr>?,
+        addressLength: socklen_t,
+        slots: UnsafePointer<curtsy_udp_slot>,
+        count: Int,
+        context: String
+    ) -> Bool {
+        guard count > 0 else { return true }
+        var sentTotal = 0
+        while sentTotal < count {
+            let sent = curtsy_udp_send_batch(
+                fd,
+                address,
+                addressLength,
+                slots.advanced(by: sentTotal),
+                UInt32(count - sentTotal)
+            )
+            if sent > 0 {
+                sentTotal += Int(sent)
+                continue
+            }
+
+            let errorDescription = sent < 0 ? Self.errnoDescription() : "sendmmsg made no progress"
+            log.warning(
+                "udp datagrams dropped \(context) sent=\(sentTotal) "
+                    + "dropped=\(count - sentTotal) error=\(errorDescription)"
+            )
+            return false
+        }
+        return true
     }
 
     private func openAssociation(
@@ -524,6 +667,11 @@ final class UDPRelayEngine: @unchecked Sendable {
                 Glibc.close(upstreamFD)
                 throw IOError(errnoCode: errorNumber, reason: "epoll add upstream socket")
             }
+            applySocketBuffers(
+                to: upstreamFD,
+                context: "direction=upstream client=\(client.curtsyDescription)",
+                warnOnFailure: false
+            )
             var clientFD: Int32? = nil
             var pairing: UDPSockmapAssociation? = nil
             if let accelerator = sockmapAccelerator, let bindStorage = listenBoundAddresses[listenFD] {
@@ -610,6 +758,7 @@ final class UDPRelayEngine: @unchecked Sendable {
         guard fd >= 0 else {
             throw IOError(errnoCode: errno, reason: "udp client socket")
         }
+        applySocketBuffers(to: fd, context: "direction=client", warnOnFailure: false)
         do {
             let pairing = try accelerator.pair(clientFD: fd, upstreamFD: upstreamFD)
             guard curtsy_epoll_add(epollFD, fd) == 0 else {

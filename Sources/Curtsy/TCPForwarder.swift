@@ -5,26 +5,29 @@ import NIOCore
 import NIOPosix
 
 private enum TCPPerformanceTuning {
-    // Large reads and batched flushes keep syscall and event-loop overhead low enough
-    // for a single connection to sustain gigabit throughput.
+    // Reads stay below glibc's 128 KiB mmap threshold so every buffer comes
+    // from the heap free list: profiles showed ~19% of relay CPU burned on
+    // page faults, page clearing, and madvise when 1 MiB buffers were
+    // mmap'd/munmap'd for every read batch.
     static var receiveAllocator: AdaptiveRecvByteBufferAllocator {
         AdaptiveRecvByteBufferAllocator(
-            minimum: 64 * 1_024,
-            initial: 256 * 1_024,
-            maximum: 1_024 * 1_024
+            minimum: 32 * 1_024,
+            initial: 64 * 1_024,
+            maximum: 112 * 1_024
         )
     }
 
-    // Eight 1 MiB buffers form an 8 MiB maximum read batch, halving the read
-    // and epoll_wait syscall rate measured under load compared to four buffers.
+    // Eight 112 KiB buffers form an ~896 KiB maximum read batch, keeping the
+    // read and epoll_wait syscall rate low without crossing the mmap
+    // threshold described above.
     static let maxMessagesPerRead: UInt = 8
     // Keep one full read batch below the high watermark with hysteresis above
     // the low watermark so a batch never toggles autoRead or issues redundant
-    // epoll_ctl calls. Worst case is 12 MiB buffered per connection, still
+    // epoll_ctl calls. Worst case is ~1 MiB buffered per connection, still
     // bounded globally by TCPBufferBudget.
     static let writeBufferWaterMark = ChannelOptions.Types.WriteBufferWaterMark(
-        low: 4 * 1_024 * 1_024,
-        high: 12 * 1_024 * 1_024
+        low: 1 * 1_024 * 1_024,
+        high: 2 * 1_024 * 1_024
     )
 }
 

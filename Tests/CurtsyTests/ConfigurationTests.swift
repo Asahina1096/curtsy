@@ -46,6 +46,11 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.logging.level, "info")
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .auto)
         XCTAssertEqual(configuration.performance.udpSockmapAcceleration, .auto)
+        XCTAssertEqual(
+            configuration.performance.udpSocketBufferBytes,
+            PerformanceConfiguration.defaultUDPSocketBufferBytes
+        )
+        XCTAssertEqual(configuration.performance.udpIOThreads, 0)
     }
 
     func testLoadsOverrides() throws {
@@ -66,7 +71,7 @@ final class ConfigurationTests: XCTestCase {
           maxUDPPendingDatagrams: 8
           maxUDPPendingBytes: 4096
         runtime: { workerThreads: 2, tuningDaemon: false, tuningIntervalSeconds: 10 }
-        performance: { tcpSockmapAcceleration: enabled, udpSockmapAcceleration: disabled }
+        performance: { tcpSockmapAcceleration: enabled, udpSockmapAcceleration: disabled, udpSocketBufferBytes: 8388608, udpIOThreads: 2 }
         logging: { level: debug }
         """)
 
@@ -84,6 +89,8 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertFalse(configuration.limits.autoTuning.maxTCPBufferedBytes)
         XCTAssertEqual(configuration.performance.tcpSockmapAcceleration, .enabled)
         XCTAssertEqual(configuration.performance.udpSockmapAcceleration, .disabled)
+        XCTAssertEqual(configuration.performance.udpSocketBufferBytes, 8 * 1_024 * 1_024)
+        XCTAssertEqual(configuration.performance.udpIOThreads, 2)
     }
 
     func testAcceptsExplicitAutoValues() throws {
@@ -245,13 +252,48 @@ final class ConfigurationTests: XCTestCase {
             protocols: [udp]
             listen: { host: "127.0.0.1", port: 9000 }
             upstream: { host: "127.0.0.1", port: 9001 }
+            limits: { maxUDPAssociations: 2147483648 }
+            """,
+            """
+            version: 1
+            protocols: [udp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
             performance: { udpSockmapAcceleration: sometimes }
+            """,
+            """
+            version: 1
+            protocols: [udp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            performance: { udpSocketBufferBytes: -1 }
+            """,
+            """
+            version: 1
+            protocols: [udp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            performance: { udpSocketBufferBytes: 536870912 }
+            """,
+            """
+            version: 1
+            protocols: [udp]
+            listen: { host: "127.0.0.1", port: 9000 }
+            upstream: { host: "127.0.0.1", port: 9001 }
+            performance: { udpIOThreads: -1 }
             """
         ]
 
         for document in invalidDocuments {
             XCTAssertThrowsError(try ConfigurationLoader.load(yaml: document))
         }
+    }
+
+    func testSockmapLoadersRejectInvalidMapSizesBeforeSyscall() {
+        XCTAssertThrowsError(try TCPSockmapAccelerator.load(maxEntries: 0))
+        XCTAssertThrowsError(try UDPSockmapAccelerator.load(maxEntries: 0))
+        XCTAssertThrowsError(try TCPSockmapAccelerator.load(maxEntries: Int(UInt32.max) + 1))
+        XCTAssertThrowsError(try UDPSockmapAccelerator.load(maxEntries: Int(UInt32.max) + 1))
     }
 
     func testResolvesIPv4IPv6AndHostname() throws {

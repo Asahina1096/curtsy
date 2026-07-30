@@ -909,6 +909,9 @@ int32_t curtsy_udp_listen_socket(
 
     int yes = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) != 0) goto fail;
+    // SO_REUSEPORT lets one engine thread per worker bind the same address;
+    // the kernel then hashes each client four-tuple to a stable listener.
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) != 0) goto fail;
     if (address->sa_family == AF_INET6) {
         if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes)) != 0) goto fail;
     }
@@ -960,6 +963,11 @@ int32_t curtsy_udp_connected_client_socket(
 
     int yes = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) != 0) goto fail;
+    // Listen sockets carry SO_REUSEPORT; every socket sharing the port must
+    // set it too, otherwise this bind fails with EADDRINUSE. Connected
+    // sockets never join wildcard delivery: the kernel exact-matches their
+    // four-tuple first, so only their peer's datagrams land here.
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) != 0) goto fail;
     if (bind_address->sa_family == AF_INET6) {
         if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes)) != 0) goto fail;
     }
@@ -974,4 +982,17 @@ fail:
         errno = saved;
     }
     return -1;
+}
+
+// Sets SO_RCVBUF and SO_SNDBUF to bytes on a datagram socket. Without
+// CAP_NET_ADMIN the kernel silently clamps each to rmem_max/wmem_max, so an
+// oversized request is not an error; genuine failures return -1 with errno.
+int32_t curtsy_udp_set_socket_buffers(int32_t fd, int32_t bytes) {
+    if (bytes <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) != 0) return -1;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) != 0) return -1;
+    return 0;
 }

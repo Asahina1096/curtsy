@@ -82,7 +82,7 @@ upstream:
 
 ## TCP 性能
 
-TCP 转发路径使用大块自适应读取、批量 flush 和背压控制，目标是在常规 Linux 主机上让单连接达到 1 Gbps。实际吞吐仍取决于 CPU、网卡、上游服务以及链路的带宽时延积。
+TCP 转发路径使用大块自适应读取、批量 flush 和背压控制，目标是在常规 Linux 主机上让单连接达到 1 Gbps。读缓冲单块上限设在 glibc mmap 阈值（128 KiB）之下，避免每批读取反复触发 mmap/munmap 缺页开销；实测回环 4 流聚合吞吐因此提升约 16%，缺页中断下降约 97%。实际吞吐仍取决于 CPU、网卡、上游服务以及链路的带宽时延积。
 
 多连接场景下，Curtsy 会为每个事件循环创建一个 `SO_REUSEPORT` TCP 监听 socket，并在 Linux 上通过 `SO_ATTACH_REUSEPORT_EBPF` 加载 socket-filter eBPF 程序，按连接四元组 hash 直接分流到对应 worker，避免单监听 socket 成为 accept 瓶颈以及连接建立后的跨线程迁移。worker 数量默认自动适配 CPU，并可通过 `runtime.workerThreads` 固定。
 
@@ -102,9 +102,11 @@ TCP 转发路径使用大块自适应读取、批量 flush 和背压控制，目
 
 ## UDP 性能
 
-UDP 转发由独立 I/O 线程驱动：epoll 管理全部监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发，会话在首个报文到达时同步建立。
+UDP 转发由独立 I/O 线程池驱动（默认每 CPU 一个线程，可用 `performance.udpIOThreads` 固定）：每个线程持有一个经 `SO_REUSEPORT` 绑定同一地址的监听 socket，内核按客户端四元组 hash 把流量稳定分流到固定线程；各线程用 epoll 管理自己的监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发，会话在首个报文到达时同步建立。`maxUDPAssociations` 由所有线程共享，仍是全局上限而不是每线程配额。
 
-在具备 eBPF 权限且内核 ≥ 5.12 的 Linux 上，Curtsy 还可以为 UDP 会话启用 sockmap 内核转发：首个报文仍由用户态建立会话，随后为该客户端创建一个 connect 到其地址的专用 socket（内核 demux 按四元组精确匹配优先于通配 listener），并把客户端 socket 与上游 socket 配对放入 `BPF_MAP_TYPE_SOCKHASH`；`SK_SKB` verdict 程序用 `bpf_sk_redirect_hash` 把两个方向的报文直接转发到对端发送路径，不再经过用户态。BPF 记录双向最后活动时间，加速会话仍遵守 `udpSessionSeconds`；会话过期后关闭专用 socket，后续报文自动回落到 listener 重建会话。
+UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触顶的瓶颈。`performance.udpSocketBufferBytes`（默认 4 MiB，设为 `0` 保持内核默认）会应用到监听、上游和每客户端 socket 的收发缓冲；没有 `CAP_NET_ADMIN` 时内核会把请求静默收敛到 `net.core.rmem_max` / `net.core.wmem_max`，因此建议部署时同步调大这两个 sysctl（Debian 包自带 `usr/lib/sysctl.d/60-curtsy.conf`，把两者设为 8 MiB）。
+
+在具备 eBPF 权限且内核 ≥ 5.12 的 Linux 上，Curtsy 还可以为 UDP 会话启用 sockmap 内核转发：首个报文仍由用户态建立会话，随后为该客户端创建一个 connect 到其地址的专用 socket（内核 demux 按四元组精确匹配优先于通配 listener），并把客户端 socket 与上游 socket 配对放入 `BPF_MAP_TYPE_SOCKHASH`；`SK_SKB` verdict 程序用 `bpf_sk_redirect_hash` 把两个方向的报文直接转发到对端发送路径，不再经过用户态。每个 I/O 线程持有独立的 sockhash 与 verdict 程序，会话不跨线程迁移。BPF 记录双向最后活动时间，加速会话仍遵守 `udpSessionSeconds`；会话过期后关闭专用 socket，后续报文自动回落到 listener 重建会话。
 
 `performance.udpSockmapAcceleration` 控制该路径，语义与 TCP 版本相同（`enabled` / `disabled` / 默认 `auto`）。在 Linux 6.8 回环实测中（iperf3 UDP 20G 注入），启用后吞吐从约 6.6 Gbit/s 提升到约 28 Gbit/s，转发进程 CPU 占用同时大幅下降。权限不足、内核不支持或单会话配对失败时逐层回退到用户态 relay，服务启动不受影响；重定向失败而落入用户态的零星报文由引擎兜底转发。热加载改变此项时，已有 UDP 会话会被清除并按新模式重建。
 
@@ -114,7 +116,7 @@ UDP 转发由独立 I/O 线程驱动：epoll 管理全部监听与上游 socket�
 - 所有超时单位均为秒，必须大于零，且不能超过 `9223372036` 秒。
 - UDP 会话按客户端 IP 与端口隔离，空闲超过 `udpSessionSeconds` 后回收。
 - 达到 `maxUDPAssociations` 后，新 UDP 客户端会被丢弃，已有会话不受影响；默认上限按系统内存自动计算。
-- UDP 转发由独立 I/O 线程以 `recvmmsg`/`sendmmsg` 批量收发（64 报文/批），会话在首个报文到达时同步建立，不存在待转发缓冲窗口；`maxUDPPendingDatagrams` 和 `maxUDPPendingBytes` 仅为兼容旧配置保留，当前不再使用。
+- UDP 转发由独立 I/O 线程池以 `recvmmsg`/`sendmmsg` 批量收发（64 报文/批），会话在首个报文到达时同步建立，不存在待转发缓冲窗口；`maxUDPPendingDatagrams` 和 `maxUDPPendingBytes` 仅为兼容旧配置保留，当前不再使用。
 - 程序不会终止 TLS、检查流量内容或记录转发数据正文。
 
 ## 测试
@@ -126,5 +128,5 @@ swift test
 默认测试不要求 eBPF 权限。若要在具备权限的 Linux 主机上显式验证 eBPF loader，可运行：
 
 ```bash
-CURTSY_ENABLE_EBPF_TESTS=1 swift test --filter ForwardingTests.testOptionalEBPFLoadersWhenExplicitlyEnabled
+CURTSY_ENABLE_EBPF_TESTS=1 swift test --filter ForwardingTests.testEBPFLoadersWhenExplicitlyEnabled
 ```

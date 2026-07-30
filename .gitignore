@@ -21,6 +21,9 @@ DerivedData/
 *.log
 *.pid
 
+# Local performance test artifacts
+.perf-test/
+
 # Debian packaging
 /*.deb
 /debian/.debhelper/

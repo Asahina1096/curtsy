@@ -27,6 +27,9 @@ final class TCPSockmapAccelerator: @unchecked Sendable {
 
     // Each proxied TCP connection consumes two map entries.
     static func load(maxEntries: Int = 131_072) throws -> TCPSockmapAccelerator {
+        guard (1...Int(UInt32.max)).contains(maxEntries) else {
+            throw AcceleratorError.systemCall(errorNumber: EINVAL)
+        }
         var verifierLog = [CChar](repeating: 0, count: 256 * 1_024)
         let runtime = verifierLog.withUnsafeMutableBufferPointer { buffer in
             curtsy_sockmap_create(UInt32(maxEntries), buffer.baseAddress, buffer.count)
