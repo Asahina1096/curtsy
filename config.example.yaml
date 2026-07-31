@@ -41,7 +41,7 @@ upstream:
 # logging:
 #   level: info
 
-# Optional rules plugin (disabled unless written): multiple independent
+# Optional rules module (disabled unless written): multiple independent
 # listen -> upstreams rules in one process. Cannot be combined with the
 # top-level listen/upstream above; timeouts/limits set here are global
 # defaults each rule may override.

@@ -1,11 +1,17 @@
-//! Upstream pool: multi-upstream selection with passive failure eviction.
+//! upstream module: the ngx_upstream framework analogue.
 //!
-//! Part of the opt-in rules plugin. A pool is a stable per-rule object whose
-//! address is captured by the TCP/UDP selector hooks; configuration reloads
-//! swap the internal generation under a mutex (inheriting health state by
-//! address) so the selector context never changes. A single-entry pool
-//! degrades to a constant pick with no bookkeeping, which is what the legacy
-//! single-rule mode would get if it ever used this module.
+//! Owns the upstream pool (peer states: passive failure eviction with
+//! exponential backoff), the Selector hook injected into the data planes
+//! (peer.get/free/notify analogue) and the balancer registry. Selection
+//! strategies are pluggable balancer modules (round_robin, source_hash,
+//! weighted_round_robin) chosen by name through the `balance` directive;
+//! the pool itself only tracks eligibility and generations.
+//!
+//! A pool is a stable per-rule object whose address is captured by the
+//! TCP/UDP selector hooks; configuration reloads swap the internal
+//! generation under a mutex (inheriting health state by address) so the
+//! selector context never changes. A single-entry pool degrades to a
+//! constant pick with no bookkeeping.
 //!
 //! Eviction is passive: consecutive failures at or above `failure_threshold`
 //! park an upstream for a cooldown that backs off exponentially on repeated
@@ -13,8 +19,12 @@
 //! eligible again and real traffic decides.
 
 const std = @import("std");
-const config = @import("config.zig");
-const log = @import("log.zig");
+const log = @import("../log.zig");
+const net = @import("../net.zig");
+
+const round_robin = @import("balancer/round_robin.zig");
+const source_hash = @import("balancer/source_hash.zig");
+const weighted_round_robin = @import("balancer/weighted_round_robin.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,27 +33,122 @@ pub const base_evict_ns: u64 = 10 * std.time.ns_per_s;
 pub const max_evict_ns: u64 = 5 * std.time.ns_per_min;
 const max_backoff_shift: u6 = 5;
 
-const UpstreamState = struct {
-    address: config.SocketAddr,
+// ---------------------------------------------------------------------------
+// Balancer: pluggable selection strategy (ngx upstream balancer modules)
+// ---------------------------------------------------------------------------
+
+pub const UpstreamState = struct {
+    address: net.SocketAddr,
     consecutive_failures: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Monotonic timestamp until which the upstream is parked; 0 = eligible.
     evicted_until_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     eviction_streak: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    fn eligible(self: *const UpstreamState, now_ns: u64) bool {
+    pub fn eligible(self: *const UpstreamState, now_ns: u64) bool {
         const until = self.evicted_until_ns.load(.monotonic);
         return until == 0 or until <= now_ns;
     }
 };
 
+pub const Balancer = struct {
+    name: []const u8,
+    /// Build per-generation strategy state (e.g. an expanded pick sequence).
+    /// Stateless strategies return null.
+    build: *const fn (allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque,
+    destroy: *const fn (allocator: Allocator, state: ?*anyopaque) void,
+    /// Choose an upstream index. Sequential strategies rotate through the
+    /// shared `cursor`; all strategies skip ineligible upstreams and fall
+    /// back to serving anyway when everything is evicted.
+    pick: *const fn (state: ?*anyopaque, upstreams: []const UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize,
+};
+
+/// The registered balancer modules, in directive-display order.
+pub const balancers: []const Balancer = &.{ round_robin.balancer, source_hash.balancer, weighted_round_robin.balancer };
+
+pub fn balancerByName(name: []const u8) ?*const Balancer {
+    for (balancers) |*balancer| {
+        if (std.mem.eql(u8, balancer.name, name)) return balancer;
+    }
+    return null;
+}
+
+pub fn defaultBalancer() *const Balancer {
+    return &balancers[0];
+}
+
+/// "round_robin, source_hash, weighted_round_robin" (for diagnostics).
+pub fn balancerNames(buf: []u8) []const u8 {
+    var fbs = std.Io.Writer.fixed(buf);
+    for (balancers, 0..) |balancer, i| {
+        if (i > 0) fbs.print(", ", .{}) catch return buf[0..fbs.end];
+        fbs.print("{s}", .{balancer.name}) catch return buf[0..fbs.end];
+    }
+    return buf[0..fbs.end];
+}
+
+// ---------------------------------------------------------------------------
+// Selector: the hook injected into the TCP/UDP data planes
+// ---------------------------------------------------------------------------
+
+/// When set, each new connection/association asks the selector for its
+/// upstream address instead of using the configured one, immediate connect
+/// failures fail over to the next pick, and outcomes are reported back for
+/// passive health tracking. When null the listener behaves exactly as a
+/// single-upstream forwarder.
+pub const Selector = struct {
+    context: *anyopaque,
+    pick_fn: *const fn (context: *anyopaque, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr,
+    report_success_fn: *const fn (context: *anyopaque, upstream: net.SocketAddr) void,
+    report_failure_fn: *const fn (context: *anyopaque, upstream: net.SocketAddr, now_ns: u64) void,
+
+    pub fn pick(self: Selector, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr {
+        return self.pick_fn(self.context, client, now_ns);
+    }
+
+    pub fn reportSuccess(self: Selector, upstream: net.SocketAddr) void {
+        self.report_success_fn(self.context, upstream);
+    }
+
+    pub fn reportFailure(self: Selector, upstream: net.SocketAddr, now_ns: u64) void {
+        self.report_failure_fn(self.context, upstream, now_ns);
+    }
+};
+
+fn poolPick(context: *anyopaque, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr {
+    const pool: *UpstreamPool = @ptrCast(@alignCast(context));
+    return pool.pick(client, now_ns);
+}
+
+fn poolReportSuccess(context: *anyopaque, upstream_addr: net.SocketAddr) void {
+    const pool: *UpstreamPool = @ptrCast(@alignCast(context));
+    pool.reportSuccess(upstream_addr);
+}
+
+fn poolReportFailure(context: *anyopaque, upstream_addr: net.SocketAddr, now_ns: u64) void {
+    const pool: *UpstreamPool = @ptrCast(@alignCast(context));
+    pool.reportFailure(upstream_addr, now_ns);
+}
+
+/// Adapt a pool to the selector hook shape consumed by the data planes.
+pub fn poolSelector(pool: *UpstreamPool) Selector {
+    return .{
+        .context = pool,
+        .pick_fn = poolPick,
+        .report_success_fn = poolReportSuccess,
+        .report_failure_fn = poolReportFailure,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// UpstreamPool: peer states and generation swapping
+// ---------------------------------------------------------------------------
+
 const Generation = struct {
     upstreams: []UpstreamState,
-    /// Selection sequence: indexes into upstreams. Identity for round_robin
-    /// and source_hash; weight-expanded and interleaved for
-    /// weighted_round_robin.
-    sequence: []u32,
+    /// Strategy state built by the balancer module (e.g. pick sequence).
+    strategy: ?*anyopaque,
 
-    fn indexOf(self: *const Generation, address: config.SocketAddr) ?usize {
+    fn indexOf(self: *const Generation, address: net.SocketAddr) ?usize {
         for (self.upstreams, 0..) |*upstream, i| {
             if (upstream.address.eql(address)) return i;
         }
@@ -53,7 +158,7 @@ const Generation = struct {
 
 pub const UpstreamPool = struct {
     allocator: Allocator,
-    policy: config.BalancePolicy,
+    balancer: *const Balancer,
     /// Guards generation/retired; critical sections are per-connection
     /// picks and failure reports, never per-packet work.
     mutex: log.Mutex = .{},
@@ -67,22 +172,22 @@ pub const UpstreamPool = struct {
     /// entry. The pool copies both.
     pub fn init(
         allocator: Allocator,
-        addresses: []const config.SocketAddr,
+        addresses: []const net.SocketAddr,
         weights: []const u32,
-        policy: config.BalancePolicy,
+        balancer: *const Balancer,
     ) error{OutOfMemory}!UpstreamPool {
-        const generation = try buildGeneration(allocator, addresses, weights, policy, null);
-        errdefer destroyGeneration(allocator, generation);
+        const generation = try buildGeneration(allocator, addresses, weights, balancer, null);
+        errdefer destroyGeneration(allocator, balancer, generation);
         return .{
             .allocator = allocator,
-            .policy = policy,
+            .balancer = balancer,
             .generation = generation,
         };
     }
 
     pub fn deinit(self: *UpstreamPool) void {
-        destroyGeneration(self.allocator, self.generation);
-        if (self.retired) |retired| destroyGeneration(self.allocator, retired);
+        destroyGeneration(self.allocator, self.balancer, self.generation);
+        if (self.retired) |retired| destroyGeneration(self.allocator, self.balancer, retired);
     }
 
     /// Number of upstreams in the current generation.
@@ -95,21 +200,18 @@ pub const UpstreamPool = struct {
     /// Choose an upstream address. Single-upstream pools return immediately
     /// without touching any counters. Evicted upstreams are skipped; when all
     /// are evicted the eviction state is ignored rather than refusing traffic.
-    pub fn pick(self: *UpstreamPool, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr {
+    pub fn pick(self: *UpstreamPool, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr {
         self.mutex.lock();
         defer self.mutex.unlock();
         const generation = self.generation;
         if (generation.upstreams.len == 1) return generation.upstreams[0].address;
-
-        return switch (self.policy) {
-            .source_hash => self.pickSourceHash(generation, client, now_ns),
-            else => self.pickSequential(generation, now_ns),
-        };
+        const index = self.balancer.pick(generation.strategy, generation.upstreams, &self.cursor, client, now_ns);
+        return generation.upstreams[index].address;
     }
 
     /// Record a successful exchange with an upstream: clears its failure
     /// count and eviction backoff.
-    pub fn reportSuccess(self: *UpstreamPool, address: config.SocketAddr) void {
+    pub fn reportSuccess(self: *UpstreamPool, address: net.SocketAddr) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const index = self.generation.indexOf(address) orelse return;
@@ -121,7 +223,7 @@ pub const UpstreamPool = struct {
     /// Record a failure; at `failure_threshold` consecutive failures the
     /// upstream is parked with exponential backoff. A single-upstream pool
     /// ignores reports (there is nowhere else to go).
-    pub fn reportFailure(self: *UpstreamPool, address: config.SocketAddr, now_ns: u64) void {
+    pub fn reportFailure(self: *UpstreamPool, address: net.SocketAddr, now_ns: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const generation = self.generation;
@@ -147,73 +249,50 @@ pub const UpstreamPool = struct {
     /// stays put, so selector contexts captured by listeners remain valid.
     pub fn rebind(
         self: *UpstreamPool,
-        addresses: []const config.SocketAddr,
+        addresses: []const net.SocketAddr,
         weights: []const u32,
     ) error{OutOfMemory}!void {
-        const replacement = try buildGeneration(self.allocator, addresses, weights, self.policy, self.generation);
+        const replacement = try buildGeneration(self.allocator, addresses, weights, self.balancer, self.generation);
         self.mutex.lock();
         const old = self.generation;
         self.generation = replacement;
-        if (self.retired) |retired| destroyGeneration(self.allocator, retired);
+        if (self.retired) |retired| destroyGeneration(self.allocator, self.balancer, retired);
         self.retired = old;
         self.mutex.unlock();
     }
 
     /// Snapshot of the current upstream addresses (used to detect upstream
     /// set changes across reloads). Caller owns the returned slice.
-    pub fn currentAddresses(self: *UpstreamPool, allocator: Allocator) error{OutOfMemory}![]config.SocketAddr {
+    pub fn currentAddresses(self: *UpstreamPool, allocator: Allocator) error{OutOfMemory}![]net.SocketAddr {
         self.mutex.lock();
         defer self.mutex.unlock();
         const generation = self.generation;
-        const addresses = try allocator.alloc(config.SocketAddr, generation.upstreams.len);
+        const addresses = try allocator.alloc(net.SocketAddr, generation.upstreams.len);
         for (generation.upstreams, 0..) |*upstream, i| addresses[i] = upstream.address;
         return addresses;
     }
-
-    fn pickSequential(self: *UpstreamPool, generation: *const Generation, now_ns: u64) config.SocketAddr {
-        const sequence = generation.sequence;
-        const start = self.cursor.fetchAdd(1, .monotonic) % @as(u32, @intCast(sequence.len));
-        var first: ?usize = null;
-        var step: u32 = 0;
-        while (step < sequence.len) : (step += 1) {
-            const index = sequence[(start + step) % @as(u32, @intCast(sequence.len))];
-            if (first == null) first = index;
-            if (generation.upstreams[index].eligible(now_ns)) {
-                return generation.upstreams[index].address;
-            }
-        }
-        return generation.upstreams[first.?].address;
-    }
-
-    fn pickSourceHash(self: *UpstreamPool, generation: *const Generation, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr {
-        const upstreams = generation.upstreams;
-        const start: usize = if (client) |address| hashClient(address) % upstreams.len else blk: {
-            break :blk self.cursor.fetchAdd(1, .monotonic) % @as(u32, @intCast(upstreams.len));
-        };
-        var step: usize = 0;
-        while (step < upstreams.len) : (step += 1) {
-            const index = (start + step) % upstreams.len;
-            if (upstreams[index].eligible(now_ns)) return upstreams[index].address;
-        }
-        return upstreams[start].address;
-    }
 };
 
-fn hashClient(address: config.SocketAddr) usize {
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(&.{@intFromEnum(address.family)});
-    switch (address.family) {
-        .v4 => hasher.update(address.addr[0..4]),
-        .v6 => hasher.update(&address.addr),
+/// Shared walk for sequential balancers (round robin and weighted round
+/// robin): rotate through the strategy sequence from the shared cursor,
+/// skipping evicted upstreams, serving the first entry when all are parked.
+pub fn pickSequential(sequence: []const u32, upstreams: []const UpstreamState, cursor: *std.atomic.Value(u32), now_ns: u64) usize {
+    const start = cursor.fetchAdd(1, .monotonic) % @as(u32, @intCast(sequence.len));
+    var first: ?usize = null;
+    var step: u32 = 0;
+    while (step < sequence.len) : (step += 1) {
+        const index = sequence[(start + step) % @as(u32, @intCast(sequence.len))];
+        if (first == null) first = index;
+        if (upstreams[index].eligible(now_ns)) return index;
     }
-    return @intCast(hasher.final());
+    return first.?;
 }
 
 fn buildGeneration(
     allocator: Allocator,
-    addresses: []const config.SocketAddr,
+    addresses: []const net.SocketAddr,
     weights: []const u32,
-    policy: config.BalancePolicy,
+    balancer: *const Balancer,
     previous: ?*const Generation,
 ) error{OutOfMemory}!*Generation {
     const upstreams = try allocator.alloc(UpstreamState, addresses.len);
@@ -230,43 +309,17 @@ fn buildGeneration(
         }
     }
 
-    var total_weight: usize = 0;
-    for (weights) |weight| total_weight += weight;
-    const sequence_len = switch (policy) {
-        .weighted_round_robin => total_weight,
-        else => addresses.len,
-    };
-    const sequence = try allocator.alloc(u32, sequence_len);
-    errdefer allocator.free(sequence);
-    switch (policy) {
-        .weighted_round_robin => {
-            // Interleave copies round by round so weights spread evenly
-            // ([0,1,0,1,1] for weights 2,3) instead of bursting ([0,0,1,1,1]).
-            var position: usize = 0;
-            const max_weight = std.mem.max(u32, weights);
-            var round: u32 = 0;
-            while (round < max_weight) : (round += 1) {
-                for (weights, 0..) |weight, i| {
-                    if (weight > round) {
-                        sequence[position] = @intCast(i);
-                        position += 1;
-                    }
-                }
-            }
-        },
-        else => {
-            for (sequence, 0..) |*slot, i| slot.* = @intCast(i);
-        },
-    }
+    const strategy = try balancer.build(allocator, addresses, weights);
+    errdefer balancer.destroy(allocator, strategy);
 
     const generation = try allocator.create(Generation);
-    generation.* = .{ .upstreams = upstreams, .sequence = sequence };
+    generation.* = .{ .upstreams = upstreams, .strategy = strategy };
     return generation;
 }
 
-fn destroyGeneration(allocator: Allocator, generation: *Generation) void {
+fn destroyGeneration(allocator: Allocator, balancer: *const Balancer, generation: *Generation) void {
+    balancer.destroy(allocator, generation.strategy);
     allocator.free(generation.upstreams);
-    allocator.free(generation.sequence);
     allocator.destroy(generation);
 }
 
@@ -282,17 +335,17 @@ pub fn monotonicNowNs() u64 {
 
 const testing = std.testing;
 
-fn testAddresses(count: usize) [4]config.SocketAddr {
-    var addresses: [4]config.SocketAddr = undefined;
+fn testAddresses(count: usize) [4]net.SocketAddr {
+    var addresses: [4]net.SocketAddr = undefined;
     for (0..count) |i| {
-        addresses[i] = config.SocketAddr.parseIp("127.0.0.1", @intCast(9000 + i)).?;
+        addresses[i] = net.SocketAddr.parseIp("127.0.0.1", @intCast(9000 + i)).?;
     }
     return addresses;
 }
 
 test "single upstream pool is a constant pick" {
     const addresses = testAddresses(1);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..1], &.{1}, .round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..1], &.{1}, defaultBalancer());
     defer pool.deinit();
 
     const picked = pool.pick(null, 0);
@@ -307,7 +360,7 @@ test "single upstream pool is a constant pick" {
 
 test "round robin rotates across upstreams" {
     const addresses = testAddresses(3);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..3], &.{ 1, 1, 1 }, .round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..3], &.{ 1, 1, 1 }, defaultBalancer());
     defer pool.deinit();
 
     try testing.expect(pool.pick(null, 0).eql(addresses[0]));
@@ -318,7 +371,7 @@ test "round robin rotates across upstreams" {
 
 test "round robin skips evicted upstreams and recovers after cooldown" {
     const addresses = testAddresses(2);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, .round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
     defer pool.deinit();
 
     var now: u64 = 1_000;
@@ -342,7 +395,7 @@ test "round robin skips evicted upstreams and recovers after cooldown" {
 
 test "eviction backs off exponentially on repeated failures" {
     const addresses = testAddresses(2);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, .round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
     defer pool.deinit();
 
     var now: u64 = 1_000;
@@ -368,7 +421,7 @@ test "eviction backs off exponentially on repeated failures" {
 
 test "all evicted falls back to serving anyway" {
     const addresses = testAddresses(2);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, .round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
     defer pool.deinit();
 
     const now: u64 = 1_000;
@@ -380,29 +433,26 @@ test "all evicted falls back to serving anyway" {
 
 test "source hash is stable per client and skips evicted" {
     const addresses = testAddresses(3);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..3], &.{ 1, 1, 1 }, .source_hash);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..3], &.{ 1, 1, 1 }, balancerByName("source_hash").?);
     defer pool.deinit();
 
-    const client_a = config.SocketAddr.parseIp("10.0.0.1", 40000).?;
-    const client_b = config.SocketAddr.parseIp("10.0.0.2", 40001).?;
+    const client_a = net.SocketAddr.parseIp("10.0.0.1", 40000).?;
     const first_a = pool.pick(client_a, 0);
     try testing.expect(pool.pick(client_a, 0).eql(first_a));
 
     // The client port does not affect the hash: stickiness is per host.
-    const client_a_other_port = config.SocketAddr.parseIp("10.0.0.1", 55555).?;
+    const client_a_other_port = net.SocketAddr.parseIp("10.0.0.1", 55555).?;
     try testing.expect(pool.pick(client_a_other_port, 0).eql(first_a));
 
     for (0..failure_threshold) |_| pool.reportFailure(first_a, 1_000);
     const rerouted = pool.pick(client_a, 1_000);
     try testing.expect(!rerouted.eql(first_a));
     try testing.expect(pool.pick(client_a, 1_000).eql(rerouted));
-
-    _ = client_b;
 }
 
 test "weighted round robin follows weights over a full cycle" {
     const addresses = testAddresses(2);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 3 }, .weighted_round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 3 }, balancerByName("weighted_round_robin").?);
     defer pool.deinit();
 
     var counts = [_]usize{ 0, 0 };
@@ -417,7 +467,7 @@ test "weighted round robin follows weights over a full cycle" {
 
 test "rebind swaps upstreams and inherits health by address" {
     const addresses = testAddresses(3);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, .round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
     defer pool.deinit();
 
     const now: u64 = 1_000;
@@ -436,11 +486,33 @@ test "rebind swaps upstreams and inherits health by address" {
 
 test "reports for unknown addresses are ignored" {
     const addresses = testAddresses(2);
-    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, .round_robin);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
     defer pool.deinit();
 
-    const stranger = config.SocketAddr.parseIp("192.0.2.1", 9000).?;
+    const stranger = net.SocketAddr.parseIp("192.0.2.1", 9000).?;
     pool.reportFailure(stranger, 0);
     pool.reportSuccess(stranger);
     try testing.expect(pool.pick(null, 0).eql(addresses[0]));
+}
+
+test "balancer registry resolves names and rejects strangers" {
+    try testing.expect(balancerByName("round_robin") == defaultBalancer());
+    try testing.expect(balancerByName("source_hash") != null);
+    try testing.expect(balancerByName("weighted_round_robin") != null);
+    try testing.expect(balancerByName("least_conn") == null);
+
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("round_robin, source_hash, weighted_round_robin", balancerNames(&buf));
+}
+
+test "pool selector adapts pick and reports" {
+    const addresses = testAddresses(2);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    defer pool.deinit();
+
+    const selector = poolSelector(&pool);
+    try testing.expect(selector.pick(null, 0).eql(addresses[0]));
+    for (0..failure_threshold) |_| selector.reportFailure(addresses[0], 1_000);
+    try testing.expect(selector.pick(null, 1_000).eql(addresses[1]));
+    selector.reportSuccess(addresses[1]);
 }

@@ -24,10 +24,10 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const autotune = @import("autotune.zig");
-const bpf = @import("bpf.zig");
-const config = @import("config.zig");
-const log = @import("log.zig");
+const autotune = @import("../autotune.zig");
+const bpf = @import("../bpf.zig");
+const config = @import("core.zig");
+const log = @import("../log.zig");
 
 extern "c" fn strerror(errnum: c_int) [*:0]u8;
 

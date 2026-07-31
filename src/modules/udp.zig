@@ -25,10 +25,11 @@
 //! existing sessions and rebuilds under the new mode.
 
 const std = @import("std");
-const config = @import("config.zig");
-const log = @import("log.zig");
-const bpf = @import("bpf.zig");
-const autotune = @import("autotune.zig");
+const config = @import("core.zig");
+const upstream = @import("upstream.zig");
+const log = @import("../log.zig");
+const bpf = @import("../bpf.zig");
+const autotune = @import("../autotune.zig");
 
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
@@ -117,29 +118,12 @@ pub const SockmapRuntimeLoader = *const fn (max_entries: u32, verifier_log: ?[]u
 
 pub const default_sockmap_runtime_loader: SockmapRuntimeLoader = bpf.SockmapRuntime.createUdp;
 
-/// Optional upstream-selection hook (rules plugin). When set, each new
+/// Optional upstream-selection hook (upstream module). When set, each new
 /// association asks the selector for its upstream address instead of using
 /// the configured one, and upstream socket errors/successes are reported
 /// back for passive health tracking. When null the listener behaves exactly
 /// as a single-upstream forwarder.
-pub const UpstreamSelector = struct {
-    context: *anyopaque,
-    pick_fn: *const fn (context: *anyopaque, client: SocketAddr, now_ns: u64) SocketAddr,
-    report_success_fn: *const fn (context: *anyopaque, upstream: SocketAddr) void,
-    report_failure_fn: *const fn (context: *anyopaque, upstream: SocketAddr, now_ns: u64) void,
-
-    pub fn pick(self: UpstreamSelector, client: SocketAddr, now_ns: u64) SocketAddr {
-        return self.pick_fn(self.context, client, now_ns);
-    }
-
-    pub fn reportSuccess(self: UpstreamSelector, upstream: SocketAddr) void {
-        self.report_success_fn(self.context, upstream);
-    }
-
-    pub fn reportFailure(self: UpstreamSelector, upstream: SocketAddr, now_ns: u64) void {
-        self.report_failure_fn(self.context, upstream, now_ns);
-    }
-};
+pub const UpstreamSelector = upstream.Selector;
 
 // ---------------------------------------------------------------------------
 // UdpListener
@@ -306,6 +290,81 @@ pub const UdpListener = struct {
         self.engines.deinit(self.allocator);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Protocol module registration (core orchestrator entry point)
+// ---------------------------------------------------------------------------
+
+pub const protocol_module = config.ProtocolModule{
+    .name = "udp",
+    .protocol = .udp,
+    .drains_connections = false,
+    .create = createProtocolListener,
+};
+
+fn createProtocolListener(
+    outer_allocator: Allocator,
+    resolved: ResolvedConfiguration,
+    logger: *LogStore,
+    selector: ?upstream.Selector,
+) anyerror!*config.Listener {
+    const listener = try outer_allocator.create(UdpListener);
+    errdefer outer_allocator.destroy(listener);
+    listener.* = UdpListener.initWithSelector(outer_allocator, resolved, logger, null, null, selector);
+    errdefer listener.deinit();
+    try listener.start();
+
+    const wrapper = try outer_allocator.create(config.Listener);
+    wrapper.* = .{
+        .allocator = outer_allocator,
+        .context = listener,
+        .stop_accepting_fn = listenerStopImmediate,
+        .destroy_fn = listenerDestroy,
+        .update_configuration_fn = listenerUpdateConfiguration,
+        .update_backlog_fn = null,
+        .force_close_fn = listenerNoopForceClose,
+        .active_count_fn = listenerZeroActive,
+        .buffered_bytes_fn = listenerZeroBuffered,
+        .associations_fn = listenerAssociations,
+    };
+    return wrapper;
+}
+
+/// UDP associations expire on their own timers; retiring a UDP listener
+/// destroys it immediately (the core orchestrator relies on this).
+fn listenerStopImmediate(context: *anyopaque) void {
+    _ = context;
+}
+
+fn listenerDestroy(listener_allocator: Allocator, context: *anyopaque) void {
+    const listener: *UdpListener = @ptrCast(@alignCast(context));
+    listener.deinit();
+    listener_allocator.destroy(listener);
+}
+
+fn listenerUpdateConfiguration(context: *anyopaque, resolved: ResolvedConfiguration, reset_sessions: bool) void {
+    const listener: *UdpListener = @ptrCast(@alignCast(context));
+    listener.updateConfiguration(resolved, reset_sessions);
+}
+
+fn listenerNoopForceClose(context: *anyopaque) void {
+    _ = context;
+}
+
+fn listenerZeroActive(context: *anyopaque) usize {
+    _ = context;
+    return 0;
+}
+
+fn listenerZeroBuffered(context: *anyopaque) i64 {
+    _ = context;
+    return 0;
+}
+
+fn listenerAssociations(context: *anyopaque) u64 {
+    const listener: *UdpListener = @ptrCast(@alignCast(context));
+    return listener.associationCount();
+}
 
 // ---------------------------------------------------------------------------
 // UdpRelayEngine
@@ -1346,7 +1405,7 @@ const MockUdpSelector = struct {
         self.successes.deinit(testing.allocator);
     }
 
-    fn pick(context: *anyopaque, client: SocketAddr, now_ns: u64) SocketAddr {
+    fn pick(context: *anyopaque, client: ?SocketAddr, now_ns: u64) SocketAddr {
         _ = client;
         _ = now_ns;
         const self: *MockUdpSelector = @ptrCast(@alignCast(context));
@@ -1356,15 +1415,15 @@ const MockUdpSelector = struct {
         return address;
     }
 
-    fn reportSuccess(context: *anyopaque, upstream: SocketAddr) void {
+    fn reportSuccess(context: *anyopaque, upstream_addr: SocketAddr) void {
         const self: *MockUdpSelector = @ptrCast(@alignCast(context));
-        self.successes.append(testing.allocator, upstream) catch {};
+        self.successes.append(testing.allocator, upstream_addr) catch {};
     }
 
-    fn reportFailure(context: *anyopaque, upstream: SocketAddr, now_ns: u64) void {
+    fn reportFailure(context: *anyopaque, upstream_addr: SocketAddr, now_ns: u64) void {
         _ = now_ns;
         const self: *MockUdpSelector = @ptrCast(@alignCast(context));
-        self.failures.append(testing.allocator, upstream) catch {};
+        self.failures.append(testing.allocator, upstream_addr) catch {};
     }
 };
 
@@ -1421,36 +1480,17 @@ test "udp selector chooses the upstream per association" {
 }
 
 test "udp selector reports failures and reroutes after eviction" {
-    const pool_module = @import("upstream_pool.zig");
+    const pool_module = @import("upstream.zig");
 
     var echo = try UdpEchoServer.start();
     defer echo.stop();
     const live = SocketAddr.parseIp("127.0.0.1", echo.port).?;
     const dead = SocketAddr.parseIp("127.0.0.1", 1).?; // ICMP port unreachable
 
-    var pool = try pool_module.UpstreamPool.init(testing.allocator, &.{ dead, live }, &.{ 1, 1 }, .round_robin);
+    var pool = try pool_module.UpstreamPool.init(testing.allocator, &.{ dead, live }, &.{ 1, 1 }, pool_module.defaultBalancer());
     defer pool.deinit();
 
-    const PoolGlue = struct {
-        fn pick(context: *anyopaque, client: SocketAddr, now_ns: u64) SocketAddr {
-            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
-            return p.pick(client, now_ns);
-        }
-        fn reportSuccess(context: *anyopaque, upstream: SocketAddr) void {
-            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
-            p.reportSuccess(upstream);
-        }
-        fn reportFailure(context: *anyopaque, upstream: SocketAddr, now_ns: u64) void {
-            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
-            p.reportFailure(upstream, now_ns);
-        }
-    };
-    const selector = UpstreamSelector{
-        .context = &pool,
-        .pick_fn = PoolGlue.pick,
-        .report_success_fn = PoolGlue.reportSuccess,
-        .report_failure_fn = PoolGlue.reportFailure,
-    };
+    const selector = pool_module.poolSelector(&pool);
 
     var logger = LogStore.init("critical");
     const resolved = try makeUdpTestResolved(testing.allocator, echo.port);

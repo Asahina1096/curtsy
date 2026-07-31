@@ -6,15 +6,17 @@
 //!       --version       Print version and exit
 //!   -h, --help          Print usage and exit
 //!
+//! A run is one configuration cycle through the module engine (conf.zig):
+//! every module parses its own directives, the core module resolves addresses
+//! and the unified orchestrator (core.ForwarderService) drives 1..N rules.
 //! Configuration or resolution errors print "curtsy: configuration error: ..."
 //! to stderr and exit 2; --check-config prints "configuration is valid" and
-//! exits 0. A normal run starts the Zig TCP/UDP forwarding runtime.
+//! exits 0.
 
 const std = @import("std");
-const config = @import("config.zig");
+const conf = @import("conf.zig");
+const core = @import("modules/core.zig");
 const log = @import("log.zig");
-const rules_service = @import("rules_service.zig");
-const service = @import("service.zig");
 
 const version = "0.3.1";
 
@@ -41,29 +43,20 @@ pub fn main(init: std.process.Init) u8 {
 
     const options = parseArgs(init.minimal.args.vector) orelse return 64; // EX_USAGE
 
-    var diag = config.Diagnostics{};
+    var diag = conf.Diagnostics{};
     defer if (diag.message) |message| gpa.free(message);
 
-    var any = config.loadAnyFile(gpa, options.config_path, &diag) catch {
+    var cycle = conf.loadFile(gpa, options.config_path, &diag) catch {
         reportConfigError(&diag);
         return 2;
     };
-    switch (any) {
-        .single => |*single| return runSingle(gpa, options, single.*, &diag),
-        .rules => |*rules| return runRules(gpa, options, rules.*, &diag),
-    }
-}
-
-/// Legacy single-rule mode: the original ForwarderService path.
-fn runSingle(gpa: std.mem.Allocator, options: Options, loaded: config.LoadedConfiguration, diag: *config.Diagnostics) u8 {
-    var owned = loaded;
-    var owns_loaded = true;
-    defer if (owns_loaded) owned.deinit();
+    var owns_cycle = true;
+    defer if (owns_cycle) cycle.deinit();
 
     // Resolve listen/upstream addresses before reporting success, so an
     // unresolvable host fails --check-config too.
-    const resolved = config.resolveConfiguration(gpa, owned.arena.allocator(), owned.value, null, diag) catch {
-        reportConfigError(diag);
+    const resolved = core.resolveForwarder(gpa, cycle.allocator(), &cycle, null, &diag) catch {
+        reportConfigError(&diag);
         return 2;
     };
 
@@ -72,45 +65,18 @@ fn runSingle(gpa: std.mem.Allocator, options: Options, loaded: config.LoadedConf
         return 0;
     }
 
-    var runtime = service.ForwarderService.init(gpa, options.config_path, owned, resolved);
-    owns_loaded = false;
-    runtime.run() catch |err| {
+    var service = core.ForwarderService.init(gpa, options.config_path, cycle, resolved);
+    owns_cycle = false;
+    service.run() catch |err| {
         writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});
-        runtime.deinit();
+        service.deinit();
         return 1;
     };
-    runtime.deinit();
+    service.deinit();
     return 0;
 }
 
-/// Rules plugin mode (top-level `rules` list in the configuration).
-fn runRules(gpa: std.mem.Allocator, options: Options, loaded: config.LoadedRulesConfiguration, diag: *config.Diagnostics) u8 {
-    var owned = loaded;
-    var owns_loaded = true;
-    defer if (owns_loaded) owned.deinit();
-
-    const resolved = config.resolveRulesConfiguration(gpa, owned.arena.allocator(), owned.value, null, diag) catch {
-        reportConfigError(diag);
-        return 2;
-    };
-
-    if (options.check_config) {
-        writeOut("configuration is valid\n", .{});
-        return 0;
-    }
-
-    var runtime = rules_service.RulesService.init(gpa, options.config_path, owned, resolved);
-    owns_loaded = false;
-    runtime.run() catch |err| {
-        writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});
-        runtime.deinit();
-        return 1;
-    };
-    runtime.deinit();
-    return 0;
-}
-
-fn reportConfigError(diag: *const config.Diagnostics) void {
+fn reportConfigError(diag: *const conf.Diagnostics) void {
     writeErr("curtsy: configuration error: {s}\n", .{diag.message orelse "unknown error"});
 }
 
@@ -166,12 +132,27 @@ fn writeErr(comptime fmt: []const u8, args: anytype) void {
     log.writeAllFd(std.posix.STDERR_FILENO, text);
 }
 
-// Pull unit tests from the foundation modules into the test build.
+// Pull unit tests from the module tree into the test build.
 test {
-    _ = config;
+    _ = @import("net.zig");
+    _ = @import("yaml.zig");
+    _ = @import("module.zig");
+    _ = conf;
+    _ = core;
     _ = log;
     _ = @import("autotune.zig");
-    _ = @import("upstream_pool.zig");
-    _ = rules_service;
-    _ = service;
+    _ = @import("modules/upstream.zig");
+    _ = @import("modules/rules.zig");
+    _ = @import("modules/timeouts.zig");
+    _ = @import("modules/limits.zig");
+    _ = @import("modules/logging.zig");
+    _ = @import("modules/runtime.zig");
+    _ = @import("modules/performance.zig");
+    _ = @import("modules/tcp.zig");
+    _ = @import("modules/udp.zig");
+    _ = @import("modules/tuning.zig");
+    _ = @import("modules/balancer/round_robin.zig");
+    _ = @import("modules/balancer/source_hash.zig");
+    _ = @import("modules/balancer/weighted_round_robin.zig");
+    _ = @import("bpf.zig");
 }

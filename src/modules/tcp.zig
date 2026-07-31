@@ -24,10 +24,11 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const bpf = @import("bpf.zig");
-const config = @import("config.zig");
-const autotune = @import("autotune.zig");
-const log = @import("log.zig");
+const bpf = @import("../bpf.zig");
+const config = @import("core.zig");
+const upstream = @import("upstream.zig");
+const autotune = @import("../autotune.zig");
+const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
 const fd_t = linux.fd_t;
@@ -237,29 +238,12 @@ const ConfigSnapshot = struct {
     sockmap_requested: bool,
 };
 
-/// Optional upstream-selection hook (rules plugin). When set, each new
+/// Optional upstream-selection hook (upstream module). When set, each new
 /// connection asks the selector for its upstream address instead of using
 /// the configured one, immediate connect failures fail over to the next
 /// pick, and outcomes are reported back for passive health tracking. When
 /// null the listener behaves exactly as a single-upstream forwarder.
-pub const UpstreamSelector = struct {
-    context: *anyopaque,
-    pick_fn: *const fn (context: *anyopaque, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr,
-    report_success_fn: *const fn (context: *anyopaque, upstream: config.SocketAddr) void,
-    report_failure_fn: *const fn (context: *anyopaque, upstream: config.SocketAddr, now_ns: u64) void,
-
-    pub fn pick(self: UpstreamSelector, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr {
-        return self.pick_fn(self.context, client, now_ns);
-    }
-
-    pub fn reportSuccess(self: UpstreamSelector, upstream: config.SocketAddr) void {
-        self.report_success_fn(self.context, upstream);
-    }
-
-    pub fn reportFailure(self: UpstreamSelector, upstream: config.SocketAddr, now_ns: u64) void {
-        self.report_failure_fn(self.context, upstream, now_ns);
-    }
-};
+pub const UpstreamSelector = upstream.Selector;
 
 /// How many upstreams a connection may try before the client is dropped.
 const max_failover_attempts: usize = 3;
@@ -674,6 +658,87 @@ pub const TCPListener = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Protocol module registration (core orchestrator entry point)
+// ---------------------------------------------------------------------------
+
+pub const protocol_module = config.ProtocolModule{
+    .name = "tcp",
+    .protocol = .tcp,
+    .drains_connections = true,
+    .create = createProtocolListener,
+};
+
+fn createProtocolListener(
+    outer_allocator: Allocator,
+    resolved: config.ResolvedConfiguration,
+    logger: *log.LogStore,
+    selector: ?upstream.Selector,
+) anyerror!*config.Listener {
+    const listener = try outer_allocator.create(TCPListener);
+    errdefer outer_allocator.destroy(listener);
+    listener.* = try TCPListener.init(resolved, logger, .{ .upstream_selector = selector });
+    errdefer listener.deinit();
+    try listener.start();
+
+    const wrapper = try outer_allocator.create(config.Listener);
+    wrapper.* = .{
+        .allocator = outer_allocator,
+        .context = listener,
+        .stop_accepting_fn = listenerStopAccepting,
+        .destroy_fn = listenerDestroy,
+        .update_configuration_fn = listenerUpdateConfiguration,
+        .update_backlog_fn = listenerUpdateBacklog,
+        .force_close_fn = listenerForceClose,
+        .active_count_fn = listenerActiveCount,
+        .buffered_bytes_fn = listenerBufferedBytes,
+        .associations_fn = listenerZeroAssociations,
+    };
+    return wrapper;
+}
+
+fn listenerStopAccepting(context: *anyopaque) void {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    listener.stopAccepting();
+}
+
+fn listenerDestroy(listener_allocator: Allocator, context: *anyopaque) void {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    listener.deinit();
+    listener_allocator.destroy(listener);
+}
+
+fn listenerUpdateConfiguration(context: *anyopaque, resolved: config.ResolvedConfiguration, reset_sessions: bool) void {
+    _ = reset_sessions; // existing TCP connections always keep their upstream
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    listener.updateConfiguration(resolved);
+}
+
+fn listenerUpdateBacklog(context: *anyopaque, backlog: i32) anyerror!void {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    try listener.updateListeningBacklog(backlog);
+}
+
+fn listenerForceClose(context: *anyopaque) void {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    listener.forceCloseConnections();
+}
+
+fn listenerActiveCount(context: *anyopaque) usize {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    return listener.activeConnectionCount();
+}
+
+fn listenerBufferedBytes(context: *anyopaque) i64 {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    return listener.bufferedBytesUsed();
+}
+
+fn listenerZeroAssociations(context: *anyopaque) u64 {
+    _ = context;
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // Worker: one thread running its own epoll loop
@@ -2431,15 +2496,15 @@ const MockSelector = struct {
         return address;
     }
 
-    fn reportSuccess(context: *anyopaque, upstream: config.SocketAddr) void {
+    fn reportSuccess(context: *anyopaque, upstream_addr: config.SocketAddr) void {
         const self: *MockSelector = @ptrCast(@alignCast(context));
-        self.successes.append(testing.allocator, upstream) catch {};
+        self.successes.append(testing.allocator, upstream_addr) catch {};
     }
 
-    fn reportFailure(context: *anyopaque, upstream: config.SocketAddr, now_ns: u64) void {
+    fn reportFailure(context: *anyopaque, upstream_addr: config.SocketAddr, now_ns: u64) void {
         _ = now_ns;
         const self: *MockSelector = @ptrCast(@alignCast(context));
-        self.failures.append(testing.allocator, upstream) catch {};
+        self.failures.append(testing.allocator, upstream_addr) catch {};
     }
 };
 
@@ -2491,36 +2556,17 @@ test "tcp selector chooses the upstream per connection" {
 }
 
 test "tcp selector fails over from a dead upstream and evicts it" {
-    const pool_module = @import("upstream_pool.zig");
+    const pool_module = @import("upstream.zig");
 
     var echo = try EchoServer.start();
     defer echo.stop();
     const live = config.SocketAddr.parseIp("127.0.0.1", echo.port).?;
     const dead = config.SocketAddr.parseIp("127.0.0.1", 1).?; // nothing listens: ECONNREFUSED
 
-    var pool = try pool_module.UpstreamPool.init(testing.allocator, &.{ dead, live }, &.{ 1, 1 }, .round_robin);
+    var pool = try pool_module.UpstreamPool.init(testing.allocator, &.{ dead, live }, &.{ 1, 1 }, pool_module.defaultBalancer());
     defer pool.deinit();
 
-    const PoolGlue = struct {
-        fn pick(context: *anyopaque, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr {
-            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
-            return p.pick(client, now_ns);
-        }
-        fn reportSuccess(context: *anyopaque, upstream: config.SocketAddr) void {
-            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
-            p.reportSuccess(upstream);
-        }
-        fn reportFailure(context: *anyopaque, upstream: config.SocketAddr, now_ns: u64) void {
-            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
-            p.reportFailure(upstream, now_ns);
-        }
-    };
-    const selector = UpstreamSelector{
-        .context = &pool,
-        .pick_fn = PoolGlue.pick,
-        .report_success_fn = PoolGlue.reportSuccess,
-        .report_failure_fn = PoolGlue.reportFailure,
-    };
+    const selector = pool_module.poolSelector(&pool);
 
     var logger = log.LogStore.init("critical");
     const resolved = try makeTestResolved(testing.allocator, echo.port);
