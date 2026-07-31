@@ -40,3 +40,24 @@ upstream:
 #   udpIOThreads: auto              # UDP relay threads; auto = worker count
 # logging:
 #   level: info
+
+# Optional rules plugin (disabled unless written): multiple independent
+# listen -> upstreams rules in one process. Cannot be combined with the
+# top-level listen/upstream above; timeouts/limits set here are global
+# defaults each rule may override.
+# rules:
+#   - listen: { host: "*", port: 9000 }
+#     protocols: [tcp, udp]              # default: inherit global protocols
+#     upstreams:
+#       - { host: "a.example.com", port: 9000 }            # port defaults to
+#       - { host: "b.example.com", port: 9000, weight: 2 } # the listen port
+#     balance: round_robin   # round_robin | source_hash | weighted_round_robin
+#     timeouts: { tcpIdleSeconds: 600 }        # optional per-rule overrides
+#     limits: { maxTCPBufferedBytes: 8388608 } # tcpListenBacklog and
+#                                              # maxUDPAssociations too
+#   - listen: { host: "127.0.0.1", port: 53 }
+#     protocols: [udp]
+#     upstreams: [ { host: "8.8.8.8", port: 53 } ]
+# Two rules must not share the same listen address and protocol. Upstream
+# health is passive: 3 consecutive failures park an upstream for 10s
+# (exponential backoff, 5min cap), then it rejoins automatically.

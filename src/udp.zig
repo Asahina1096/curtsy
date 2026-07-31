@@ -117,6 +117,30 @@ pub const SockmapRuntimeLoader = *const fn (max_entries: u32, verifier_log: ?[]u
 
 pub const default_sockmap_runtime_loader: SockmapRuntimeLoader = bpf.SockmapRuntime.createUdp;
 
+/// Optional upstream-selection hook (rules plugin). When set, each new
+/// association asks the selector for its upstream address instead of using
+/// the configured one, and upstream socket errors/successes are reported
+/// back for passive health tracking. When null the listener behaves exactly
+/// as a single-upstream forwarder.
+pub const UpstreamSelector = struct {
+    context: *anyopaque,
+    pick_fn: *const fn (context: *anyopaque, client: SocketAddr, now_ns: u64) SocketAddr,
+    report_success_fn: *const fn (context: *anyopaque, upstream: SocketAddr) void,
+    report_failure_fn: *const fn (context: *anyopaque, upstream: SocketAddr, now_ns: u64) void,
+
+    pub fn pick(self: UpstreamSelector, client: SocketAddr, now_ns: u64) SocketAddr {
+        return self.pick_fn(self.context, client, now_ns);
+    }
+
+    pub fn reportSuccess(self: UpstreamSelector, upstream: SocketAddr) void {
+        self.report_success_fn(self.context, upstream);
+    }
+
+    pub fn reportFailure(self: UpstreamSelector, upstream: SocketAddr, now_ns: u64) void {
+        self.report_failure_fn(self.context, upstream, now_ns);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // UdpListener
 // ---------------------------------------------------------------------------
@@ -137,6 +161,7 @@ pub const UdpListener = struct {
     log: *LogStore,
     enable_sockmap_override: ?bool,
     loader: ?SockmapRuntimeLoader,
+    upstream_selector: ?UpstreamSelector = null,
     /// Shared across all engine threads so the configured association limit
     /// stays a global bound rather than a per-thread one.
     budget: UdpAssociationBudget = .{},
@@ -151,12 +176,25 @@ pub const UdpListener = struct {
         enable_sockmap_acceleration: ?bool,
         load_sockmap_runtime: ?SockmapRuntimeLoader,
     ) UdpListener {
+        return initWithSelector(allocator, configuration, log_store, enable_sockmap_acceleration, load_sockmap_runtime, null);
+    }
+
+    /// init plus the rules plugin upstream-selection hook.
+    pub fn initWithSelector(
+        allocator: Allocator,
+        configuration: ResolvedConfiguration,
+        log_store: *LogStore,
+        enable_sockmap_acceleration: ?bool,
+        load_sockmap_runtime: ?SockmapRuntimeLoader,
+        upstream_selector: ?UpstreamSelector,
+    ) UdpListener {
         return .{
             .allocator = allocator,
             .runtime = RuntimeConfiguration.init(configuration),
             .log = log_store,
             .enable_sockmap_override = enable_sockmap_acceleration,
             .loader = load_sockmap_runtime,
+            .upstream_selector = upstream_selector,
         };
     }
 
@@ -214,6 +252,7 @@ pub const UdpListener = struct {
             self.enable_sockmap_override,
             self.loader,
             announce_listen,
+            self.upstream_selector,
         );
         errdefer slot.engine.destroy();
         try slot.engine.start();
@@ -286,6 +325,12 @@ pub const UdpRelayEngine = struct {
         client_address_length: socklen_t,
         listen_fd: fd_t,
         upstream_fd: fd_t,
+        /// Address the upstream socket is connected to; with a selector this
+        /// is the picked address, otherwise the configured upstream.
+        upstream_addr: SocketAddr,
+        /// Set once the upstream answered, so reportSuccess fires once per
+        /// association instead of per recv batch.
+        reported_success: bool = false,
         /// Connected per-client socket and its kernel pairing; present only
         /// when this association is steered by the sockmap verdict program.
         client_fd: ?fd_t = null,
@@ -344,6 +389,7 @@ pub const UdpRelayEngine = struct {
     announce_listen: bool,
     enable_sockmap_override: ?bool,
     loader: SockmapRuntimeLoader,
+    upstream_selector: ?UpstreamSelector,
 
     command_mutex: Mutex = .{},
     /// Fast path flag so processCommands skips the mutex when no command
@@ -386,6 +432,7 @@ pub const UdpRelayEngine = struct {
         enable_sockmap_acceleration: ?bool,
         loader: ?SockmapRuntimeLoader,
         announce_listen: bool,
+        upstream_selector: ?UpstreamSelector,
     ) UdpRelayEngine {
         return .{
             .runtime = runtime,
@@ -396,6 +443,7 @@ pub const UdpRelayEngine = struct {
             .announce_listen = announce_listen,
             .enable_sockmap_override = enable_sockmap_acceleration,
             .loader = loader orelse default_sockmap_runtime_loader,
+            .upstream_selector = upstream_selector,
             .associations = AssociationMap.init(allocator),
             .upstream_to_client = std.AutoHashMap(fd_t, SocketAddr).init(allocator),
             .client_fd_to_client = std.AutoHashMap(fd_t, SocketAddr).init(allocator),
@@ -857,11 +905,18 @@ pub const UdpRelayEngine = struct {
         while (batches < max_batches_per_drain) : (batches += 1) {
             const received = recv_io.recv(fd, recv_slots) catch {
                 self.log.err("udp upstream error client={f} error={s}", .{ client, errnoDescription() });
+                if (self.upstream_selector) |selector| {
+                    selector.reportFailure(association.upstream_addr, now_ms * std.time.ns_per_ms);
+                }
                 self.closeAssociation(client);
                 return;
             };
             if (received == 0) return;
             association.last_activity_ms = now_ms;
+            if (!association.reported_success) {
+                association.reported_success = true;
+                if (self.upstream_selector) |selector| selector.reportSuccess(association.upstream_addr);
+            }
             const address: *const posix.sockaddr = @ptrCast(&association.client_address);
             _ = self.sendAllDatagrams(
                 association.listen_fd,
@@ -947,8 +1002,15 @@ pub const UdpRelayEngine = struct {
         snapshot: *const ResolvedConfiguration,
         now_ms: u64,
     ) Error!fd_t {
+        // The selector (rules plugin) picks the upstream per association;
+        // without one the configured upstream is used.
+        const upstream_address = if (self.upstream_selector) |selector|
+            selector.pick(client, now_ms * std.time.ns_per_ms)
+        else
+            snapshot.upstream_address;
+
         var upstream_storage: posix.sockaddr.storage = undefined;
-        const upstream_len = snapshot.upstream_address.toSockaddrStorage(@ptrCast(&upstream_storage));
+        const upstream_len = upstream_address.toSockaddrStorage(@ptrCast(&upstream_storage));
         const upstream_fd = try bpf.udpUpstreamSocket(@ptrCast(&upstream_storage), upstream_len);
         errdefer _ = linux.close(upstream_fd);
         try bpf.epollAdd(self.epoll_fd, upstream_fd);
@@ -984,6 +1046,7 @@ pub const UdpRelayEngine = struct {
             .client_address_length = client_address_length,
             .listen_fd = listen_fd,
             .upstream_fd = upstream_fd,
+            .upstream_addr = upstream_address,
             .client_fd = client_fd,
             .pairing = pairing,
             .last_activity_ms = now_ms,
@@ -996,7 +1059,7 @@ pub const UdpRelayEngine = struct {
             try self.client_fd_to_client.put(fd, client);
         }
         self.warned_at_limit = false;
-        self.log.debug("udp association opened client={f} upstream={f}", .{ client, snapshot.upstream_address });
+        self.log.debug("udp association opened client={f} upstream={f}", .{ client, upstream_address });
         return upstream_fd;
     }
 
@@ -1131,4 +1194,296 @@ fn socketAddrFromStorage(storage: *const posix.sockaddr.storage) ?SocketAddr {
         },
         else => return null,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn sleepMs(milliseconds: u64) void {
+    var ts = linux.timespec{
+        .sec = @intCast(milliseconds / 1_000),
+        .nsec = @intCast((milliseconds % 1_000) * 1_000_000),
+    };
+    while (true) {
+        const rc = linux.nanosleep(&ts, &ts);
+        if (linux.errno(rc) != .INTR) return;
+    }
+}
+
+fn closeFd(fd: fd_t) void {
+    _ = linux.close(fd);
+}
+
+/// Minimal threaded UDP echo server on 127.0.0.1:0.
+const UdpEchoServer = struct {
+    fd: fd_t,
+    port: u16,
+    thread: std.Thread = undefined,
+    stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn start() !*UdpEchoServer {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        try testing.expect(linux.errno(rc) == .SUCCESS);
+        const fd: fd_t = @intCast(rc);
+        errdefer closeFd(fd);
+
+        var addr = linux.sockaddr.in{
+            .port = 0,
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        };
+        try testing.expect(linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+        var bound = linux.sockaddr.in{ .port = 0, .addr = 0 };
+        var bound_len: socklen_t = @sizeOf(linux.sockaddr.in);
+        try testing.expect(linux.errno(linux.getsockname(fd, @ptrCast(&bound), &bound_len)) == .SUCCESS);
+
+        const server = try testing.allocator.create(UdpEchoServer);
+        errdefer testing.allocator.destroy(server);
+        server.* = .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+        server.thread = try std.Thread.spawn(.{}, UdpEchoServer.loop, .{server});
+        return server;
+    }
+
+    fn loop(self: *UdpEchoServer) void {
+        var buf: [2_048]u8 = undefined;
+        while (!self.stopping.load(.acquire)) {
+            var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 50) catch return;
+            if (ready == 0) continue;
+            var src: posix.sockaddr.storage = undefined;
+            var src_len: socklen_t = @sizeOf(posix.sockaddr.storage);
+            const rc = linux.recvfrom(self.fd, &buf, buf.len, 0, @ptrCast(&src), &src_len);
+            if (linux.errno(rc) != .SUCCESS) continue;
+            const count: usize = @intCast(rc);
+            _ = linux.sendto(self.fd, &buf, count, linux.MSG.NOSIGNAL, @ptrCast(&src), src_len);
+        }
+    }
+
+    fn stop(self: *UdpEchoServer) void {
+        self.stopping.store(true, .release);
+        self.thread.join();
+        closeFd(self.fd);
+        testing.allocator.destroy(self);
+    }
+};
+
+fn makeUdpTestResolved(gpa: Allocator, upstream_port: u16) !config.ResolvedConfiguration {
+    const listen = try gpa.alloc(SocketAddr, 1);
+    listen[0] = SocketAddr.parseIp("127.0.0.1", 0).?;
+    return .{
+        .configuration = .{
+            .version = 1,
+            .protocols = @constCast(&[_]config.ForwardProtocol{.udp}),
+            .listen = .{ .host = "127.0.0.1", .port = 0 },
+            .upstream = .{ .host = "127.0.0.1", .port = upstream_port },
+            .timeouts = .{ .udp_session_seconds = 5 },
+            .limits = .{
+                .tcp_listen_backlog = 128,
+                .max_tcp_buffered_bytes = 64 * 1_024 * 1_024,
+                .max_udp_associations = 1_024,
+                .max_udp_pending_datagrams = 64,
+                .max_udp_pending_bytes = 256 * 1_024,
+            },
+            .performance = .{ .udp_io_threads = 1 },
+        },
+        .listen_addresses = listen,
+        .upstream_address = SocketAddr.parseIp("127.0.0.1", upstream_port).?,
+    };
+}
+
+/// UDP client socket on an ephemeral port with a 200ms receive timeout.
+fn udpClient() !fd_t {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+    const fd: fd_t = @intCast(rc);
+    errdefer closeFd(fd);
+    var timeout = linux.timeval{ .sec = 0, .usec = 200_000 };
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(linux.timeval));
+    return fd;
+}
+
+fn udpSendTo(fd: fd_t, port: u16, bytes: []const u8) !void {
+    var addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const rc = linux.sendto(fd, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+}
+
+/// Null on receive timeout.
+fn udpReceive(fd: fd_t, out: []u8) !?usize {
+    const rc = linux.recvfrom(fd, out.ptr, out.len, 0, null, null);
+    const errno = linux.errno(rc);
+    if (errno != .SUCCESS) {
+        try testing.expect(errno == .AGAIN);
+        return null;
+    }
+    return @intCast(rc);
+}
+
+const MockUdpSelector = struct {
+    addresses: []const SocketAddr,
+    cursor: usize = 0,
+    picks: std.ArrayList(SocketAddr) = .empty,
+    failures: std.ArrayList(SocketAddr) = .empty,
+    successes: std.ArrayList(SocketAddr) = .empty,
+
+    fn selector(self: *MockUdpSelector) UpstreamSelector {
+        return .{
+            .context = self,
+            .pick_fn = pick,
+            .report_success_fn = reportSuccess,
+            .report_failure_fn = reportFailure,
+        };
+    }
+
+    fn deinit(self: *MockUdpSelector) void {
+        self.picks.deinit(testing.allocator);
+        self.failures.deinit(testing.allocator);
+        self.successes.deinit(testing.allocator);
+    }
+
+    fn pick(context: *anyopaque, client: SocketAddr, now_ns: u64) SocketAddr {
+        _ = client;
+        _ = now_ns;
+        const self: *MockUdpSelector = @ptrCast(@alignCast(context));
+        const address = self.addresses[self.cursor % self.addresses.len];
+        self.cursor += 1;
+        self.picks.append(testing.allocator, address) catch {};
+        return address;
+    }
+
+    fn reportSuccess(context: *anyopaque, upstream: SocketAddr) void {
+        const self: *MockUdpSelector = @ptrCast(@alignCast(context));
+        self.successes.append(testing.allocator, upstream) catch {};
+    }
+
+    fn reportFailure(context: *anyopaque, upstream: SocketAddr, now_ns: u64) void {
+        _ = now_ns;
+        const self: *MockUdpSelector = @ptrCast(@alignCast(context));
+        self.failures.append(testing.allocator, upstream) catch {};
+    }
+};
+
+fn waitForEcho(fd: fd_t, port: u16, message: []const u8, timeout_ms: u64) !bool {
+    var waited: u64 = 0;
+    while (waited < timeout_ms) {
+        try udpSendTo(fd, port, message);
+        var buf: [64]u8 = undefined;
+        if (try udpReceive(fd, &buf)) |count| {
+            try testing.expectEqualStrings(message, buf[0..count]);
+            return true;
+        }
+        waited += 200;
+    }
+    return false;
+}
+
+test "udp selector chooses the upstream per association" {
+    var echo_a = try UdpEchoServer.start();
+    defer echo_a.stop();
+    var echo_b = try UdpEchoServer.start();
+    defer echo_b.stop();
+    const addr_a = SocketAddr.parseIp("127.0.0.1", echo_a.port).?;
+    const addr_b = SocketAddr.parseIp("127.0.0.1", echo_b.port).?;
+
+    var mock = MockUdpSelector{ .addresses = &.{ addr_a, addr_b } };
+    defer mock.deinit();
+
+    var logger = LogStore.init("critical");
+    const resolved = try makeUdpTestResolved(testing.allocator, echo_a.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = UdpListener.initWithSelector(testing.allocator, resolved, &logger, false, null, mock.selector());
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = try listener.localAddresses(testing.allocator);
+    defer testing.allocator.free(bound);
+    const port = bound[0].port;
+
+    // Two clients (two associations): alternating picks, both echoes work.
+    const client_a = try udpClient();
+    defer closeFd(client_a);
+    try testing.expect(try waitForEcho(client_a, port, "hello-a", 2_000));
+    const client_b = try udpClient();
+    defer closeFd(client_b);
+    try testing.expect(try waitForEcho(client_b, port, "hello-b", 2_000));
+
+    try testing.expectEqual(@as(usize, 2), mock.picks.items.len);
+    try testing.expect(mock.picks.items[0].eql(addr_a));
+    try testing.expect(mock.picks.items[1].eql(addr_b));
+    try testing.expect(mock.successes.items.len >= 1);
+    try testing.expectEqual(@as(usize, 0), mock.failures.items.len);
+}
+
+test "udp selector reports failures and reroutes after eviction" {
+    const pool_module = @import("upstream_pool.zig");
+
+    var echo = try UdpEchoServer.start();
+    defer echo.stop();
+    const live = SocketAddr.parseIp("127.0.0.1", echo.port).?;
+    const dead = SocketAddr.parseIp("127.0.0.1", 1).?; // ICMP port unreachable
+
+    var pool = try pool_module.UpstreamPool.init(testing.allocator, &.{ dead, live }, &.{ 1, 1 }, .round_robin);
+    defer pool.deinit();
+
+    const PoolGlue = struct {
+        fn pick(context: *anyopaque, client: SocketAddr, now_ns: u64) SocketAddr {
+            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
+            return p.pick(client, now_ns);
+        }
+        fn reportSuccess(context: *anyopaque, upstream: SocketAddr) void {
+            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
+            p.reportSuccess(upstream);
+        }
+        fn reportFailure(context: *anyopaque, upstream: SocketAddr, now_ns: u64) void {
+            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
+            p.reportFailure(upstream, now_ns);
+        }
+    };
+    const selector = UpstreamSelector{
+        .context = &pool,
+        .pick_fn = PoolGlue.pick,
+        .report_success_fn = PoolGlue.reportSuccess,
+        .report_failure_fn = PoolGlue.reportFailure,
+    };
+
+    var logger = LogStore.init("critical");
+    const resolved = try makeUdpTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = UdpListener.initWithSelector(testing.allocator, resolved, &logger, false, null, selector);
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = try listener.localAddresses(testing.allocator);
+    defer testing.allocator.free(bound);
+    const port = bound[0].port;
+
+    // Each round uses a fresh client (fresh association). Round-robin picks
+    // alternate dead/live; datagrams to the dead upstream trigger ICMP errors
+    // that fail the association, and after the failure threshold the dead
+    // upstream is parked for good.
+    var clients: std.ArrayList(fd_t) = .empty;
+    defer {
+        for (clients.items) |fd| closeFd(fd);
+        clients.deinit(testing.allocator);
+    }
+    var got_echo = false;
+    var round: usize = 0;
+    while (round < 12) : (round += 1) {
+        const client = try udpClient();
+        try clients.append(testing.allocator, client);
+        try udpSendTo(client, port, "probe");
+        var buf: [64]u8 = undefined;
+        if (try udpReceive(client, &buf)) |_| got_echo = true;
+        sleepMs(50); // let the engine consume ICMP errors
+    }
+    try testing.expect(got_echo);
+
+    try testing.expect(pool.pick(live, monotonicMilliseconds() * std.time.ns_per_ms).eql(live));
 }

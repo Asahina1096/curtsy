@@ -2,7 +2,7 @@
 
 Curtsy 是一个使用 Zig 编写的 Linux TCP/UDP 透明流量转发器。它在一个地址和端口上监听 TCP、UDP 或两种协议，并把流量转发到固定上游。
 
-当前版本只支持一条监听规则和一个上游，不终止 TLS、不检查流量内容、不记录转发数据正文。
+默认只运行一条监听规则和一个上游，不终止 TLS、不检查流量内容、不记录转发数据正文。配置中出现顶层 `rules` 列表时会启用可选的多规则模块：一个进程内运行多条独立的监听规则，每条规则可配置多个上游并做负载均衡。
 
 ## 构建
 
@@ -82,6 +82,33 @@ zig-out/bin/curtsy --config config.yaml
 
 `runtime.workerThreads` 省略、设为 `0` 或设为 `auto` 时，Curtsy 会按 CPU 数自动选择 worker 数，并限制过高核心数带来的空载内存和调度成本；显式正整数会固定 worker 数。`runtime.tuningDaemon` 默认启用，`runtime.tuningIntervalSeconds` 默认 5 秒。`limits` 下的整数项省略或写 `auto` 时，会按 Linux 主机 CPU/内存探测结果生成保守初始值，并由常驻 tuning daemon 持续观测后调整；显式整数始终优先。启动日志会输出最终生效的 worker 和主要限额。
 
+## 多规则与负载均衡（可选模块）
+
+默认关闭。配置中出现顶层 `rules` 列表即启用，此时不能再使用顶层 `listen`/`upstream`。`version`、`timeouts`、`limits`、`logging`、`runtime`、`performance` 仍是全局配置，作为各规则的默认值：
+
+```yaml
+rules:
+  - listen: { host: "*", port: 9000 }
+    protocols: [tcp, udp]
+    upstreams:
+      - { host: "a.example.com", port: 9000 }
+      - { host: "b.example.com", port: 9000, weight: 2 }
+    balance: round_robin
+    timeouts: { tcpIdleSeconds: 600 }        # 可选，规则级覆盖
+    limits: { maxTCPBufferedBytes: 8388608 } # 可选，规则级覆盖
+  - listen: { host: "127.0.0.1", port: 53 }
+    protocols: [udp]
+    upstreams: [ { host: "8.8.8.8", port: 53 } ]
+```
+
+- 每条规则独立监听一组地址，转发到自己的上游集合；两条规则不得共享同一监听地址和协议。
+- `upstreams` 至少一个；`port` 省略时使用该规则的 `listen.port`，`weight` 默认为 1。
+- `balance` 支持 `round_robin`（默认，TCP 按连接轮转，UDP 按客户端会话轮转）、`source_hash`（按客户端地址 hash，同一客户端固定落同一上游）、`weighted_round_robin`（按权重分配）。
+- 上游健康检查是被动的：连续失败 3 次的上游会被摘除 10 秒，反复失败指数回退（上限 5 分钟），冷却结束后自动恢复并用真实流量探测；TCP connect 失败时会在连接内换下一个上游重试。
+- `protocols`、`timeouts.connectSeconds`、`timeouts.tcpIdleSeconds`、`timeouts.udpSessionSeconds`、`limits.tcpListenBacklog`、`limits.maxTCPBufferedBytes`、`limits.maxUDPAssociations` 可按规则覆盖；`runtime`/`logging`/`performance` 不可按规则覆盖。
+- `workerThreads`/`udpIOThreads` 为 auto 时按规则数均分（如 8 CPU、4 条规则 = 每规则 2 线程），显式整数不干预。
+- 热加载按规则 diff：监听地址未变的规则原地更新（上游健康状态按地址继承），新增规则绑定成功后才退役被删除的规则；已有 TCP 连接保持原上游，UDP 会话在上游集合变化时重建。在 rules 与单规则两种写法之间切换需要重启进程。
+
 ## 信号
 
 - `SIGHUP`：重新读取并应用配置。配置无效或新端口绑定失败时继续使用旧配置。
@@ -117,7 +144,7 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 
 ## 配置约束
 
-- 当前版本只支持一条监听规则和一个上游。
+- 默认只支持一条监听规则和一个上游；多规则与多上游需使用可选的 `rules` 写法（见上文）。
 - 所有超时单位均为秒，必须大于零，且不能超过 `9223372036` 秒。
 - UDP 会话按客户端 IP 与端口隔离，空闲超过 `udpSessionSeconds` 后回收。
 - 达到 `maxUDPAssociations` 后，新 UDP 客户端会被丢弃，已有会话不受影响；默认上限按系统内存自动计算。

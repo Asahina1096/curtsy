@@ -237,6 +237,33 @@ const ConfigSnapshot = struct {
     sockmap_requested: bool,
 };
 
+/// Optional upstream-selection hook (rules plugin). When set, each new
+/// connection asks the selector for its upstream address instead of using
+/// the configured one, immediate connect failures fail over to the next
+/// pick, and outcomes are reported back for passive health tracking. When
+/// null the listener behaves exactly as a single-upstream forwarder.
+pub const UpstreamSelector = struct {
+    context: *anyopaque,
+    pick_fn: *const fn (context: *anyopaque, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr,
+    report_success_fn: *const fn (context: *anyopaque, upstream: config.SocketAddr) void,
+    report_failure_fn: *const fn (context: *anyopaque, upstream: config.SocketAddr, now_ns: u64) void,
+
+    pub fn pick(self: UpstreamSelector, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr {
+        return self.pick_fn(self.context, client, now_ns);
+    }
+
+    pub fn reportSuccess(self: UpstreamSelector, upstream: config.SocketAddr) void {
+        self.report_success_fn(self.context, upstream);
+    }
+
+    pub fn reportFailure(self: UpstreamSelector, upstream: config.SocketAddr, now_ns: u64) void {
+        self.report_failure_fn(self.context, upstream, now_ns);
+    }
+};
+
+/// How many upstreams a connection may try before the client is dropped.
+const max_failover_attempts: usize = 3;
+
 const ListenerState = struct {
     snapshot: ConfigSnapshot,
     accelerator: ?*TCPSockmapAccelerator,
@@ -253,6 +280,8 @@ pub const TCPListener = struct {
         enable_sockmap_acceleration: ?bool = null,
         sockmap_loader: ?SockmapLoader = null,
         sockmap_loader_context: ?*anyopaque = null,
+        /// Rules plugin hook; null keeps the fixed configured upstream.
+        upstream_selector: ?UpstreamSelector = null,
     };
 
     logger: *log.LogStore,
@@ -868,6 +897,9 @@ const Worker = struct {
                         self.listener.logger.err("tcp connect failed client={s} upstream={f} error=connect timeout", .{
                             connection.clientText(), connection.upstream_addr,
                         });
+                        if (self.listener.options.upstream_selector) |s| {
+                            s.reportFailure(connection.upstream_addr, now);
+                        }
                         self.killConnection(connection);
                     }
                 },
@@ -979,6 +1011,8 @@ const Worker = struct {
             .idle_ns = state.snapshot.idle_ns,
             .last_activity_ns = now,
             .upstream_addr = state.snapshot.upstream,
+            .client_addr = client_address,
+            .connect_ns = state.snapshot.connect_ns,
             .accelerator = state.accelerator,
         };
         if (client_address) |address| {
@@ -986,37 +1020,38 @@ const Worker = struct {
             connection.client_text_len = text.len;
         }
 
-        listener.logger.debug("tcp opening upstream client={s} upstream={f}", .{
-            connection.clientText(), connection.upstream_addr,
-        });
-
-        // Nonblocking upstream connect with connect_seconds deadline.
-        var upstream_storage: linux.sockaddr.storage = undefined;
-        const upstream_len = connection.upstream_addr.toSockaddrStorage(&upstream_storage);
-        const family: u32 = switch (connection.upstream_addr.family) {
-            .v4 => linux.AF.INET,
-            .v6 => linux.AF.INET6,
-        };
-        const socket_rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
-        if (linux.errno(socket_rc) != .SUCCESS) {
-            listener.logger.err("tcp connect failed client={s} upstream={f} errno={s}", .{
-                connection.clientText(), connection.upstream_addr, @tagName(linux.errno(socket_rc)),
-            });
-            self.discardNewConnection(connection);
-            return;
-        }
-        const upstream_fd: fd_t = @intCast(socket_rc);
-        connection.upstream.fd = upstream_fd;
-        _ = linux.setsockopt(upstream_fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&yes), @sizeOf(i32));
-
-        const connect_rc = linux.connect(upstream_fd, @ptrCast(&upstream_storage), upstream_len);
-        const connect_errno = linux.errno(connect_rc);
-        if (connect_errno != .SUCCESS and connect_errno != .INPROGRESS) {
-            listener.logger.err("tcp connect failed client={s} upstream={f} errno={s}", .{
-                connection.clientText(), connection.upstream_addr, @tagName(connect_errno),
-            });
-            self.discardNewConnection(connection);
-            return;
+        // Nonblocking upstream connect with connect_seconds deadline. With a
+        // selector (rules plugin) the upstream is picked per connection and
+        // immediate connect failures fail over to the next pick; without one
+        // the loop below runs exactly once with the configured upstream.
+        const selector = listener.options.upstream_selector;
+        const max_attempts: usize = if (selector == null) 1 else max_failover_attempts;
+        var connect_errno: linux.E = .SUCCESS;
+        var attempt: usize = 0;
+        connect_attempts: while (true) {
+            if (selector) |s| connection.upstream_addr = s.pick(client_address, now);
+            switch (self.connectUpstreamOnce(connection)) {
+                .connected => {
+                    connect_errno = .SUCCESS;
+                    break :connect_attempts;
+                },
+                .pending => {
+                    connect_errno = .INPROGRESS;
+                    break :connect_attempts;
+                },
+                .connect_failed => {
+                    if (selector) |s| s.reportFailure(connection.upstream_addr, now);
+                    attempt += 1;
+                    if (attempt >= max_attempts) {
+                        self.discardNewConnection(connection);
+                        return;
+                    }
+                },
+                .socket_failed => {
+                    self.discardNewConnection(connection);
+                    return;
+                },
+            }
         }
 
         // Register both fds with the loop and link the connection.
@@ -1046,8 +1081,98 @@ const Worker = struct {
         self.releaseConnection(connection);
     }
 
+    const ConnectOutcome = enum { connected, pending, connect_failed, socket_failed };
+
+    /// One nonblocking connect attempt to connection.upstream_addr on a fresh
+    /// socket. Immediate connect failures close the fd and report
+    /// .connect_failed (the caller may re-pick); a socket() error reports
+    /// .socket_failed and must not be retried against another upstream.
+    fn connectUpstreamOnce(self: *Worker, connection: *Connection) ConnectOutcome {
+        const listener = self.listener;
+        listener.logger.debug("tcp opening upstream client={s} upstream={f}", .{
+            connection.clientText(), connection.upstream_addr,
+        });
+
+        var upstream_storage: linux.sockaddr.storage = undefined;
+        const upstream_len = connection.upstream_addr.toSockaddrStorage(&upstream_storage);
+        const family: u32 = switch (connection.upstream_addr.family) {
+            .v4 => linux.AF.INET,
+            .v6 => linux.AF.INET6,
+        };
+        const socket_rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(socket_rc) != .SUCCESS) {
+            listener.logger.err("tcp connect failed client={s} upstream={f} errno={s}", .{
+                connection.clientText(), connection.upstream_addr, @tagName(linux.errno(socket_rc)),
+            });
+            return .socket_failed;
+        }
+        const upstream_fd: fd_t = @intCast(socket_rc);
+        connection.upstream.fd = upstream_fd;
+        const yes: i32 = 1;
+        _ = linux.setsockopt(upstream_fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&yes), @sizeOf(i32));
+
+        const connect_rc = linux.connect(upstream_fd, @ptrCast(&upstream_storage), upstream_len);
+        const connect_errno = linux.errno(connect_rc);
+        if (connect_errno == .SUCCESS) return .connected;
+        if (connect_errno == .INPROGRESS) return .pending;
+
+        listener.logger.err("tcp connect failed client={s} upstream={f} errno={s}", .{
+            connection.clientText(), connection.upstream_addr, @tagName(connect_errno),
+        });
+        closeFd(upstream_fd);
+        connection.upstream.fd = -1;
+        return .connect_failed;
+    }
+
+    /// Selector failover while the connection is still in connecting mode:
+    /// drop the failed upstream fd, re-pick and restart the connect. Returns
+    /// true when a new attempt is underway (or already connected).
+    fn retryUpstream(self: *Worker, connection: *Connection, now: u64) bool {
+        const listener = self.listener;
+        const selector = listener.options.upstream_selector orelse return false;
+        selector.reportFailure(connection.upstream_addr, now);
+        connection.failover_attempts += 1;
+        if (connection.failover_attempts >= max_failover_attempts) return false;
+
+        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, connection.upstream.fd, null);
+        closeFd(connection.upstream.fd);
+        connection.upstream.fd = -1;
+        connection.upstream.registered = false;
+        connection.upstream.want_write = false;
+        self.deadline_cache_dirty = true;
+
+        while (connection.failover_attempts < max_failover_attempts) {
+            connection.upstream_addr = selector.pick(connection.client_addr, now);
+            switch (self.connectUpstreamOnce(connection)) {
+                .connected => {
+                    self.registerEndpoint(&connection.upstream);
+                    if (connection.dead) return true;
+                    self.onUpstreamConnected(connection, now);
+                    return true;
+                },
+                .pending => {
+                    self.registerEndpoint(&connection.upstream);
+                    if (connection.dead) return true;
+                    connection.mode = .connecting;
+                    connection.connect_deadline_ns = now + connection.connect_ns;
+                    connection.upstream.want_write = true;
+                    self.updateMask(&connection.upstream);
+                    self.deadline_cache_dirty = true;
+                    return true;
+                },
+                .connect_failed => {
+                    selector.reportFailure(connection.upstream_addr, now);
+                    connection.failover_attempts += 1;
+                },
+                .socket_failed => return false,
+            }
+        }
+        return false;
+    }
+
     fn onUpstreamConnected(self: *Worker, connection: *Connection, now: u64) void {
         const listener = self.listener;
+        if (listener.options.upstream_selector) |s| s.reportSuccess(connection.upstream_addr);
         self.deadline_cache_dirty = true; // deadline basis changes with the mode
         if (connection.accelerator) |accelerator_ref| {
             if (accelerator_ref.pair(connection.client.fd, connection.upstream.fd)) |pairing| {
@@ -1089,9 +1214,11 @@ const Worker = struct {
         const connection = endpoint.connection;
 
         if (connection.mode == .connecting) {
-            // Only the upstream fd's writability matters; any client-side
-            // event or error before the upstream is up tears the attempt down.
-            if (!endpoint.is_client and mask & linux.EPOLL.OUT != 0) {
+            // Only the upstream fd matters; any client-side event before the
+            // upstream is up tears the attempt down. Writability means the
+            // connect settled; error/hangup events are routed through the
+            // same SO_ERROR check so selector failover applies to them too.
+            if (!endpoint.is_client and mask & (linux.EPOLL.OUT | linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
                 self.finishConnect(connection, now);
                 return;
             }
@@ -1131,6 +1258,7 @@ const Worker = struct {
                 connection.clientText(),                                    connection.upstream_addr,
                 if (errno != .SUCCESS) @intFromEnum(tag) else socket_error,
             });
+            if (self.retryUpstream(connection, now)) return;
             self.killConnection(connection);
             return;
         }
@@ -1698,6 +1826,12 @@ const Connection = struct {
     pairing: ?bpf.SockmapRuntime.Pairing = null,
     accelerator: ?*TCPSockmapAccelerator = null, // retained
     upstream_addr: config.SocketAddr,
+    /// Captured for selector re-picks during failover (rules plugin only).
+    client_addr: ?config.SocketAddr = null,
+    /// Connect timeout per upstream attempt, from the accept-time snapshot.
+    connect_ns: u64 = 0,
+    /// Selector failovers already performed for this connection.
+    failover_attempts: usize = 0,
     /// "[addr]:port" text; the longest form is an IPv6 literal (53 bytes).
     client_text: [56]u8 = undefined,
     client_text_len: usize = 0,
@@ -2259,4 +2393,162 @@ test "tcp idle timeout closes inactive connections" {
     };
     drained.listener_ptr = &listener;
     try testing.expect(waitForCondition(drained.check, 5_000));
+}
+
+// ---------------------------------------------------------------------------
+// Upstream selector hook tests (rules plugin)
+// ---------------------------------------------------------------------------
+
+const MockSelector = struct {
+    addresses: []const config.SocketAddr,
+    cursor: usize = 0,
+    picks: std.ArrayList(config.SocketAddr) = .empty,
+    failures: std.ArrayList(config.SocketAddr) = .empty,
+    successes: std.ArrayList(config.SocketAddr) = .empty,
+
+    fn selector(self: *MockSelector) UpstreamSelector {
+        return .{
+            .context = self,
+            .pick_fn = pick,
+            .report_success_fn = reportSuccess,
+            .report_failure_fn = reportFailure,
+        };
+    }
+
+    fn deinit(self: *MockSelector) void {
+        self.picks.deinit(testing.allocator);
+        self.failures.deinit(testing.allocator);
+        self.successes.deinit(testing.allocator);
+    }
+
+    fn pick(context: *anyopaque, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr {
+        _ = client;
+        _ = now_ns;
+        const self: *MockSelector = @ptrCast(@alignCast(context));
+        const address = self.addresses[self.cursor % self.addresses.len];
+        self.cursor += 1;
+        self.picks.append(testing.allocator, address) catch {};
+        return address;
+    }
+
+    fn reportSuccess(context: *anyopaque, upstream: config.SocketAddr) void {
+        const self: *MockSelector = @ptrCast(@alignCast(context));
+        self.successes.append(testing.allocator, upstream) catch {};
+    }
+
+    fn reportFailure(context: *anyopaque, upstream: config.SocketAddr, now_ns: u64) void {
+        _ = now_ns;
+        const self: *MockSelector = @ptrCast(@alignCast(context));
+        self.failures.append(testing.allocator, upstream) catch {};
+    }
+};
+
+test "tcp selector chooses the upstream per connection" {
+    var echo_a = try EchoServer.start();
+    defer echo_a.stop();
+    var echo_b = try EchoServer.start();
+    defer echo_b.stop();
+    const addr_a = config.SocketAddr.parseIp("127.0.0.1", echo_a.port).?;
+    const addr_b = config.SocketAddr.parseIp("127.0.0.1", echo_b.port).?;
+
+    var mock = MockSelector{ .addresses = &.{ addr_a, addr_b } };
+    defer mock.deinit();
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, echo_a.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 2,
+        .enable_sockmap_acceleration = false,
+        .upstream_selector = mock.selector(),
+    });
+    defer listener.deinit();
+    try listener.start();
+    defer {
+        listener.stopAccepting();
+        listener.forceCloseConnections();
+    }
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const client = try connectClient(listener.localAddresses()[0].port);
+        defer closeFd(client);
+        try writeAll(client, "ping");
+        var received: [4]u8 = undefined;
+        try readFully(client, &received);
+        try testing.expectEqualStrings("ping", &received);
+    }
+
+    // Every connection was routed through the selector, alternating upstreams.
+    try testing.expectEqual(@as(usize, 4), mock.picks.items.len);
+    for (mock.picks.items, 0..) |picked, n| {
+        const expected = if (n % 2 == 0) addr_a else addr_b;
+        try testing.expect(picked.eql(expected));
+    }
+    try testing.expectEqual(@as(usize, 0), mock.failures.items.len);
+    try testing.expectEqual(@as(usize, 4), mock.successes.items.len);
+}
+
+test "tcp selector fails over from a dead upstream and evicts it" {
+    const pool_module = @import("upstream_pool.zig");
+
+    var echo = try EchoServer.start();
+    defer echo.stop();
+    const live = config.SocketAddr.parseIp("127.0.0.1", echo.port).?;
+    const dead = config.SocketAddr.parseIp("127.0.0.1", 1).?; // nothing listens: ECONNREFUSED
+
+    var pool = try pool_module.UpstreamPool.init(testing.allocator, &.{ dead, live }, &.{ 1, 1 }, .round_robin);
+    defer pool.deinit();
+
+    const PoolGlue = struct {
+        fn pick(context: *anyopaque, client: ?config.SocketAddr, now_ns: u64) config.SocketAddr {
+            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
+            return p.pick(client, now_ns);
+        }
+        fn reportSuccess(context: *anyopaque, upstream: config.SocketAddr) void {
+            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
+            p.reportSuccess(upstream);
+        }
+        fn reportFailure(context: *anyopaque, upstream: config.SocketAddr, now_ns: u64) void {
+            const p: *pool_module.UpstreamPool = @ptrCast(@alignCast(context));
+            p.reportFailure(upstream, now_ns);
+        }
+    };
+    const selector = UpstreamSelector{
+        .context = &pool,
+        .pick_fn = PoolGlue.pick,
+        .report_success_fn = PoolGlue.reportSuccess,
+        .report_failure_fn = PoolGlue.reportFailure,
+    };
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 2,
+        .enable_sockmap_acceleration = false,
+        .upstream_selector = selector,
+    });
+    defer listener.deinit();
+    try listener.start();
+    defer {
+        listener.stopAccepting();
+        listener.forceCloseConnections();
+    }
+
+    // Every connection succeeds: the dead upstream always fails over to live.
+    var i: usize = 0;
+    while (i < pool_module.failure_threshold + 1) : (i += 1) {
+        const client = try connectClient(listener.localAddresses()[0].port);
+        defer closeFd(client);
+        try writeAll(client, "ok");
+        var received: [2]u8 = undefined;
+        try readFully(client, &received);
+        try testing.expectEqualStrings("ok", &received);
+    }
+
+    // After threshold failures the dead upstream is parked and picks return live.
+    try testing.expect(pool.pick(null, pool_module.monotonicNowNs()).eql(live));
 }

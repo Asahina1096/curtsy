@@ -106,6 +106,81 @@ pub const LoadedConfiguration = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Rules plugin model (opt-in): a configuration with a top-level `rules` list
+// describes multiple independent listen -> upstreams forwarding rules. The
+// legacy single-rule model above is untouched; `loadAnyFile` selects between
+// the two by the presence of the `rules` key.
+// ---------------------------------------------------------------------------
+
+pub const BalancePolicy = enum { round_robin, source_hash, weighted_round_robin };
+
+pub const UpstreamConfiguration = struct {
+    host: []const u8,
+    /// Decoded with the rule listen port as default.
+    port: i64,
+    weight: i64 = 1,
+};
+
+/// Per-rule timeout overrides; null inherits the global value.
+pub const RuleTimeoutOverrides = struct {
+    connect_seconds: ?i64 = null,
+    tcp_idle_seconds: ?i64 = null,
+    udp_session_seconds: ?i64 = null,
+};
+
+/// Per-rule limit overrides; null inherits the global value (including its
+/// auto-tuning flag).
+pub const RuleLimitOverrides = struct {
+    tcp_listen_backlog: ?i64 = null,
+    max_tcp_buffered_bytes: ?i64 = null,
+    max_udp_associations: ?i64 = null,
+};
+
+pub const RuleConfiguration = struct {
+    /// null inherits the global protocols list.
+    protocols: ?[]ForwardProtocol = null,
+    listen: EndpointConfiguration,
+    upstreams: []UpstreamConfiguration,
+    balance: BalancePolicy = .round_robin,
+    timeouts: RuleTimeoutOverrides = .{},
+    limits: RuleLimitOverrides = .{},
+};
+
+pub const RulesConfiguration = struct {
+    version: i64,
+    protocols: []ForwardProtocol,
+    rules: []RuleConfiguration,
+    timeouts: TimeoutConfiguration = .{},
+    limits: LimitConfiguration,
+    logging: LogConfiguration = .{},
+    runtime: RuntimeOptions = .{},
+    performance: PerformanceConfiguration = .{},
+};
+
+/// A parsed rules configuration plus the arena owning everything inside it.
+pub const LoadedRulesConfiguration = struct {
+    arena: std.heap.ArenaAllocator,
+    value: RulesConfiguration,
+
+    pub fn deinit(self: *LoadedRulesConfiguration) void {
+        self.arena.deinit();
+    }
+};
+
+/// Result of the mode-selecting loader: legacy single-rule or rules plugin.
+pub const AnyConfiguration = union(enum) {
+    single: LoadedConfiguration,
+    rules: LoadedRulesConfiguration,
+
+    pub fn deinit(self: *AnyConfiguration) void {
+        switch (self.*) {
+            .single => |*loaded| loaded.deinit(),
+            .rules => |*loaded| loaded.deinit(),
+        }
+    }
+};
+
 /// Load and fully validate a configuration from a YAML file.
 pub fn loadFile(gpa: Allocator, path: []const u8, diag: *Diagnostics) LoadError!LoadedConfiguration {
     const text = readFileAlloc(gpa, path, 16 * 1_024 * 1_024) catch |err| switch (err) {
@@ -148,6 +223,52 @@ pub fn loadYaml(gpa: Allocator, text: []const u8, diag: *Diagnostics) LoadError!
 
 fn setDiag(gpa: Allocator, diag: *Diagnostics, comptime fmt: []const u8, args: anytype) void {
     diag.message = std.fmt.allocPrint(gpa, fmt, args) catch "out of memory while reporting error";
+}
+
+/// Load a configuration file, selecting the rules plugin model when the
+/// document contains a top-level `rules` key and the legacy model otherwise.
+pub fn loadAnyFile(gpa: Allocator, path: []const u8, diag: *Diagnostics) LoadError!AnyConfiguration {
+    const text = readFileAlloc(gpa, path, 16 * 1_024 * 1_024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            setDiag(gpa, diag, "unable to read configuration file: {s}", .{path});
+            return error.ReadFailed;
+        },
+    };
+    defer gpa.free(text);
+    return loadAnyYaml(gpa, text, diag);
+}
+
+/// Mode-selecting variant of loadYaml; see loadAnyFile.
+pub fn loadAnyYaml(gpa: Allocator, text: []const u8, diag: *Diagnostics) LoadError!AnyConfiguration {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser{
+        .arena = alloc,
+        .gpa = gpa,
+        .diag = diag,
+        .lines = try splitLines(alloc, gpa, text, diag),
+    };
+    const root = try parser.parseDocument();
+    if (root.* != .mapping) {
+        setDiag(gpa, diag, "YAML root must be a mapping", .{});
+        return error.InvalidConfiguration;
+    }
+
+    var decoder = Decoder{ .arena = alloc, .gpa = gpa, .diag = diag };
+    if (mappingGet(root.mapping, "rules") != null) {
+        try validateRulesKeys(gpa, diag, root.mapping);
+        const value = try decoder.decodeRulesConfiguration(root);
+        try validateRules(gpa, diag, value);
+        return .{ .rules = .{ .arena = arena, .value = value } };
+    }
+
+    try validateKeys(gpa, diag, root.mapping, "");
+    const value = try decoder.decodeConfiguration(root);
+    try validate(gpa, diag, value);
+    return .{ .single = .{ .arena = arena, .value = value } };
 }
 
 fn readFileAlloc(gpa: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -284,31 +405,51 @@ const Parser = struct {
         while (self.index < self.lines.len) {
             const line = self.lines[self.index];
             if (line.indent != indent or isSequenceItem(line.content)) break;
-
-            const colon = findMappingColon(line.content) orelse
-                return self.fail(line.number, "expected a 'key: value' mapping entry", .{});
-            const key = try self.parseKey(line.content[0..colon], line.number);
-            const rest = std.mem.trimStart(u8, line.content[colon + 1 ..], " ");
             self.index += 1;
+            try self.parseMappingEntry(&entries, line.content, line.number, indent);
+        }
+        return self.newValue(.{ .mapping = try entries.toOwnedSlice(self.arena) });
+    }
 
-            var value: *Value = undefined;
-            if (rest.len == 0) {
-                // Nested block (deeper indent), a same-indent block sequence,
-                // or an empty value.
-                if (self.index < self.lines.len and self.lines[self.index].indent > indent) {
-                    value = try self.parseBlock(self.lines[self.index].indent);
-                } else if (self.index < self.lines.len and
-                    self.lines[self.index].indent == indent and
-                    isSequenceItem(self.lines[self.index].content))
-                {
-                    value = try self.parseSequence(indent);
-                } else {
-                    value = try self.newValue(.null_value);
-                }
+    /// Parse one 'key: value' entry (content has no leading dash) into the
+    /// entry list; nested blocks are consumed from following lines.
+    fn parseMappingEntry(self: *Parser, entries: *std.ArrayList(Entry), content: []const u8, number: usize, indent: usize) error{ InvalidConfiguration, OutOfMemory }!void {
+        const colon = findMappingColon(content) orelse
+            return self.fail(number, "expected a 'key: value' mapping entry", .{});
+        const key = try self.parseKey(content[0..colon], number);
+        const rest = std.mem.trimStart(u8, content[colon + 1 ..], " ");
+
+        var value: *Value = undefined;
+        if (rest.len == 0) {
+            // Nested block (deeper indent), a same-indent block sequence,
+            // or an empty value.
+            if (self.index < self.lines.len and self.lines[self.index].indent > indent) {
+                value = try self.parseBlock(self.lines[self.index].indent);
+            } else if (self.index < self.lines.len and
+                self.lines[self.index].indent == indent and
+                isSequenceItem(self.lines[self.index].content))
+            {
+                value = try self.parseSequence(indent);
             } else {
-                value = try self.parseInlineValue(rest, line.number);
+                value = try self.newValue(.null_value);
             }
-            try entries.append(self.arena, .{ .key = key, .value = value });
+        } else {
+            value = try self.parseInlineValue(rest, number);
+        }
+        try entries.append(self.arena, .{ .key = key, .value = value });
+    }
+
+    /// A sequence item that directly starts a mapping (`- key: value`): the
+    /// first entry comes from the dash line itself, following entries align
+    /// at the column where the first key started.
+    fn parseInlineMapping(self: *Parser, content: []const u8, number: usize, indent: usize) error{ InvalidConfiguration, OutOfMemory }!*Value {
+        var entries: std.ArrayList(Entry) = .empty;
+        try self.parseMappingEntry(&entries, content, number, indent);
+        while (self.index < self.lines.len) {
+            const line = self.lines[self.index];
+            if (line.indent != indent or isSequenceItem(line.content)) break;
+            self.index += 1;
+            try self.parseMappingEntry(&entries, line.content, line.number, indent);
         }
         return self.newValue(.{ .mapping = try entries.toOwnedSlice(self.arena) });
     }
@@ -327,6 +468,12 @@ const Parser = struct {
                 } else {
                     value = try self.newValue(.null_value);
                 }
+            } else if (rest[0] != '{' and rest[0] != '[' and rest[0] != '"' and
+                findMappingColon(rest) != null)
+            {
+                // `- key: value`: the item is a mapping whose first entry is
+                // inline; following keys align at the key's column.
+                value = try self.parseInlineMapping(rest, line.number, indent + (line.content.len - rest.len));
             } else {
                 value = try self.parseInlineValue(rest, line.number);
             }
@@ -564,6 +711,87 @@ fn validateKeys(gpa: Allocator, diag: *Diagnostics, mapping: []const Entry, path
         }
         if (entry.value.* == .mapping and allowedKeysFor(entry.key) != null) {
             try validateKeys(gpa, diag, entry.value.mapping, entry.key);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rules plugin key whitelist
+// ---------------------------------------------------------------------------
+
+const rules_root_keys = [_][]const u8{ "version", "protocols", "rules", "timeouts", "limits", "logging", "runtime", "performance" };
+const rule_keys = [_][]const u8{ "listen", "upstreams", "protocols", "balance", "timeouts", "limits" };
+const rule_listen_keys = [_][]const u8{ "host", "port" };
+const rule_upstream_keys = [_][]const u8{ "host", "port", "weight" };
+const rule_timeout_keys = [_][]const u8{ "connectSeconds", "tcpIdleSeconds", "udpSessionSeconds" };
+const rule_limit_keys = [_][]const u8{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations" };
+
+fn keyKnown(known_keys: []const []const u8, key: []const u8) bool {
+    for (known_keys) |candidate| {
+        if (std.mem.eql(u8, candidate, key)) return true;
+    }
+    return false;
+}
+
+fn validateRulesKeys(gpa: Allocator, diag: *Diagnostics, mapping: []const Entry) LoadError!void {
+    for (mapping) |entry| {
+        if (!keyKnown(&rules_root_keys, entry.key)) {
+            if (std.mem.eql(u8, entry.key, "listen") or std.mem.eql(u8, entry.key, "upstream")) {
+                setDiag(gpa, diag, "configuration cannot mix listen/upstream with rules", .{});
+            } else {
+                setDiag(gpa, diag, "unknown configuration key: {s}", .{entry.key});
+            }
+            return error.InvalidConfiguration;
+        }
+        if (std.mem.eql(u8, entry.key, "rules")) {
+            try validateRuleListKeys(gpa, diag, entry.value);
+        } else if (entry.value.* == .mapping and allowedKeysFor(entry.key) != null) {
+            try validateKeys(gpa, diag, entry.value.mapping, entry.key);
+        }
+    }
+}
+
+fn validateRuleListKeys(gpa: Allocator, diag: *Diagnostics, value: *Value) LoadError!void {
+    if (value.* != .sequence) return; // the decoder reports the type error
+    for (value.sequence, 0..) |item, i| {
+        if (item.* != .mapping) continue;
+        for (item.mapping) |entry| {
+            if (!keyKnown(&rule_keys, entry.key)) {
+                setDiag(gpa, diag, "unknown configuration key: rules[{d}].{s}", .{ i, entry.key });
+                return error.InvalidConfiguration;
+            }
+            if (std.mem.eql(u8, entry.key, "listen")) {
+                try validateNestedKeys(gpa, diag, entry.value, &rule_listen_keys, "rules[{d}].listen", .{i});
+            } else if (std.mem.eql(u8, entry.key, "upstreams")) {
+                if (entry.value.* == .sequence) {
+                    for (entry.value.sequence, 0..) |upstream, j| {
+                        try validateNestedKeys(gpa, diag, upstream, &rule_upstream_keys, "rules[{d}].upstreams[{d}]", .{ i, j });
+                    }
+                }
+            } else if (std.mem.eql(u8, entry.key, "timeouts")) {
+                try validateNestedKeys(gpa, diag, entry.value, &rule_timeout_keys, "rules[{d}].timeouts", .{i});
+            } else if (std.mem.eql(u8, entry.key, "limits")) {
+                try validateNestedKeys(gpa, diag, entry.value, &rule_limit_keys, "rules[{d}].limits", .{i});
+            }
+        }
+    }
+}
+
+fn validateNestedKeys(
+    gpa: Allocator,
+    diag: *Diagnostics,
+    value: *Value,
+    known_keys: []const []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) LoadError!void {
+    if (value.* != .mapping) return; // the decoder reports the type error
+    var prefix_buf: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, fmt, args) catch return error.InvalidConfiguration;
+    for (value.mapping) |entry| {
+        if (!keyKnown(known_keys, entry.key)) {
+            setDiag(gpa, diag, "unknown configuration key: {s}.{s}", .{ prefix, entry.key });
+            return error.InvalidConfiguration;
         }
     }
 }
@@ -822,6 +1050,182 @@ const Decoder = struct {
         performance.udp_io_threads = io_threads.value;
         return performance;
     }
+
+    // ------------------------------------------------------------------
+    // Rules plugin decoding
+    // ------------------------------------------------------------------
+
+    fn decodeRulesConfiguration(self: *Decoder, root: *Value) LoadError!RulesConfiguration {
+        const map = root.mapping;
+        const auto_limits = autotune.limits(.system());
+
+        var configuration = RulesConfiguration{
+            .version = 1,
+            .protocols = try self.arena.dupe(ForwardProtocol, &.{ .tcp, .udp }),
+            .rules = &.{},
+            .limits = .{
+                .tcp_listen_backlog = auto_limits.tcp_listen_backlog,
+                .max_tcp_buffered_bytes = auto_limits.max_tcp_buffered_bytes,
+                .max_udp_associations = auto_limits.max_udp_associations,
+                .max_udp_pending_datagrams = auto_limits.max_udp_pending_datagrams,
+                .max_udp_pending_bytes = auto_limits.max_udp_pending_bytes,
+            },
+        };
+
+        if (mappingGet(map, "version")) |v| {
+            configuration.version = try self.decodeInt(v, "version");
+        }
+        if (mappingGet(map, "protocols")) |v| {
+            configuration.protocols = try self.decodeProtocols(v);
+        }
+
+        const rules_value = mappingGet(map, "rules") orelse
+            return self.fail("missing required key: rules", .{});
+        configuration.rules = try self.decodeRuleList(rules_value);
+
+        if (mappingGet(map, "timeouts")) |v| {
+            configuration.timeouts = try self.decodeTimeouts(v);
+        }
+        if (mappingGet(map, "limits")) |v| {
+            configuration.limits = try self.decodeLimits(v, auto_limits);
+        }
+        if (mappingGet(map, "logging")) |v| {
+            configuration.logging = try self.decodeLogging(v);
+        }
+        if (mappingGet(map, "runtime")) |v| {
+            configuration.runtime = try self.decodeRuntime(v);
+        }
+        if (mappingGet(map, "performance")) |v| {
+            configuration.performance = try self.decodePerformance(v);
+        }
+        return configuration;
+    }
+
+    fn decodeRuleList(self: *Decoder, value: *Value) LoadError![]RuleConfiguration {
+        if (value.* != .sequence) {
+            return self.fail("rules: expected a sequence", .{});
+        }
+        var rules: std.ArrayList(RuleConfiguration) = .empty;
+        for (value.sequence, 0..) |item, i| {
+            try rules.append(self.arena, try self.decodeRule(item, i));
+        }
+        return rules.toOwnedSlice(self.arena);
+    }
+
+    fn decodeRule(self: *Decoder, value: *Value, index: usize) LoadError!RuleConfiguration {
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "rules[{d}]", .{index}) catch "rules";
+        const map = try self.requireMapping(value, path);
+
+        var rule = RuleConfiguration{
+            .listen = .{ .host = "*", .port = 0 },
+            .upstreams = &.{},
+        };
+
+        const listen_value = mappingGet(map, "listen") orelse
+            return self.fail("missing required key: {s}.listen", .{path});
+        rule.listen = try self.decodeRuleListen(listen_value, path);
+
+        const upstreams_value = mappingGet(map, "upstreams") orelse
+            return self.fail("missing required key: {s}.upstreams", .{path});
+        rule.upstreams = try self.decodeRuleUpstreams(upstreams_value, rule.listen.port, path);
+
+        if (mappingGet(map, "protocols")) |v| {
+            rule.protocols = try self.decodeProtocols(v);
+        }
+        if (mappingGet(map, "balance")) |v| {
+            rule.balance = try self.decodeBalancePolicy(v, path);
+        }
+        if (mappingGet(map, "timeouts")) |v| {
+            rule.timeouts = try self.decodeRuleTimeouts(v, path);
+        }
+        if (mappingGet(map, "limits")) |v| {
+            rule.limits = try self.decodeRuleLimits(v, path);
+        }
+        return rule;
+    }
+
+    fn decodeRuleListen(self: *Decoder, value: *Value, path: []const u8) LoadError!EndpointConfiguration {
+        var sub_buf: [80]u8 = undefined;
+        const listen_path = std.fmt.bufPrint(&sub_buf, "{s}.listen", .{path}) catch path;
+        const map = try self.requireMapping(value, listen_path);
+        var endpoint = EndpointConfiguration{ .host = "*", .port = 0 };
+        if (mappingGet(map, "host")) |v| {
+            endpoint.host = try self.decodeString(v, "rules.listen.host");
+        }
+        const port_value = mappingGet(map, "port") orelse
+            return self.fail("missing required key: {s}.port", .{listen_path});
+        endpoint.port = try self.decodeInt(port_value, listen_path);
+        return endpoint;
+    }
+
+    fn decodeRuleUpstreams(self: *Decoder, value: *Value, listen_port: i64, path: []const u8) LoadError![]UpstreamConfiguration {
+        var sub_buf: [80]u8 = undefined;
+        const upstreams_path = std.fmt.bufPrint(&sub_buf, "{s}.upstreams", .{path}) catch path;
+        if (value.* != .sequence) {
+            return self.fail("{s}: expected a sequence", .{upstreams_path});
+        }
+        var upstreams: std.ArrayList(UpstreamConfiguration) = .empty;
+        for (value.sequence, 0..) |item, j| {
+            const map = try self.requireMapping(item, upstreams_path);
+            const host_value = mappingGet(map, "host") orelse
+                return self.fail("missing required key: {s}[{d}].host", .{ upstreams_path, j });
+            const host = try self.decodeString(host_value, upstreams_path);
+            var upstream = UpstreamConfiguration{ .host = host, .port = listen_port };
+            if (mappingGet(map, "port")) |v| {
+                upstream.port = try self.decodeInt(v, upstreams_path);
+            }
+            if (mappingGet(map, "weight")) |v| {
+                upstream.weight = try self.decodeInt(v, upstreams_path);
+            }
+            try upstreams.append(self.arena, upstream);
+        }
+        return upstreams.toOwnedSlice(self.arena);
+    }
+
+    fn decodeBalancePolicy(self: *Decoder, value: *Value, path: []const u8) LoadError!BalancePolicy {
+        var sub_buf: [80]u8 = undefined;
+        const balance_path = std.fmt.bufPrint(&sub_buf, "{s}.balance", .{path}) catch path;
+        const text = try self.decodeString(value, balance_path);
+        const map = std.StaticStringMap(BalancePolicy).initComptime(.{
+            .{ "round_robin", .round_robin },
+            .{ "source_hash", .source_hash },
+            .{ "weighted_round_robin", .weighted_round_robin },
+        });
+        return map.get(text) orelse
+            self.fail("{s}: expected one of round_robin, source_hash, weighted_round_robin", .{balance_path});
+    }
+
+    fn decodeRuleTimeouts(self: *Decoder, value: *Value, path: []const u8) LoadError!RuleTimeoutOverrides {
+        var sub_buf: [80]u8 = undefined;
+        const timeouts_path = std.fmt.bufPrint(&sub_buf, "{s}.timeouts", .{path}) catch path;
+        const map = try self.requireMapping(value, timeouts_path);
+        var timeouts = RuleTimeoutOverrides{};
+        if (mappingGet(map, "connectSeconds")) |v| {
+            timeouts.connect_seconds = try self.decodeInt(v, timeouts_path);
+        }
+        if (mappingGet(map, "tcpIdleSeconds")) |v| {
+            timeouts.tcp_idle_seconds = try self.decodeInt(v, timeouts_path);
+        }
+        if (mappingGet(map, "udpSessionSeconds")) |v| {
+            timeouts.udp_session_seconds = try self.decodeInt(v, timeouts_path);
+        }
+        return timeouts;
+    }
+
+    fn decodeRuleLimits(self: *Decoder, value: *Value, path: []const u8) LoadError!RuleLimitOverrides {
+        var sub_buf: [80]u8 = undefined;
+        const limits_path = std.fmt.bufPrint(&sub_buf, "{s}.limits", .{path}) catch path;
+        const map = try self.requireMapping(value, limits_path);
+        var limits = RuleLimitOverrides{};
+        const backlog = try self.decodeAutoTunedInt(map, "tcpListenBacklog", limits_path, 0);
+        if (!backlog.is_auto) limits.tcp_listen_backlog = backlog.value;
+        const tcp_bytes = try self.decodeAutoTunedInt(map, "maxTCPBufferedBytes", limits_path, 0);
+        if (!tcp_bytes.is_auto) limits.max_tcp_buffered_bytes = tcp_bytes.value;
+        const udp_associations = try self.decodeAutoTunedInt(map, "maxUDPAssociations", limits_path, 0);
+        if (!udp_associations.is_auto) limits.max_udp_associations = udp_associations.value;
+        return limits;
+    }
 };
 
 fn mappingGet(map: []const Entry, key: []const u8) ?*Value {
@@ -952,6 +1356,181 @@ fn isValidLogLevel(level: []const u8) bool {
         if (std.mem.eql(u8, name, lower)) return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Rules plugin validation (same ranges and message style as validate)
+// ---------------------------------------------------------------------------
+
+fn validateRules(gpa: Allocator, diag: *Diagnostics, configuration: RulesConfiguration) LoadError!void {
+    if (configuration.version != 1) {
+        setDiag(gpa, diag, "unsupported configuration version: {d}", .{configuration.version});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.protocols.len == 0) {
+        setDiag(gpa, diag, "protocols must not be empty", .{});
+        return error.InvalidConfiguration;
+    }
+    for (configuration.protocols, 0..) |protocol, i| {
+        for (configuration.protocols[i + 1 ..]) |other| {
+            if (protocol == other) {
+                setDiag(gpa, diag, "protocols must not contain duplicates", .{});
+                return error.InvalidConfiguration;
+            }
+        }
+    }
+    const global_timeout_values = [_]i64{
+        configuration.timeouts.connect_seconds,
+        configuration.timeouts.tcp_idle_seconds,
+        configuration.timeouts.udp_session_seconds,
+        configuration.timeouts.shutdown_grace_seconds,
+    };
+    for (global_timeout_values) |value| {
+        if (value <= 0) {
+            setDiag(gpa, diag, "all timeout values must be positive", .{});
+            return error.InvalidConfiguration;
+        }
+    }
+    for (global_timeout_values) |value| {
+        if (value > max_timeout_seconds) {
+            setDiag(gpa, diag, "all timeout values must be no greater than {d} seconds", .{max_timeout_seconds});
+            return error.InvalidConfiguration;
+        }
+    }
+    if (configuration.limits.tcp_listen_backlog < 1 or configuration.limits.tcp_listen_backlog > std.math.maxInt(i32)) {
+        setDiag(gpa, diag, "limits.tcpListenBacklog must be between 1 and {d}", .{std.math.maxInt(i32)});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.limits.max_tcp_buffered_bytes <= 0) {
+        setDiag(gpa, diag, "limits.maxTCPBufferedBytes must be positive", .{});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.limits.max_udp_associations < 1 or configuration.limits.max_udp_associations > max_udp_associations) {
+        setDiag(gpa, diag, "limits.maxUDPAssociations must be between 1 and {d}", .{max_udp_associations});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.limits.max_udp_pending_datagrams <= 0) {
+        setDiag(gpa, diag, "limits.maxUDPPendingDatagrams must be positive", .{});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.limits.max_udp_pending_bytes <= 0) {
+        setDiag(gpa, diag, "limits.maxUDPPendingBytes must be positive", .{});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.runtime.worker_threads < 0) {
+        setDiag(gpa, diag, "runtime.workerThreads must be zero for auto or positive", .{});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.runtime.tuning_interval_seconds <= 0) {
+        setDiag(gpa, diag, "runtime.tuningIntervalSeconds must be positive", .{});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.performance.udp_socket_buffer_bytes < 0 or
+        configuration.performance.udp_socket_buffer_bytes > max_udp_socket_buffer_bytes)
+    {
+        setDiag(gpa, diag, "performance.udpSocketBufferBytes must be between 0 (kernel default) and {d}", .{max_udp_socket_buffer_bytes});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.performance.udp_io_threads < 0) {
+        setDiag(gpa, diag, "performance.udpIOThreads must be zero for auto or positive", .{});
+        return error.InvalidConfiguration;
+    }
+    if (configuration.performance.udp_datagram_buffer_bytes < min_udp_datagram_buffer_bytes or
+        configuration.performance.udp_datagram_buffer_bytes > max_udp_datagram_buffer_bytes)
+    {
+        setDiag(gpa, diag, "performance.udpDatagramBufferBytes must be between {d} and {d}", .{ min_udp_datagram_buffer_bytes, max_udp_datagram_buffer_bytes });
+        return error.InvalidConfiguration;
+    }
+    if (!isValidLogLevel(configuration.logging.level)) {
+        setDiag(gpa, diag, "logging.level is invalid", .{});
+        return error.InvalidConfiguration;
+    }
+
+    if (configuration.rules.len == 0) {
+        setDiag(gpa, diag, "rules must not be empty", .{});
+        return error.InvalidConfiguration;
+    }
+    for (configuration.rules, 0..) |rule, i| {
+        try validateRule(gpa, diag, rule, i);
+    }
+}
+
+fn validateRule(gpa: Allocator, diag: *Diagnostics, rule: RuleConfiguration, i: usize) LoadError!void {
+    if (std.mem.trim(u8, rule.listen.host, " \t\n\r").len == 0) {
+        setDiag(gpa, diag, "rules[{d}].listen.host must not be empty", .{i});
+        return error.InvalidConfiguration;
+    }
+    if (rule.listen.port < 1 or rule.listen.port > 65_535) {
+        setDiag(gpa, diag, "rules[{d}].listen.port must be between 1 and 65535", .{i});
+        return error.InvalidConfiguration;
+    }
+    if (rule.upstreams.len == 0) {
+        setDiag(gpa, diag, "rules[{d}].upstreams must not be empty", .{i});
+        return error.InvalidConfiguration;
+    }
+    for (rule.upstreams, 0..) |upstream, j| {
+        if (std.mem.trim(u8, upstream.host, " \t\n\r").len == 0) {
+            setDiag(gpa, diag, "rules[{d}].upstreams[{d}].host must not be empty", .{ i, j });
+            return error.InvalidConfiguration;
+        }
+        if (upstream.port < 1 or upstream.port > 65_535) {
+            setDiag(gpa, diag, "rules[{d}].upstreams[{d}].port must be between 1 and 65535", .{ i, j });
+            return error.InvalidConfiguration;
+        }
+        if (upstream.weight < 1 or upstream.weight > 65_535) {
+            setDiag(gpa, diag, "rules[{d}].upstreams[{d}].weight must be between 1 and 65535", .{ i, j });
+            return error.InvalidConfiguration;
+        }
+    }
+    if (rule.protocols) |protocols| {
+        if (protocols.len == 0) {
+            setDiag(gpa, diag, "rules[{d}].protocols must not be empty", .{i});
+            return error.InvalidConfiguration;
+        }
+        for (protocols, 0..) |protocol, k| {
+            for (protocols[k + 1 ..]) |other| {
+                if (protocol == other) {
+                    setDiag(gpa, diag, "rules[{d}].protocols must not contain duplicates", .{i});
+                    return error.InvalidConfiguration;
+                }
+            }
+        }
+    }
+    const override_timeouts = [_]struct { name: []const u8, value: ?i64 }{
+        .{ .name = "connectSeconds", .value = rule.timeouts.connect_seconds },
+        .{ .name = "tcpIdleSeconds", .value = rule.timeouts.tcp_idle_seconds },
+        .{ .name = "udpSessionSeconds", .value = rule.timeouts.udp_session_seconds },
+    };
+    for (override_timeouts) |entry| {
+        if (entry.value) |value| {
+            if (value <= 0) {
+                setDiag(gpa, diag, "rules[{d}].timeouts.{s} must be positive", .{ i, entry.name });
+                return error.InvalidConfiguration;
+            }
+            if (value > max_timeout_seconds) {
+                setDiag(gpa, diag, "rules[{d}].timeouts.{s} must be no greater than {d} seconds", .{ i, entry.name, max_timeout_seconds });
+                return error.InvalidConfiguration;
+            }
+        }
+    }
+    if (rule.limits.tcp_listen_backlog) |value| {
+        if (value < 1 or value > std.math.maxInt(i32)) {
+            setDiag(gpa, diag, "rules[{d}].limits.tcpListenBacklog must be between 1 and {d}", .{ i, std.math.maxInt(i32) });
+            return error.InvalidConfiguration;
+        }
+    }
+    if (rule.limits.max_tcp_buffered_bytes) |value| {
+        if (value <= 0) {
+            setDiag(gpa, diag, "rules[{d}].limits.maxTCPBufferedBytes must be positive", .{i});
+            return error.InvalidConfiguration;
+        }
+    }
+    if (rule.limits.max_udp_associations) |value| {
+        if (value < 1 or value > max_udp_associations) {
+            setDiag(gpa, diag, "rules[{d}].limits.maxUDPAssociations must be between 1 and {d}", .{ i, max_udp_associations });
+            return error.InvalidConfiguration;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,6 +1720,146 @@ fn resolverAddress(
         setDiag(gpa, diag, "unable to resolve host '{s}'", .{host});
         return error.ResolutionFailed;
     };
+}
+
+// ---------------------------------------------------------------------------
+// ResolvedRulesConfiguration (rules plugin counterpart of ResolvedConfiguration)
+// ---------------------------------------------------------------------------
+
+pub const ResolvedRule = struct {
+    rule: RuleConfiguration,
+    /// Synthesized legacy configuration (global sections merged with rule
+    /// overrides) so a rule drives the existing listener APIs unchanged. Its
+    /// upstream is upstreams[0]; multi-upstream selection happens through the
+    /// selector hook.
+    effective: ForwarderConfiguration,
+    listen_addresses: []SocketAddr,
+    /// One resolved address per rule.upstreams entry, same order.
+    upstream_addresses: []SocketAddr,
+
+    pub fn effectiveProtocols(self: *const ResolvedRule) []ForwardProtocol {
+        return self.rule.protocols orelse self.effective.protocols;
+    }
+};
+
+pub const ResolvedRulesConfiguration = struct {
+    configuration: RulesConfiguration,
+    rules: []ResolvedRule,
+};
+
+/// Synthesize the legacy per-rule configuration from global sections plus
+/// rule overrides.
+pub fn effectiveRuleConfiguration(configuration: RulesConfiguration, rule: RuleConfiguration) ForwarderConfiguration {
+    var timeouts = configuration.timeouts;
+    if (rule.timeouts.connect_seconds) |v| timeouts.connect_seconds = v;
+    if (rule.timeouts.tcp_idle_seconds) |v| timeouts.tcp_idle_seconds = v;
+    if (rule.timeouts.udp_session_seconds) |v| timeouts.udp_session_seconds = v;
+
+    var limits = configuration.limits;
+    if (rule.limits.tcp_listen_backlog) |v| {
+        limits.tcp_listen_backlog = v;
+        limits.auto_tuning.tcp_listen_backlog = false;
+    }
+    if (rule.limits.max_tcp_buffered_bytes) |v| {
+        limits.max_tcp_buffered_bytes = v;
+        limits.auto_tuning.max_tcp_buffered_bytes = false;
+    }
+    if (rule.limits.max_udp_associations) |v| {
+        limits.max_udp_associations = v;
+        limits.auto_tuning.max_udp_associations = false;
+    }
+
+    return .{
+        .version = configuration.version,
+        .protocols = rule.protocols orelse configuration.protocols,
+        .listen = rule.listen,
+        .upstream = .{ .host = rule.upstreams[0].host, .port = rule.upstreams[0].port },
+        .timeouts = timeouts,
+        .limits = limits,
+        .logging = configuration.logging,
+        .runtime = configuration.runtime,
+        .performance = configuration.performance,
+    };
+}
+
+/// Resolve every rule's listen/upstream endpoints. `gpa` backs diagnostics;
+/// `alloc` backs the returned slices and must outlive them (pass the arena).
+pub fn resolveRulesConfiguration(
+    gpa: Allocator,
+    alloc: Allocator,
+    configuration: RulesConfiguration,
+    resolver: ?Resolver,
+    diag: *Diagnostics,
+) ResolveError!ResolvedRulesConfiguration {
+    const resolve = resolver orelse defaultResolver;
+
+    const resolved_rules = try alloc.alloc(ResolvedRule, configuration.rules.len);
+    for (configuration.rules, 0..) |rule, i| {
+        var listen_addresses: []SocketAddr = undefined;
+        const listen_port: u16 = @intCast(rule.listen.port);
+        if (std.mem.eql(u8, rule.listen.host, "*")) {
+            const pair = try alloc.alloc(SocketAddr, 2);
+            pair[0] = SocketAddr.initV4(.{ 0, 0, 0, 0 }, listen_port);
+            pair[1] = SocketAddr.initV6(@splat(0), listen_port);
+            listen_addresses = pair;
+        } else {
+            const address = resolverAddress(resolve, rule.listen.host, listen_port, gpa, diag) catch
+                return error.ResolutionFailed;
+            const single = try alloc.alloc(SocketAddr, 1);
+            single[0] = address;
+            listen_addresses = single;
+        }
+
+        const upstream_addresses = try alloc.alloc(SocketAddr, rule.upstreams.len);
+        for (rule.upstreams, 0..) |upstream, j| {
+            const upstream_port: u16 = @intCast(upstream.port);
+            upstream_addresses[j] = resolverAddress(resolve, upstream.host, upstream_port, gpa, diag) catch
+                return error.ResolutionFailed;
+        }
+
+        resolved_rules[i] = .{
+            .rule = rule,
+            .effective = effectiveRuleConfiguration(configuration, rule),
+            .listen_addresses = listen_addresses,
+            .upstream_addresses = upstream_addresses,
+        };
+    }
+
+    for (resolved_rules, 0..) |*a, i| {
+        for (resolved_rules[i + 1 ..], i + 1..) |*b, j| {
+            if (rulesConflict(a, b)) |protocol| {
+                setDiag(gpa, diag, "rules {d} and {d} listen on the same address for protocol {s}", .{ i, j, @tagName(protocol) });
+                return error.ResolutionFailed;
+            }
+        }
+    }
+
+    return .{
+        .configuration = configuration,
+        .rules = resolved_rules,
+    };
+}
+
+/// Two rules conflict when they share a concrete listen address and serve an
+/// overlapping protocol: both would bind the same socket with SO_REUSEPORT
+/// and silently split traffic.
+fn rulesConflict(a: *const ResolvedRule, b: *const ResolvedRule) ?ForwardProtocol {
+    for (a.effectiveProtocols()) |protocol| {
+        var shared_protocol = false;
+        for (b.effectiveProtocols()) |other| {
+            if (protocol == other) {
+                shared_protocol = true;
+                break;
+            }
+        }
+        if (!shared_protocol) continue;
+        for (a.listen_addresses) |addr_a| {
+            for (b.listen_addresses) |addr_b| {
+                if (addr_a.eql(addr_b)) return protocol;
+            }
+        }
+    }
+    return null;
 }
 
 /// Default resolver: IP literals are parsed directly, everything else goes
@@ -1643,10 +2362,360 @@ test "config.example.yaml parses with expected values" {
         \\#   udpIOThreads: auto              # UDP relay threads; auto = worker count
         \\# logging:
         \\#   level: info
+        \\# Optional rules plugin (disabled unless written): multiple independent
+        \\# listen -> upstreams rules in one process. Cannot be combined with the
+        \\# top-level listen/upstream above.
+        \\# rules:
+        \\#   - listen: { host: "*", port: 9000 }
+        \\#     upstreams:
+        \\#       - { host: "a.example.com", port: 9000 }
+        \\#       - { host: "b.example.com", port: 9000, weight: 2 }
+        \\#     balance: round_robin
         \\
     );
     defer loaded.deinit();
     try testing.expectEqual(9000, loaded.value.listen.port);
     try testing.expectEqualStrings("example.com", loaded.value.upstream.host);
     try testing.expectEqual(9000, loaded.value.upstream.port);
+}
+
+// ---------------------------------------------------------------------------
+// Rules plugin tests
+// ---------------------------------------------------------------------------
+
+fn loadAnyForTest(text: []const u8) !AnyConfiguration {
+    var diag = Diagnostics{};
+    return loadAnyYaml(testing.allocator, text, &diag) catch |err| {
+        if (diag.message) |message| {
+            std.debug.print("unexpected load failure: {s}\n", .{message});
+            testing.allocator.free(message);
+        }
+        return err;
+    };
+}
+
+fn expectAnyLoadFailure(text: []const u8, expected_message: ?[]const u8) !void {
+    var diag = Diagnostics{};
+    const result = loadAnyYaml(testing.allocator, text, &diag);
+    if (result) |any_value| {
+        var any = any_value;
+        any.deinit();
+        return error.TestExpectedFailureButLoaded;
+    } else |_| {}
+    if (expected_message) |expected| {
+        try testing.expectEqualStrings(expected, diag.message.?);
+    }
+    if (diag.message) |message| testing.allocator.free(message);
+}
+
+test "loadAny selects the legacy model without a rules key" {
+    var any = try loadAnyForTest(
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9001 }
+        \\
+    );
+    defer any.deinit();
+    switch (any) {
+        .single => |loaded| {
+            try testing.expectEqual(9000, loaded.value.listen.port);
+            try testing.expectEqualStrings("localhost", loaded.value.upstream.host);
+        },
+        .rules => return error.TestUnexpectedRulesMode,
+    }
+}
+
+test "loads rules with defaults and inheritance" {
+    var any = try loadAnyForTest(
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    upstreams:
+        \\      - { host: "a.example.com" }
+        \\      - { host: "b.example.com", port: 9001, weight: 3 }
+        \\  - listen: { host: "127.0.0.1", port: 53 }
+        \\    protocols: [udp]
+        \\    upstreams: [ { host: "8.8.8.8", port: 53 } ]
+        \\
+    );
+    defer any.deinit();
+    const configuration = switch (any) {
+        .rules => |loaded| loaded.value,
+        .single => return error.TestUnexpectedSingleMode,
+    };
+
+    try testing.expectEqual(1, configuration.version);
+    try testing.expectEqualSlices(ForwardProtocol, &.{ .tcp, .udp }, configuration.protocols);
+    try testing.expectEqual(@as(usize, 2), configuration.rules.len);
+
+    const first = configuration.rules[0];
+    try testing.expectEqualStrings("*", first.listen.host);
+    try testing.expectEqual(9000, first.listen.port);
+    try testing.expect(first.protocols == null);
+    try testing.expectEqual(BalancePolicy.round_robin, first.balance);
+    try testing.expectEqual(@as(usize, 2), first.upstreams.len);
+    try testing.expectEqualStrings("a.example.com", first.upstreams[0].host);
+    try testing.expectEqual(9000, first.upstreams[0].port); // defaults to the rule listen port
+    try testing.expectEqual(1, first.upstreams[0].weight);
+    try testing.expectEqualStrings("b.example.com", first.upstreams[1].host);
+    try testing.expectEqual(9001, first.upstreams[1].port);
+    try testing.expectEqual(3, first.upstreams[1].weight);
+
+    const second = configuration.rules[1];
+    try testing.expectEqualStrings("127.0.0.1", second.listen.host);
+    try testing.expectEqualSlices(ForwardProtocol, &.{.udp}, second.protocols.?);
+    try testing.expectEqual(@as(usize, 1), second.upstreams.len);
+}
+
+test "loads rule overrides and global sections" {
+    var any = try loadAnyForTest(
+        \\protocols: [tcp]
+        \\timeouts: { connectSeconds: 8, tcpIdleSeconds: 100 }
+        \\limits: { maxTCPBufferedBytes: 1048576 }
+        \\runtime: { workerThreads: 2 }
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    balance: source_hash
+        \\    upstreams: [ { host: "a" } ]
+        \\    timeouts: { tcpIdleSeconds: 600 }
+        \\    limits: { maxTCPBufferedBytes: 8388608, maxUDPAssociations: 128 }
+        \\  - listen: { port: 9001 }
+        \\    balance: weighted_round_robin
+        \\    upstreams: [ { host: "b" } ]
+        \\
+    );
+    defer any.deinit();
+    const configuration = switch (any) {
+        .rules => |loaded| loaded.value,
+        .single => return error.TestUnexpectedSingleMode,
+    };
+
+    try testing.expectEqualSlices(ForwardProtocol, &.{.tcp}, configuration.protocols);
+    try testing.expectEqual(8, configuration.timeouts.connect_seconds);
+    try testing.expectEqual(100, configuration.timeouts.tcp_idle_seconds);
+    try testing.expectEqual(1_048_576, configuration.limits.max_tcp_buffered_bytes);
+    try testing.expectEqual(2, configuration.runtime.worker_threads);
+
+    const first = configuration.rules[0];
+    try testing.expectEqual(BalancePolicy.source_hash, first.balance);
+    try testing.expectEqual(@as(?i64, 600), first.timeouts.tcp_idle_seconds);
+    try testing.expect(first.timeouts.connect_seconds == null);
+    try testing.expectEqual(@as(?i64, 8_388_608), first.limits.max_tcp_buffered_bytes);
+    try testing.expectEqual(@as(?i64, 128), first.limits.max_udp_associations);
+    try testing.expect(first.limits.tcp_listen_backlog == null);
+
+    try testing.expectEqual(BalancePolicy.weighted_round_robin, configuration.rules[1].balance);
+}
+
+test "effective rule configuration merges overrides" {
+    var any = try loadAnyForTest(
+        \\timeouts: { connectSeconds: 8 }
+        \\limits: { maxTCPBufferedBytes: 1048576 }
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    upstreams: [ { host: "a" } ]
+        \\    timeouts: { tcpIdleSeconds: 600 }
+        \\    limits: { maxTCPBufferedBytes: 8388608 }
+        \\
+    );
+    defer any.deinit();
+    const configuration = switch (any) {
+        .rules => |loaded| loaded.value,
+        .single => return error.TestUnexpectedSingleMode,
+    };
+
+    const effective = effectiveRuleConfiguration(configuration, configuration.rules[0]);
+    try testing.expectEqual(8, effective.timeouts.connect_seconds);
+    try testing.expectEqual(600, effective.timeouts.tcp_idle_seconds);
+    try testing.expectEqual(8_388_608, effective.limits.max_tcp_buffered_bytes);
+    try testing.expect(!effective.limits.auto_tuning.max_tcp_buffered_bytes);
+    try testing.expect(effective.limits.auto_tuning.max_udp_associations);
+    try testing.expectEqualStrings("a", effective.upstream.host);
+    try testing.expectEqual(9000, effective.upstream.port);
+}
+
+test "rejects rules mixed with legacy endpoints" {
+    try expectAnyLoadFailure(
+        \\listen: { port: 9000 }
+        \\rules:
+        \\  - listen: { port: 9001 }
+        \\    upstreams: [ { host: "a" } ]
+        \\
+    , "configuration cannot mix listen/upstream with rules");
+}
+
+test "rejects unknown keys inside rules with indexed paths" {
+    try expectAnyLoadFailure(
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    upstreams: [ { host: "a" } ]
+        \\    bogus: 1
+        \\
+    , "unknown configuration key: rules[0].bogus");
+
+    try expectAnyLoadFailure(
+        \\rules:
+        \\  - listen: { port: 9000, typo: 1 }
+        \\    upstreams: [ { host: "a" } ]
+        \\
+    , "unknown configuration key: rules[0].listen.typo");
+
+    try expectAnyLoadFailure(
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    upstreams: [ { host: "a", typo: 1 } ]
+        \\
+    , "unknown configuration key: rules[0].upstreams[0].typo");
+
+    try expectAnyLoadFailure(
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    upstreams: [ { host: "a" } ]
+        \\    timeouts: { shutdownGraceSeconds: 5 }
+        \\
+    , "unknown configuration key: rules[0].timeouts.shutdownGraceSeconds");
+
+    try expectAnyLoadFailure(
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    upstreams: [ { host: "a" } ]
+        \\    limits: { maxUDPPendingBytes: 4096 }
+        \\
+    , "unknown configuration key: rules[0].limits.maxUDPPendingBytes");
+}
+
+test "rejects invalid rules values" {
+    const cases = [_]struct { yaml: []const u8, message: []const u8 }{
+        .{ .yaml = "rules: []\n", .message = "rules must not be empty" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n", .message = "missing required key: rules[0].upstreams" },
+        .{ .yaml = "rules:\n  - upstreams: [ { host: \"a\" } ]\n", .message = "missing required key: rules[0].listen" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: []\n", .message = "rules[0].upstreams must not be empty" },
+        .{ .yaml = "rules:\n  - listen: { port: 0 }\n    upstreams: [ { host: \"a\" } ]\n", .message = "rules[0].listen.port must be between 1 and 65535" },
+        .{ .yaml = "rules:\n  - listen: { host: \" \", port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n", .message = "rules[0].listen.host must not be empty" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\", port: 0 } ]\n", .message = "rules[0].upstreams[0].port must be between 1 and 65535" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\", weight: 0 } ]\n", .message = "rules[0].upstreams[0].weight must be between 1 and 65535" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\", weight: 65536 } ]\n", .message = "rules[0].upstreams[0].weight must be between 1 and 65535" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    balance: nearest\n", .message = "rules[0].balance: expected one of round_robin, source_hash, weighted_round_robin" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    protocols: []\n", .message = "rules[0].protocols must not be empty" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    protocols: [tcp, tcp]\n", .message = "rules[0].protocols must not contain duplicates" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    timeouts: { tcpIdleSeconds: 0 }\n", .message = "rules[0].timeouts.tcpIdleSeconds must be positive" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    timeouts: { connectSeconds: 9223372037 }\n", .message = "rules[0].timeouts.connectSeconds must be no greater than 9223372036 seconds" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    limits: { tcpListenBacklog: 0 }\n", .message = "rules[0].limits.tcpListenBacklog must be between 1 and 2147483647" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    limits: { maxTCPBufferedBytes: 0 }\n", .message = "rules[0].limits.maxTCPBufferedBytes must be positive" },
+        .{ .yaml = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    limits: { maxUDPAssociations: 0 }\n", .message = "rules[0].limits.maxUDPAssociations must be between 1 and 2147483647" },
+        .{ .yaml = "version: 2\nrules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n", .message = "unsupported configuration version: 2" },
+    };
+    for (cases) |case| {
+        try expectAnyLoadFailure(case.yaml, case.message);
+    }
+}
+
+fn resolveRulesForTest(text: []const u8, resolver: ?Resolver) !struct { any: AnyConfiguration, resolved: ResolvedRulesConfiguration } {
+    var any = try loadAnyForTest(text);
+    errdefer any.deinit();
+    switch (any) {
+        .single => return error.TestUnexpectedSingleMode,
+        .rules => |*loaded| {
+            var diag = Diagnostics{};
+            const resolved = resolveRulesConfiguration(
+                testing.allocator,
+                loaded.arena.allocator(),
+                loaded.value,
+                resolver,
+                &diag,
+            ) catch |err| {
+                if (diag.message) |message| {
+                    std.debug.print("unexpected resolve failure: {s}\n", .{message});
+                    testing.allocator.free(message);
+                }
+                return err;
+            };
+            return .{ .any = any, .resolved = resolved };
+        },
+    }
+}
+
+test "resolves rules listen and upstream addresses" {
+    const result = try resolveRulesForTest(
+        \\rules:
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    upstreams:
+        \\      - { host: "127.0.0.2", port: 9001 }
+        \\      - { host: "::1", port: 9002 }
+        \\  - listen: { host: "*", port: 5353 }
+        \\    protocols: [udp]
+        \\    upstreams: [ { host: "127.0.0.3", port: 53 } ]
+        \\
+    , null);
+    var any = result.any;
+    defer any.deinit();
+
+    const first = result.resolved.rules[0];
+    try testing.expectEqual(@as(usize, 1), first.listen_addresses.len);
+    try testing.expectEqual(@as(u16, 9000), first.listen_addresses[0].port);
+    try testing.expectEqual(@as(usize, 2), first.upstream_addresses.len);
+    try testing.expectEqual(SocketAddr.Family.v4, first.upstream_addresses[0].family);
+    try testing.expectEqual(@as(u16, 9001), first.upstream_addresses[0].port);
+    try testing.expectEqual(SocketAddr.Family.v6, first.upstream_addresses[1].family);
+
+    const second = result.resolved.rules[1];
+    try testing.expectEqual(@as(usize, 2), second.listen_addresses.len);
+    try testing.expectEqual(@as(u16, 5353), second.listen_addresses[1].port);
+    try testing.expectEqualSlices(ForwardProtocol, &.{.udp}, second.effectiveProtocols());
+}
+
+fn expectRulesResolveFailure(text: []const u8, expected_message: []const u8) !void {
+    var any = try loadAnyForTest(text);
+    defer any.deinit();
+    switch (any) {
+        .single => return error.TestUnexpectedSingleMode,
+        .rules => |*loaded| {
+            var diag = Diagnostics{};
+            const result = resolveRulesConfiguration(
+                testing.allocator,
+                loaded.arena.allocator(),
+                loaded.value,
+                null,
+                &diag,
+            );
+            if (result) |_| return error.TestExpectedFailureButResolved else |_| {}
+            try testing.expectEqualStrings(expected_message, diag.message.?);
+            if (diag.message) |message| testing.allocator.free(message);
+        },
+    }
+}
+
+test "rejects rules sharing a listen address and protocol" {
+    try expectRulesResolveFailure(
+        \\rules:
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    upstreams: [ { host: "127.0.0.2", port: 9001 } ]
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    upstreams: [ { host: "127.0.0.3", port: 9001 } ]
+        \\
+    , "rules 0 and 1 listen on the same address for protocol tcp");
+
+    try expectRulesResolveFailure(
+        \\rules:
+        \\  - listen: { host: "*", port: 9000 }
+        \\    upstreams: [ { host: "127.0.0.2", port: 9001 } ]
+        \\  - listen: { host: "0.0.0.0", port: 9000 }
+        \\    protocols: [udp]
+        \\    upstreams: [ { host: "127.0.0.3", port: 9001 } ]
+        \\
+    , "rules 0 and 1 listen on the same address for protocol udp");
+}
+
+test "allows rules sharing an address across disjoint protocols" {
+    const result = try resolveRulesForTest(
+        \\rules:
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    protocols: [tcp]
+        \\    upstreams: [ { host: "127.0.0.2", port: 9001 } ]
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    protocols: [udp]
+        \\    upstreams: [ { host: "127.0.0.3", port: 9001 } ]
+        \\
+    , null);
+    var any = result.any;
+    defer any.deinit();
+    try testing.expectEqual(@as(usize, 2), result.resolved.rules.len);
 }

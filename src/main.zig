@@ -13,6 +13,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const log = @import("log.zig");
+const rules_service = @import("rules_service.zig");
 const service = @import("service.zig");
 
 const version = "0.3.1";
@@ -43,17 +44,26 @@ pub fn main(init: std.process.Init) u8 {
     var diag = config.Diagnostics{};
     defer if (diag.message) |message| gpa.free(message);
 
-    var loaded = config.loadFile(gpa, options.config_path, &diag) catch {
+    var any = config.loadAnyFile(gpa, options.config_path, &diag) catch {
         reportConfigError(&diag);
         return 2;
     };
+    switch (any) {
+        .single => |*single| return runSingle(gpa, options, single.*, &diag),
+        .rules => |*rules| return runRules(gpa, options, rules.*, &diag),
+    }
+}
+
+/// Legacy single-rule mode: the original ForwarderService path.
+fn runSingle(gpa: std.mem.Allocator, options: Options, loaded: config.LoadedConfiguration, diag: *config.Diagnostics) u8 {
+    var owned = loaded;
     var owns_loaded = true;
-    defer if (owns_loaded) loaded.deinit();
+    defer if (owns_loaded) owned.deinit();
 
     // Resolve listen/upstream addresses before reporting success, so an
     // unresolvable host fails --check-config too.
-    const resolved = config.resolveConfiguration(gpa, loaded.arena.allocator(), loaded.value, null, &diag) catch {
-        reportConfigError(&diag);
+    const resolved = config.resolveConfiguration(gpa, owned.arena.allocator(), owned.value, null, diag) catch {
+        reportConfigError(diag);
         return 2;
     };
 
@@ -62,7 +72,34 @@ pub fn main(init: std.process.Init) u8 {
         return 0;
     }
 
-    var runtime = service.ForwarderService.init(gpa, options.config_path, loaded, resolved);
+    var runtime = service.ForwarderService.init(gpa, options.config_path, owned, resolved);
+    owns_loaded = false;
+    runtime.run() catch |err| {
+        writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});
+        runtime.deinit();
+        return 1;
+    };
+    runtime.deinit();
+    return 0;
+}
+
+/// Rules plugin mode (top-level `rules` list in the configuration).
+fn runRules(gpa: std.mem.Allocator, options: Options, loaded: config.LoadedRulesConfiguration, diag: *config.Diagnostics) u8 {
+    var owned = loaded;
+    var owns_loaded = true;
+    defer if (owns_loaded) owned.deinit();
+
+    const resolved = config.resolveRulesConfiguration(gpa, owned.arena.allocator(), owned.value, null, diag) catch {
+        reportConfigError(diag);
+        return 2;
+    };
+
+    if (options.check_config) {
+        writeOut("configuration is valid\n", .{});
+        return 0;
+    }
+
+    var runtime = rules_service.RulesService.init(gpa, options.config_path, owned, resolved);
     owns_loaded = false;
     runtime.run() catch |err| {
         writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});
@@ -134,5 +171,7 @@ test {
     _ = config;
     _ = log;
     _ = @import("autotune.zig");
+    _ = @import("upstream_pool.zig");
+    _ = rules_service;
     _ = service;
 }
