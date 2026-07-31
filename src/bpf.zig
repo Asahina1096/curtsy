@@ -627,13 +627,20 @@ fn readUintFromFile(path: [*:0]const u8) Error!i32 {
     return std.fmt.parseInt(i32, text, 10) catch errnoError(.INVAL);
 }
 
+/// All kprobe attaches happen on the tuning thread; cache the PMU type
+/// instead of re-reading the sysfs file for every probe.
+threadlocal var cached_kprobe_type: i32 = -1;
+
 /// Attaches the program to a kprobe PMU event on every online CPU
 /// (pid == -1 with cpu == -1 is rejected by perf_event_open). Returns the
 /// per-CPU event fds (allocated with the C allocator; owned by the caller).
 fn attachKprobe(program_fd: fd_t, function_name: [:0]const u8) Error![]fd_t {
-    const kprobe_type = readUintFromFile("/sys/bus/event_source/devices/kprobe/type") catch {
-        return errnoError(.OPNOTSUPP);
-    };
+    if (cached_kprobe_type < 0) {
+        cached_kprobe_type = readUintFromFile("/sys/bus/event_source/devices/kprobe/type") catch {
+            return errnoError(.OPNOTSUPP);
+        };
+    }
+    const kprobe_type = cached_kprobe_type;
     if (kprobe_type < 0) return errnoError(.OPNOTSUPP);
 
     const cpu_count = std.Thread.getCpuCount() catch return errnoError(.OPNOTSUPP);
@@ -695,38 +702,59 @@ pub const UdpSlot = extern struct {
 /// or was interrupted (matching the C contract).
 pub fn udpRecvBatch(fd: fd_t, slots: []UdpSlot) Error!usize {
     if (slots.len == 0) return errnoError(.INVAL);
-    var headers: [udp_batch_capacity]linux.mmsghdr = undefined;
-    var vectors: [udp_batch_capacity]posix.iovec = undefined;
-    const count = @min(slots.len, udp_batch_capacity);
-    for (slots[0..count], 0..) |*slot, i| {
-        vectors[i] = .{ .base = slot.data, .len = slot.capacity };
-        headers[i] = .{
-            .hdr = .{
-                .name = @ptrCast(&slot.address),
-                .namelen = @sizeOf(posix.sockaddr.storage),
-                .iov = @ptrCast(&vectors[i]),
-                .iovlen = 1,
-                .control = null,
-                .controllen = 0,
-                .flags = 0,
-            },
-            .len = 0,
-        };
-    }
-    const rc = linux.recvmmsg(fd, &headers, @intCast(count), linux.MSG.DONTWAIT, null);
-    const e = linux.errno(rc);
-    switch (e) {
-        .SUCCESS => {},
-        .AGAIN, .INTR => return 0,
-        else => return errnoError(e),
-    }
-    const received: usize = @intCast(rc);
-    for (slots[0..received], 0..) |*slot, i| {
-        slot.length = headers[i].len;
-        slot.address_length = headers[i].hdr.namelen;
-    }
-    return received;
+    var io: UdpRecvBatchIo = undefined;
+    io.init(slots);
+    return io.recv(fd, slots);
 }
+
+/// Reusable recvmmsg header set for a fixed slot array: slot data pointers
+/// never change between calls, so only the per-call fields (namelen, len)
+/// are reset instead of rebuilding all 64 headers every batch.
+pub const UdpRecvBatchIo = struct {
+    headers: [udp_batch_capacity]linux.mmsghdr = undefined,
+    vectors: [udp_batch_capacity]posix.iovec = undefined,
+
+    pub fn init(self: *UdpRecvBatchIo, slots: []const UdpSlot) void {
+        const count = @min(slots.len, udp_batch_capacity);
+        for (slots[0..count], 0..) |*slot, i| {
+            self.vectors[i] = .{ .base = slot.data, .len = slot.capacity };
+            self.headers[i] = .{
+                .hdr = .{
+                    .name = @ptrCast(@constCast(&slot.address)),
+                    .namelen = @sizeOf(posix.sockaddr.storage),
+                    .iov = @ptrCast(&self.vectors[i]),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+        }
+    }
+
+    pub fn recv(self: *UdpRecvBatchIo, fd: fd_t, slots: []UdpSlot) Error!usize {
+        if (slots.len == 0) return errnoError(.INVAL);
+        const count = @min(slots.len, udp_batch_capacity);
+        for (self.headers[0..count]) |*header| {
+            header.hdr.namelen = @sizeOf(posix.sockaddr.storage);
+            header.len = 0;
+        }
+        const rc = linux.recvmmsg(fd, &self.headers, @intCast(count), linux.MSG.DONTWAIT, null);
+        const e = linux.errno(rc);
+        switch (e) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => return 0,
+            else => return errnoError(e),
+        }
+        const received: usize = @intCast(rc);
+        for (slots[0..received], 0..) |*slot, i| {
+            slot.length = self.headers[i].len;
+            slot.address_length = self.headers[i].hdr.namelen;
+        }
+        return received;
+    }
+};
 
 /// Sends slots.len datagrams (at most 64) described by slots (data/length
 /// only) to address. Pass address == null for connected sockets. Returns
@@ -883,7 +911,12 @@ pub fn udpConnectedClientSocket(
     // set it too, otherwise this bind fails with EADDRINUSE. Connected
     // sockets never join wildcard delivery: the kernel exact-matches their
     // four-tuple first, so only their peer's datagrams land here.
-    try setReuseOptions(fd, bind_address.family);
+    // SO_REUSEADDR is not needed for a connected four-tuple socket.
+    const yes: i32 = 1;
+    _ = try sys(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&yes), @sizeOf(i32)));
+    if (bind_address.family == linux.AF.INET6) {
+        _ = try sys(linux.setsockopt(fd, linux.SOL.IPV6, linux.IPV6.V6ONLY, std.mem.asBytes(&yes), @sizeOf(i32)));
+    }
     _ = try sys(linux.bind(fd, bind_address, bind_address_length));
     _ = try sys(linux.connect(fd, peer_address, peer_address_length));
     return fd;

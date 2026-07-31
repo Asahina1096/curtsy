@@ -5,9 +5,9 @@
 //! is "*"). Accepted clients and their upstream connections live on the same
 //! worker loop. The relay provides:
 //!
-//! - adaptive read chunks of 32..112 KiB (below the glibc 128 KiB mmap
-//!   threshold), at most 8 reads per readiness event, immediate writes with
-//!   leftovers queued per connection;
+//! - adaptive read chunks of 64..256 KiB, at most 8 reads per readiness
+//!   event, a per-worker splice(2) zero-copy fast path, and buffered fallback
+//!   when the destination applies backpressure;
 //! - watermark backpressure: reading from a peer pauses when the outbound
 //!   queue exceeds 2 MiB and resumes below 1 MiB;
 //! - a global TCPBufferBudget caps queued userspace bytes across all workers;
@@ -45,11 +45,11 @@ fn failWith(e: linux.E) Error {
 
 const Error = error{SystemCall};
 
-/// Reads stay below glibc's 128 KiB mmap threshold so buffers come from the
-/// heap free list.
-const min_read_chunk: usize = 32 * 1_024;
-const initial_read_chunk: usize = 64 * 1_024;
-const max_read_chunk: usize = 112 * 1_024;
+/// Read buffers are allocated once per worker, so larger chunks reduce
+/// syscall pressure without creating per-read allocator churn.
+const min_read_chunk: usize = 64 * 1_024;
+const initial_read_chunk: usize = 128 * 1_024;
+const max_read_chunk: usize = 256 * 1_024;
 
 /// At most one full read batch per readiness event.
 const max_reads_per_event: usize = 8;
@@ -65,6 +65,14 @@ const pending_shrink_capacity: usize = 256 * 1_024;
 
 const max_accept_per_event: usize = 128;
 const sweep_interval_ns: u64 = 1_000_000_000;
+const max_events_per_wait: usize = 1024;
+/// Connections kept in the worker-local reuse pool to avoid malloc/free churn
+/// on short-lived connection bursts.
+const max_pooled_connections: usize = 256;
+
+const splice_f_move: u32 = 0x01;
+const splice_f_nonblock: u32 = 0x02;
+const splice_f_more: u32 = 0x04;
 
 fn monotonicNowNs() u64 {
     var ts: linux.timespec = undefined;
@@ -86,6 +94,19 @@ fn sleepNs(ns: u64) void {
 
 fn closeFd(fd: fd_t) void {
     _ = linux.close(fd);
+}
+
+fn spliceNonBlocking(fd_in: fd_t, fd_out: fd_t, len: usize, more: bool) usize {
+    const flags = splice_f_move | splice_f_nonblock | (if (more) splice_f_more else 0);
+    return linux.syscall6(
+        .splice,
+        @as(usize, @bitCast(@as(isize, fd_in))),
+        0,
+        @as(usize, @bitCast(@as(isize, fd_out))),
+        0,
+        len,
+        flags,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +404,7 @@ pub const TCPListener = struct {
             for (self.workers[0..initialized_workers]) |*worker| {
                 if (worker.epoll_fd >= 0) closeFd(worker.epoll_fd);
                 if (worker.wake_fd >= 0) closeFd(worker.wake_fd);
+                worker.closeSplicePipe();
                 if (worker.read_buffer.len > 0) allocator.free(worker.read_buffer);
             }
             allocator.free(self.bound_addresses);
@@ -443,6 +465,7 @@ pub const TCPListener = struct {
                 return error.StartFailed;
             };
             self.workers[worker_index].read_buffer = try allocator.alloc(u8, max_read_chunk);
+            self.workers[worker_index].initSplicePipe();
             initialized_workers += 1;
 
             const worker = &self.workers[worker_index];
@@ -661,9 +684,55 @@ const Worker = struct {
     stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     connections: ?*Connection = null,
     zombies: ?*Connection = null,
+    /// Worker-local freelist of dead Connection objects (linked through
+    /// zombie_next); avoids malloc/free per accept/close cycle.
+    connection_pool: ?*Connection = null,
+    connection_pool_count: usize = 0,
+    /// Earliest timer deadline across all connections, recomputed lazily.
+    /// Connection deadlines only move later on activity, so a stale (earlier)
+    /// cache is safe: it can only cause an extra wake, never a missed one.
+    cached_deadline_ns: u64 = std.math.maxInt(u64),
+    deadline_cache_dirty: bool = true,
+    next_sweep_ns: u64 = 0,
     read_buffer: []u8 = &.{},
+    /// Shared by this worker only. The pipe is always empty between dispatches;
+    /// any bytes that hit destination backpressure are copied into the normal
+    /// budgeted queue before relaySplice returns.
+    splice_pipe: [2]fd_t = .{ -1, -1 },
+    splice_capacity: usize = 0,
 
     const wake_tag: u64 = 0;
+
+    fn initSplicePipe(self: *Worker) void {
+        var pipe_fds: [2]fd_t = undefined;
+        const rc = linux.pipe2(&pipe_fds, .{ .NONBLOCK = true, .CLOEXEC = true });
+        if (linux.errno(rc) != .SUCCESS) {
+            self.listener.logger.warning("tcp splice unavailable; using buffered relay worker={d} errno={s}", .{
+                self.index, @tagName(linux.errno(rc)),
+            });
+            return;
+        }
+        self.splice_pipe = pipe_fds;
+
+        // Growing the pipe is an optimization only. Unprivileged processes
+        // may be capped below max_read_chunk; GETPIPE_SZ records the actual
+        // value so each splice request always fits in the empty pipe.
+        _ = linux.fcntl(pipe_fds[1], linux.F.SETPIPE_SZ, max_read_chunk);
+        const capacity_rc = linux.fcntl(pipe_fds[1], linux.F.GETPIPE_SZ, 0);
+        if (linux.errno(capacity_rc) == .SUCCESS) {
+            self.splice_capacity = @intCast(capacity_rc);
+        } else {
+            self.splice_capacity = min_read_chunk;
+        }
+    }
+
+    fn closeSplicePipe(self: *Worker) void {
+        for (&self.splice_pipe) |*fd| {
+            if (fd.* >= 0) closeFd(fd.*);
+            fd.* = -1;
+        }
+        self.splice_capacity = 0;
+    }
 
     fn registerWake(self: *Worker) Error!void {
         var event = linux.epoll_event{
@@ -684,9 +753,10 @@ const Worker = struct {
     }
 
     fn main(self: *Worker) void {
-        var events: [128]linux.epoll_event = undefined;
+        var events: [max_events_per_wait]linux.epoll_event = undefined;
+        var now = monotonicNowNs();
         while (!self.stopping.load(.acquire)) {
-            const timeout_ms = self.computeTimeoutMs();
+            const timeout_ms = self.computeTimeoutMs(now);
             const rc = linux.epoll_wait(self.epoll_fd, &events, events.len, timeout_ms);
             const errno = linux.errno(rc);
             switch (errno) {
@@ -700,17 +770,18 @@ const Worker = struct {
                 },
             }
             const count: usize = @intCast(rc);
+            now = monotonicNowNs();
             for (events[0..count]) |event| {
-                self.dispatch(event);
+                self.dispatch(event, now);
             }
             self.applyCommands();
-            self.sweepTimers();
+            self.maybeSweepTimers(now);
             self.freeZombies();
         }
         self.teardown();
     }
 
-    fn dispatch(self: *Worker, event: linux.epoll_event) void {
+    fn dispatch(self: *Worker, event: linux.epoll_event, now: u64) void {
         const tag = event.data.u64;
         if (tag == wake_tag) {
             bpf.eventfdDrain(self.wake_fd);
@@ -719,14 +790,14 @@ const Worker = struct {
         if (tag & 1 == 1) {
             const address_index: usize = @intCast(tag >> 1);
             if (address_index < self.listen_fds.len and self.listen_fds[address_index] >= 0) {
-                self.acceptLoop(address_index);
+                self.acceptLoop(address_index, now);
             }
             return;
         }
         const endpoint: *Endpoint = @ptrFromInt(tag);
         const connection = endpoint.connection;
         if (connection.dead) return;
-        self.handleEndpointEvent(endpoint, event.events);
+        self.handleEndpointEvent(endpoint, event.events, now);
     }
 
     /// Late commands from the listener: stop accepting (close listen sockets)
@@ -750,9 +821,19 @@ const Worker = struct {
         }
     }
 
-    fn computeTimeoutMs(self: *Worker) i32 {
-        const now = monotonicNowNs();
-        var next_deadline = now + sweep_interval_ns;
+    fn computeTimeoutMs(self: *Worker, now: u64) i32 {
+        if (self.deadline_cache_dirty) self.refreshDeadlineCache();
+        const next_deadline = @min(self.cached_deadline_ns, self.next_sweep_ns);
+        if (next_deadline <= now) return 0;
+        const delta_ms = (next_deadline - now + 999_999) / 1_000_000;
+        return @intCast(@min(delta_ms, sweep_interval_ns / 1_000_000));
+    }
+
+    /// Full O(N) scan for the earliest connection deadline. Runs at most once
+    /// per actual deadline arrival (or once per sweep) instead of once per
+    /// epoll wake, because deadlines only move later between scans.
+    fn refreshDeadlineCache(self: *Worker) void {
+        var next_deadline: u64 = std.math.maxInt(u64);
         var current = self.connections;
         while (current) |connection| : (current = connection.next) {
             const deadline = switch (connection.mode) {
@@ -762,13 +843,22 @@ const Worker = struct {
             };
             next_deadline = @min(next_deadline, deadline);
         }
-        if (next_deadline <= now) return 0;
-        const delta_ms = (next_deadline - now + 999_999) / 1_000_000;
-        return @intCast(@min(delta_ms, sweep_interval_ns / 1_000_000));
+        self.cached_deadline_ns = next_deadline;
+        self.deadline_cache_dirty = false;
     }
 
-    fn sweepTimers(self: *Worker) void {
-        const now = monotonicNowNs();
+    /// Sweeps connection timers at most once per sweep_interval_ns, plus
+    /// promptly whenever a real deadline has arrived.
+    fn maybeSweepTimers(self: *Worker, now: u64) void {
+        if (self.deadline_cache_dirty) self.refreshDeadlineCache();
+        if (now >= self.next_sweep_ns or now >= self.cached_deadline_ns) {
+            self.sweepTimers(now);
+            self.refreshDeadlineCache();
+            self.next_sweep_ns = now + sweep_interval_ns;
+        }
+    }
+
+    fn sweepTimers(self: *Worker, now: u64) void {
         var current = self.connections;
         while (current) |connection| {
             current = connection.next;
@@ -818,7 +908,7 @@ const Worker = struct {
     // Accept and upstream connect
     // ------------------------------------------------------------------
 
-    fn acceptLoop(self: *Worker, address_index: usize) void {
+    fn acceptLoop(self: *Worker, address_index: usize, now: u64) void {
         const listen_fd = self.listen_fds[address_index];
         var accepted: usize = 0;
         while (accepted < max_accept_per_event) : (accepted += 1) {
@@ -839,11 +929,30 @@ const Worker = struct {
                 closeFd(client_fd);
                 return;
             }
-            self.setupConnection(client_fd, &storage);
+            self.setupConnection(client_fd, &storage, now);
         }
     }
 
-    fn setupConnection(self: *Worker, client_fd: fd_t, client_storage: *const linux.sockaddr.storage) void {
+    fn allocConnection(self: *Worker) ?*Connection {
+        if (self.connection_pool) |pooled| {
+            self.connection_pool = pooled.zombie_next;
+            self.connection_pool_count -= 1;
+            return pooled;
+        }
+        return allocator.create(Connection) catch null;
+    }
+
+    fn releaseConnection(self: *Worker, connection: *Connection) void {
+        if (self.connection_pool_count < max_pooled_connections) {
+            connection.zombie_next = self.connection_pool;
+            self.connection_pool = connection;
+            self.connection_pool_count += 1;
+        } else {
+            allocator.destroy(connection);
+        }
+    }
+
+    fn setupConnection(self: *Worker, client_fd: fd_t, client_storage: *const linux.sockaddr.storage, now: u64) void {
         const listener = self.listener;
         const yes: i32 = 1;
         _ = linux.setsockopt(client_fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&yes), @sizeOf(i32));
@@ -858,7 +967,7 @@ const Worker = struct {
             return;
         }
 
-        const connection = allocator.create(Connection) catch {
+        const connection = self.allocConnection() orelse {
             if (state.accelerator) |acc| acc.release();
             closeFd(client_fd);
             return;
@@ -868,7 +977,7 @@ const Worker = struct {
             .client = .{ .connection = connection, .fd = client_fd, .is_client = true },
             .upstream = .{ .connection = connection, .fd = -1, .is_client = false },
             .idle_ns = state.snapshot.idle_ns,
-            .last_activity_ns = monotonicNowNs(),
+            .last_activity_ns = now,
             .upstream_addr = state.snapshot.upstream,
             .accelerator = state.accelerator,
         };
@@ -913,16 +1022,17 @@ const Worker = struct {
         // Register both fds with the loop and link the connection.
         connection.next = self.connections;
         self.connections = connection;
+        self.deadline_cache_dirty = true;
         _ = listener.active_connections.fetchAdd(1, .release);
 
         self.registerEndpoint(&connection.client);
         self.registerEndpoint(&connection.upstream);
 
         if (connect_errno == .SUCCESS) {
-            self.onUpstreamConnected(connection);
+            self.onUpstreamConnected(connection, now);
         } else {
             connection.mode = .connecting;
-            connection.connect_deadline_ns = monotonicNowNs() + state.snapshot.connect_ns;
+            connection.connect_deadline_ns = now + state.snapshot.connect_ns;
             connection.upstream.want_write = true;
             self.updateMask(&connection.upstream);
         }
@@ -930,20 +1040,20 @@ const Worker = struct {
 
     /// Failure path before the connection entered the loop's bookkeeping.
     fn discardNewConnection(self: *Worker, connection: *Connection) void {
-        _ = self;
         if (connection.client.fd >= 0) closeFd(connection.client.fd);
         if (connection.upstream.fd >= 0) closeFd(connection.upstream.fd);
         if (connection.accelerator) |acc| acc.release();
-        allocator.destroy(connection);
+        self.releaseConnection(connection);
     }
 
-    fn onUpstreamConnected(self: *Worker, connection: *Connection) void {
+    fn onUpstreamConnected(self: *Worker, connection: *Connection, now: u64) void {
         const listener = self.listener;
+        self.deadline_cache_dirty = true; // deadline basis changes with the mode
         if (connection.accelerator) |accelerator_ref| {
             if (accelerator_ref.pair(connection.client.fd, connection.upstream.fd)) |pairing| {
                 connection.pairing = pairing;
                 connection.mode = .sockmap;
-                connection.sockmap_next_check_ns = monotonicNowNs() + connection.idle_ns;
+                connection.sockmap_next_check_ns = now + connection.idle_ns;
                 connection.client.read_wanted = true;
                 connection.upstream.read_wanted = true;
                 connection.upstream.want_write = false;
@@ -960,7 +1070,7 @@ const Worker = struct {
             }
         }
         connection.mode = .userspace;
-        connection.last_activity_ns = monotonicNowNs();
+        connection.last_activity_ns = now;
         connection.client.read_wanted = true;
         connection.upstream.read_wanted = true;
         connection.upstream.want_write = false;
@@ -975,14 +1085,14 @@ const Worker = struct {
     // Event handling
     // ------------------------------------------------------------------
 
-    fn handleEndpointEvent(self: *Worker, endpoint: *Endpoint, mask: u32) void {
+    fn handleEndpointEvent(self: *Worker, endpoint: *Endpoint, mask: u32, now: u64) void {
         const connection = endpoint.connection;
 
         if (connection.mode == .connecting) {
             // Only the upstream fd's writability matters; any client-side
             // event or error before the upstream is up tears the attempt down.
             if (!endpoint.is_client and mask & linux.EPOLL.OUT != 0) {
-                self.finishConnect(connection);
+                self.finishConnect(connection, now);
                 return;
             }
             if (mask & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP | linux.EPOLL.IN) != 0) {
@@ -999,18 +1109,18 @@ const Worker = struct {
             endpoint.read_open and endpoint.read_wanted)
         {
             switch (connection.mode) {
-                .userspace => self.relayRead(endpoint),
-                .sockmap => self.sockmapRead(endpoint),
+                .userspace => self.relayRead(endpoint, now),
+                .sockmap => self.sockmapRead(endpoint, now),
                 .connecting => unreachable,
             }
             if (connection.dead) return;
         }
         if (mask & linux.EPOLL.OUT != 0 and connection.mode != .connecting) {
-            self.flushPending(endpoint);
+            self.flushPending(endpoint, now);
         }
     }
 
-    fn finishConnect(self: *Worker, connection: *Connection) void {
+    fn finishConnect(self: *Worker, connection: *Connection, now: u64) void {
         var socket_error: i32 = 0;
         var length: linux.socklen_t = @sizeOf(i32);
         const rc = linux.getsockopt(connection.upstream.fd, linux.SOL.SOCKET, linux.SO.ERROR, std.mem.asBytes(&socket_error).ptr, &length);
@@ -1024,13 +1134,162 @@ const Worker = struct {
             self.killConnection(connection);
             return;
         }
-        self.onUpstreamConnected(connection);
+        self.onUpstreamConnected(connection, now);
     }
 
-    /// Userspace relay: read up to one batch from endpoint and forward to the
-    /// peer, pausing reads when the peer's outbound queue crosses the high
+    /// Userspace relay. Prefer socket -> pipe -> socket splice when the peer's
+    /// queue is empty, then fall back to the buffered path if splice is not
+    /// supported or ordering requires appending behind queued bytes.
+    fn relayRead(self: *Worker, endpoint: *Endpoint, now: u64) void {
+        if (self.relaySplice(endpoint, now)) return;
+        self.relayBuffered(endpoint, now);
+    }
+
+    /// Zero-copy fast path. The worker pipe is empty on entry and exit. If the
+    /// destination stops accepting data, the pipe remainder is copied into
+    /// the normal budgeted queue so epoll flushing preserves ordering.
+    fn relaySplice(self: *Worker, endpoint: *Endpoint, now: u64) bool {
+        if (self.splice_pipe[0] < 0 or self.splice_capacity == 0) return false;
+
+        const connection = endpoint.connection;
+        const peer = connection.peerOf(endpoint);
+        if (peer.pendingLen() != 0 or peer.fin_when_drained or peer.wr_shutdown) return false;
+
+        var reads: usize = 0;
+        var batch_bytes: usize = 0;
+        while (reads < max_reads_per_event) : (reads += 1) {
+            if (!endpoint.read_open or !endpoint.read_wanted) break;
+            if (peer.fin_when_drained or peer.wr_shutdown) {
+                self.killConnection(connection);
+                return true;
+            }
+
+            const request = @min(endpoint.read_chunk, self.splice_capacity);
+            const rc = spliceNonBlocking(endpoint.fd, self.splice_pipe[1], request, true);
+            const errno = linux.errno(rc);
+            if (errno != .SUCCESS) {
+                switch (errno) {
+                    .AGAIN => break,
+                    .INTR => continue,
+                    .INVAL, .NOSYS, .OPNOTSUPP => {
+                        // No bytes entered the pipe. Disable splice for this
+                        // worker and retry this event through buffered I/O.
+                        self.closeSplicePipe();
+                        return batch_bytes != 0;
+                    },
+                    else => {
+                        self.killConnection(connection);
+                        return true;
+                    },
+                }
+            }
+
+            const moved: usize = @intCast(rc);
+            if (moved == 0) {
+                self.onPeerEof(endpoint);
+                return true;
+            }
+            batch_bytes += moved;
+            connection.last_activity_ns = now;
+            if (endpoint.is_client) {
+                connection.bytes_to_upstream += @intCast(moved);
+            } else {
+                connection.bytes_to_client += @intCast(moved);
+            }
+
+            var remaining = moved;
+            while (remaining > 0) {
+                // No SPLICE_F_MORE on the outgoing side: it makes the kernel
+                // hold small segments, which penalizes request/response
+                // latency for marginal bulk-throughput gain.
+                const send_rc = spliceNonBlocking(self.splice_pipe[0], peer.fd, remaining, false);
+                const send_errno = linux.errno(send_rc);
+                if (send_errno != .SUCCESS) {
+                    switch (send_errno) {
+                        .AGAIN => break,
+                        .INTR => continue,
+                        else => {
+                            self.closeSplicePipe();
+                            self.killConnection(connection);
+                            return true;
+                        },
+                    }
+                }
+                const sent: usize = @intCast(send_rc);
+                if (sent == 0) break;
+                remaining -= sent;
+            }
+
+            if (remaining > 0) {
+                const budget = &self.listener.budget;
+                if (!budget.tryAcquire(remaining)) {
+                    self.discardPipeBytes(remaining);
+                    self.listener.logger.warning("tcp buffer budget exhausted limit={d}", .{budget.limit()});
+                    self.killConnection(connection);
+                    return true;
+                }
+                // Reserve queue space and read the pipe straight into it,
+                // avoiding the read_buffer bounce copy.
+                peer.pending.ensureUnusedCapacity(allocator, remaining) catch {
+                    budget.release(remaining);
+                    self.discardPipeBytes(remaining);
+                    self.killConnection(connection);
+                    return true;
+                };
+                if (!self.readPipeBytes(peer.pending.unusedCapacitySlice()[0..remaining])) {
+                    budget.release(remaining);
+                    self.killConnection(connection);
+                    return true;
+                }
+                peer.pending.items.len += remaining;
+                peer.budget_bytes += remaining;
+                self.updateMask(peer);
+                break;
+            }
+        }
+
+        if (batch_bytes > 0 and batch_bytes < endpoint.read_chunk / 2 and endpoint.read_chunk > min_read_chunk) {
+            endpoint.read_chunk = @max(endpoint.read_chunk / 2, min_read_chunk);
+        }
+        return true;
+    }
+
+    fn readPipeBytes(self: *Worker, destination: []u8) bool {
+        var read_total: usize = 0;
+        while (read_total < destination.len) {
+            const rc = linux.read(
+                self.splice_pipe[0],
+                destination.ptr + read_total,
+                destination.len - read_total,
+            );
+            const errno = linux.errno(rc);
+            if (errno != .SUCCESS) {
+                switch (errno) {
+                    .INTR => continue,
+                    else => {
+                        self.closeSplicePipe();
+                        return false;
+                    },
+                }
+            }
+            const count: usize = @intCast(rc);
+            if (count == 0) {
+                self.closeSplicePipe();
+                return false;
+            }
+            read_total += count;
+        }
+        return true;
+    }
+
+    fn discardPipeBytes(self: *Worker, byte_count: usize) void {
+        _ = self.readPipeBytes(self.read_buffer[0..byte_count]);
+    }
+
+    /// Buffered fallback: read up to one batch from endpoint and forward to
+    /// the peer, pausing reads when the peer's outbound queue crosses the high
     /// watermark.
-    fn relayRead(self: *Worker, endpoint: *Endpoint) void {
+    fn relayBuffered(self: *Worker, endpoint: *Endpoint, now: u64) void {
         const connection = endpoint.connection;
         const peer = connection.peerOf(endpoint);
         var reads: usize = 0;
@@ -1063,7 +1322,7 @@ const Worker = struct {
                 return;
             }
             batch_bytes += count;
-            connection.touch();
+            connection.last_activity_ns = now;
             if (endpoint.is_client) {
                 connection.bytes_to_upstream += @intCast(count);
             } else {
@@ -1072,7 +1331,7 @@ const Worker = struct {
             if (!self.deliver(peer, self.read_buffer[0..count])) return;
 
             // Adaptive chunk: grow when reads fill the buffer, shrink when a
-            // batch is mostly idle (32..112 KiB, below the mmap threshold).
+            // batch is mostly idle.
             if (count == endpoint.read_chunk and endpoint.read_chunk < max_read_chunk) {
                 endpoint.read_chunk = @min(endpoint.read_chunk * 2, max_read_chunk);
             }
@@ -1090,28 +1349,32 @@ const Worker = struct {
     /// Sockmap-forwarded connection: the kernel moves the data; userspace
     /// reads only see FIN (close both sides, unpair) or stragglers the
     /// verdict passed through (relay them in userspace).
-    fn sockmapRead(self: *Worker, endpoint: *Endpoint) void {
+    fn sockmapRead(self: *Worker, endpoint: *Endpoint, now: u64) void {
         const connection = endpoint.connection;
-        const rc = linux.read(endpoint.fd, self.read_buffer.ptr, self.read_buffer.len);
-        const errno = linux.errno(rc);
-        if (errno != .SUCCESS) {
-            switch (errno) {
-                .AGAIN => return,
-                .INTR => return,
-                else => {
-                    self.killConnection(connection);
-                    return;
-                },
+        var attempts: usize = 0;
+        while (attempts < 4) : (attempts += 1) {
+            const rc = linux.read(endpoint.fd, self.read_buffer.ptr, self.read_buffer.len);
+            const errno = linux.errno(rc);
+            if (errno != .SUCCESS) {
+                switch (errno) {
+                    .AGAIN => return,
+                    .INTR => return,
+                    else => {
+                        self.killConnection(connection);
+                        return;
+                    },
+                }
             }
+            const count: usize = @intCast(rc);
+            if (count == 0) {
+                self.killConnection(connection);
+                return;
+            }
+            connection.last_activity_ns = now;
+            const peer = connection.peerOf(endpoint);
+            _ = self.deliver(peer, self.read_buffer[0..count]);
+            if (connection.dead or count < self.read_buffer.len) return;
         }
-        const count: usize = @intCast(rc);
-        if (count == 0) {
-            self.killConnection(connection);
-            return;
-        }
-        connection.touch();
-        const peer = connection.peerOf(endpoint);
-        _ = self.deliver(peer, self.read_buffer[0..count]);
     }
 
     /// Forward data to a peer fd: write immediately when the queue is empty,
@@ -1125,7 +1388,6 @@ const Worker = struct {
                 self.killConnection(connection);
                 return false;
             };
-            if (written > 0) connection.touch();
         }
         const rest = data[written..];
         if (rest.len == 0) return true;
@@ -1171,8 +1433,15 @@ const Worker = struct {
     }
 
     /// Drain the outbound queue of endpoint while the kernel accepts data.
-    fn flushPending(self: *Worker, endpoint: *Endpoint) void {
+    fn flushPending(self: *Worker, endpoint: *Endpoint, now: u64) void {
         const connection = endpoint.connection;
+        const budget = &self.listener.budget;
+        // Release budget once per flush instead of once per sendto, so the
+        // cross-worker shared counter is not hammered under backpressure.
+        var flushed: usize = 0;
+        defer {
+            if (flushed > 0) budget.release(flushed);
+        }
         while (endpoint.budget_bytes > 0) {
             const items = endpoint.pending.items[endpoint.pending_head..];
             const rc = linux.sendto(endpoint.fd, items.ptr, items.len, linux.MSG.NOSIGNAL, null, 0);
@@ -1182,8 +1451,8 @@ const Worker = struct {
                     const count: usize = @intCast(rc);
                     endpoint.pending_head += count;
                     endpoint.budget_bytes -= count;
-                    connection.worker.listener.budget.release(count);
-                    connection.touch();
+                    flushed += count;
+                    connection.last_activity_ns = now;
                 },
                 .AGAIN => break,
                 .INTR => continue,
@@ -1329,11 +1598,12 @@ const Worker = struct {
             }
             endpoint.pending.deinit(allocator);
             if (endpoint.fd >= 0) {
-                if (endpoint.registered) {
-                    _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, endpoint.fd, null);
-                }
+                // close() implicitly removes the fd from this epoll instance;
+                // stale queued events are filtered by the connection.dead
+                // check in dispatch.
                 closeFd(endpoint.fd);
                 endpoint.fd = -1;
+                endpoint.registered = false;
             }
         }
         if (connection.pairing) |pairing| {
@@ -1370,7 +1640,7 @@ const Worker = struct {
         self.zombies = null;
         while (current) |connection| {
             current = connection.zombie_next;
-            allocator.destroy(connection);
+            self.releaseConnection(connection);
         }
     }
 
@@ -1381,6 +1651,11 @@ const Worker = struct {
             self.killConnection(connection);
         }
         self.freeZombies();
+        while (self.connection_pool) |pooled| {
+            self.connection_pool = pooled.zombie_next;
+            allocator.destroy(pooled);
+        }
+        self.connection_pool_count = 0;
         for (self.listen_fds, 0..) |fd, address_index| {
             if (fd >= 0) {
                 _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
@@ -1397,6 +1672,7 @@ const Worker = struct {
             closeFd(self.wake_fd);
             self.wake_fd = -1;
         }
+        self.closeSplicePipe();
         if (self.read_buffer.len > 0) {
             allocator.free(self.read_buffer);
             self.read_buffer = &.{};
@@ -1422,7 +1698,8 @@ const Connection = struct {
     pairing: ?bpf.SockmapRuntime.Pairing = null,
     accelerator: ?*TCPSockmapAccelerator = null, // retained
     upstream_addr: config.SocketAddr,
-    client_text: [80]u8 = undefined,
+    /// "[addr]:port" text; the longest form is an IPv6 literal (53 bytes).
+    client_text: [56]u8 = undefined,
     client_text_len: usize = 0,
     bytes_to_upstream: i64 = 0,
     bytes_to_client: i64 = 0,
@@ -1436,10 +1713,6 @@ const Connection = struct {
 
     fn peerOf(self: *Connection, endpoint: *Endpoint) *Endpoint {
         return if (endpoint.is_client) &self.upstream else &self.client;
-    }
-
-    fn touch(self: *Connection) void {
-        self.last_activity_ns = monotonicNowNs();
     }
 };
 
@@ -1677,6 +1950,47 @@ test "tcp buffer budget caps aggregate queued bytes" {
     try testing.expect(budget.tryAcquire(5));
     budget.release(5);
     try testing.expectEqual(@as(i64, 0), budget.used());
+}
+
+test "tcp splice helper moves bytes between stream sockets" {
+    var source: [2]fd_t = undefined;
+    try testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &source)),
+    );
+    defer closeFd(source[0]);
+    defer closeFd(source[1]);
+
+    var destination: [2]fd_t = undefined;
+    try testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &destination)),
+    );
+    defer closeFd(destination[0]);
+    defer closeFd(destination[1]);
+
+    var pipe_fds: [2]fd_t = undefined;
+    try testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.pipe2(&pipe_fds, .{ .NONBLOCK = true, .CLOEXEC = true })),
+    );
+    defer closeFd(pipe_fds[0]);
+    defer closeFd(pipe_fds[1]);
+
+    const message = "splice without userspace payload copies";
+    try writeAll(source[0], message);
+
+    const into_pipe = spliceNonBlocking(source[1], pipe_fds[1], message.len, true);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(into_pipe));
+    try testing.expectEqual(message.len, into_pipe);
+
+    const into_socket = spliceNonBlocking(pipe_fds[0], destination[0], message.len, false);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(into_socket));
+    try testing.expectEqual(message.len, into_socket);
+
+    var received: [message.len]u8 = undefined;
+    try readFully(destination[1], &received);
+    try testing.expectEqualStrings(message, &received);
 }
 
 test "tcp echo roundtrip" {

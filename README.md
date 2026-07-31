@@ -12,7 +12,7 @@ Curtsy 是一个使用 Zig 编写的 Linux TCP/UDP 透明流量转发器。它�
 zig build -Doptimize=ReleaseSafe
 ```
 
-生成的程序位于 `zig-out/bin/curtsy`。
+生成的程序位于 `zig-out/bin/curtsy`。默认按架构基线 CPU 编译，可在任意同架构机器上运行；如需针对本机优化可加 `-Dcpu=native`（产物可能无法在更老的 CPU 上运行）。
 
 常用命令：
 
@@ -91,13 +91,15 @@ zig-out/bin/curtsy --config config.yaml
 
 ## TCP 性能
 
-TCP 转发路径使用每 worker 一个 epoll loop：每个 worker 持有 `SO_REUSEPORT` 监听 socket，连接和对应上游 socket 固定在同一线程。读缓冲采用 32 KiB 到 112 KiB 的自适应块，配合批量 flush 和水位线背压控制；待发送数据受全局 `limits.maxTCPBufferedBytes` 约束，防止大量慢速连接耗尽进程内存。
+TCP 转发路径使用每 worker 一个 epoll loop：每个 worker 持有 `SO_REUSEPORT` 监听 socket，连接和对应上游 socket 固定在同一线程。普通用户态 relay 优先使用每 worker 一个非阻塞 pipe，通过 `splice(2)` 完成 socket→pipe→socket 零拷贝；目标端产生背压时，pipe 中剩余数据会回退到原有的用户态缓冲队列。读缓冲采用 64 KiB 到 256 KiB 的自适应块，配合批量 flush 和水位线背压控制；待发送数据受全局 `limits.maxTCPBufferedBytes` 约束，防止大量慢速连接耗尽进程内存。worker 在一次 epoll 唤醒内复用同一个单调时钟时间戳，避免为每个数据块重复调用 `clock_gettime`。
 
 多 worker 时，Curtsy 会尝试通过 `SO_ATTACH_REUSEPORT_EBPF` 加载 reuseport eBPF 程序，按连接四元组 hash 分流到对应 worker。失败时回退到内核原生 `SO_REUSEPORT` hash，不影响服务启动。
 
 在具备 eBPF 权限的 Linux 上，Curtsy 还可创建 `BPF_MAP_TYPE_SOCKHASH`，并为每对客户端/上游 TCP socket 挂载 `SK_SKB` stream parser 与 verdict 程序。双向数据通过 `bpf_sk_redirect_hash` 在内核中直接转发，绕过用户态 relay 的 `tcp_recvmsg`、`tcp_sendmsg` 和用户缓冲区复制。BPF 同时记录双向最后活动时间，因此加速连接仍遵守 `tcpIdleSeconds`。
 
 `performance.tcpSockmapAcceleration` 控制该路径：`enabled` 强制尝试启用，`disabled` 始终使用用户态 relay，默认的 `auto` 对所有上游尝试启用。权限不足、内核不支持或单连接 sockhash 配对失败时，Curtsy 会记录日志并自动回退到用户态 relay。
+
+sockmap 是否更快取决于数据路径。跨主机、高 RTT 或 CPU 受限环境通常更可能受益；loopback 和部分小包场景中，SK_SKB/sockhash 的逐包成本可能高于用户态 relay。部署前应使用实际网卡、包大小和 RTT 分别压测 `enabled` 与 `disabled`，不要仅根据本机回环结果选择。
 
 常驻 tuning daemon 默认启用。它会优先加载 eBPF kprobe observer，观测当前 Curtsy 进程触发的 TCP/UDP send/recv 内核调用，并结合 `/proc/net/netstat` 的监听队列溢出计数和 Curtsy 内部 TCP/UDP 使用量持续调参。当前版本只调整 Curtsy 自己的运行时限额，不写系统 sysctl；如果 eBPF observer 加载失败，会降级使用内部计数和 `/proc`，服务继续运行。
 

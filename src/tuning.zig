@@ -221,9 +221,11 @@ fn decide(
     return decision;
 }
 
-/// Daemon thread recomputing auto-tuned limits. `start()` loads the eBPF observer (falling back to internal
-/// counters with a warning when unavailable) and spawns the thread;
-/// `stop()` wakes and joins the thread promptly and releases the observer.
+/// Daemon thread recomputing auto-tuned limits. `start()` caches the hardware
+/// snapshot, loads the eBPF observer only when at least one limit is auto
+/// (falling back to internal counters with a warning when unavailable) and
+/// spawns the thread; `stop()` wakes and joins the thread promptly and
+/// releases the observer.
 pub const TuningDaemon = struct {
     interval_seconds: i64,
     logger: *log.LogStore,
@@ -240,6 +242,14 @@ pub const TuningDaemon = struct {
     observer: ?bpf.BpfObserver = null,
     last_bpf_counters: ?ObserverCounters = null,
     last_netstat_counters: ?NetstatCounters = null,
+    /// CPU count and total memory never change at runtime; read once at
+    /// start instead of re-reading /proc/meminfo on every tick.
+    hardware: ?autotune.AutoTuneSnapshot = null,
+
+    fn anyLimitAuto(current: config.LimitConfiguration) bool {
+        const auto = current.auto_tuning;
+        return auto.tcp_listen_backlog or auto.max_tcp_buffered_bytes or auto.max_udp_associations;
+    }
 
     pub fn init(
         interval_seconds: i64,
@@ -266,30 +276,48 @@ pub const TuningDaemon = struct {
     pub fn start(self: *TuningDaemon) void {
         std.debug.assert(self.thread == null);
 
-        var verifier_log: [256 * 1_024]u8 = [_]u8{0} ** (256 * 1_024);
-        const pid: u32 = @intCast(linux.getpid());
-        if (bpf.BpfObserver.create(pid, &verifier_log)) |observer| {
-            self.observer = observer;
-            self.logger.info("tuning daemon ebpf observer enabled", .{});
-        } else |_| {
-            self.observer = null;
-            const reason = std.mem.span(strerror(@intFromEnum(bpf.lastErrno)));
-            const verifier = std.mem.sliceTo(&verifier_log, 0);
-            if (verifier.len > 0) {
-                self.logger.warning(
-                    "tuning daemon ebpf observer unavailable; using internal counters error={s}; verifier={s}",
-                    .{ reason, verifier },
-                );
-            } else {
-                self.logger.warning(
-                    "tuning daemon ebpf observer unavailable; using internal counters error={s}",
-                    .{reason},
-                );
+        self.hardware = autotune.AutoTuneSnapshot.system();
+
+        // The observer data feeds only auto-tuned decisions (and their log
+        // line); when every limit is fixed, skip the kprobes entirely — they
+        // would otherwise fire on every tcp/udp send/recv of every process.
+        const start_snapshot = self.snapshot_provider(self.snapshot_context);
+        const any_auto = if (start_snapshot) |snapshot|
+            anyLimitAuto(snapshot.configuration.configuration.limits)
+        else
+            false;
+
+        if (any_auto) {
+            var verifier_log: [256 * 1_024]u8 = [_]u8{0} ** (256 * 1_024);
+            const pid: u32 = @intCast(linux.getpid());
+            if (bpf.BpfObserver.create(pid, &verifier_log)) |observer| {
+                self.observer = observer;
+                self.logger.info("tuning daemon ebpf observer enabled", .{});
+            } else |_| {
+                self.observer = null;
+                const reason = std.mem.span(strerror(@intFromEnum(bpf.lastErrno)));
+                const verifier = std.mem.sliceTo(&verifier_log, 0);
+                if (verifier.len > 0) {
+                    self.logger.warning(
+                        "tuning daemon ebpf observer unavailable; using internal counters error={s}; verifier={s}",
+                        .{ reason, verifier },
+                    );
+                } else {
+                    self.logger.warning(
+                        "tuning daemon ebpf observer unavailable; using internal counters error={s}",
+                        .{reason},
+                    );
+                }
             }
         }
 
         self.last_bpf_counters = if (self.observer) |*observer| observer.read() catch null else null;
-        self.last_netstat_counters = NetstatCounters.read();
+        if (start_snapshot) |snapshot| {
+            self.last_netstat_counters = if (snapshot.configuration.configuration.limits.auto_tuning.tcp_listen_backlog)
+                NetstatCounters.read()
+            else
+                null;
+        }
 
         self.stopping.store(false, .release);
         self.thread = std.Thread.spawn(.{ .stack_size = 1 << 20 }, threadMain, .{self}) catch |err| {
@@ -334,11 +362,17 @@ pub const TuningDaemon = struct {
     fn tick(self: *TuningDaemon) void {
         const snapshot = self.snapshot_provider(self.snapshot_context) orelse return;
         const current = snapshot.configuration.configuration.limits;
-        const hardware = autotune.AutoTuneSnapshot.system();
+        // Nothing to decide when every limit is fixed; skip the /proc reads
+        // and observer queries entirely.
+        if (!anyLimitAuto(current)) return;
+        const hardware = self.hardware orelse autotune.AutoTuneSnapshot.system();
         const target = autotune.limits(hardware);
 
         const bpf_delta = self.readBpfDeltas();
-        const netstat_delta = self.readNetstatDelta();
+        const netstat_delta = if (current.auto_tuning.tcp_listen_backlog)
+            self.readNetstatDelta()
+        else
+            NetstatCounters.zero;
 
         var decision = decide(
             current,

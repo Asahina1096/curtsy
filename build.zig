@@ -1,7 +1,12 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to the arch baseline CPU so release binaries (e.g. the Debian
+    // package) run on any machine; pass -Dcpu=native to optimize for the
+    // build host.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     // libc is required for getaddrinfo/inet_pton/inet_ntop in config.zig.

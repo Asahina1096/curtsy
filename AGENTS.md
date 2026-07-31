@@ -19,6 +19,8 @@ zig build run -- --config config.yaml --check-config
 zig build run -- --config config.yaml
 ```
 
+默认按架构基线 CPU 编译（`-mcpu baseline`），保证二进制可移植；本地开发想要本机优化时显式传 `-Dcpu=native`。
+
 ## 代码组织
 
 - `src/main.zig`：命令行入口，解析 `--config` / `--check-config` / `--version` / `--help`，配置错误退出码为 2。
@@ -27,7 +29,7 @@ zig build run -- --config config.yaml
 - `src/log.zig`：带原子阈值和 futex mutex 的日志门面，输出到 stderr。
 - `src/autotune.zig`：CPU/内存自适应默认值公式。
 - `src/tuning.zig`：常驻 tuning daemon，读取 eBPF observer 和 `/proc/net/netstat`，按压力调整自动限额。
-- `src/tcp.zig`：TCP listener 和 relay。每 worker 一个 epoll loop、每监听地址一个 `SO_REUSEPORT` socket；实现背压、全局用户态缓冲预算、空闲超时、reuseport eBPF 和 TCP sockmap 加速。
+- `src/tcp.zig`：TCP listener 和 relay。每 worker 一个 epoll loop、每监听地址一个 `SO_REUSEPORT` socket；用户态 relay 优先通过每 worker 非阻塞 pipe 使用 `splice(2)` 零拷贝，背压时回退预算缓冲；同时实现空闲超时、reuseport eBPF 和 TCP sockmap 加速。
 - `src/udp.zig`：UDP listener 和 relay engine。多个 I/O 线程经 `SO_REUSEPORT` 共享端口，每线程 epoll 管理监听、上游和 per-client socket，`recvmmsg`/`sendmmsg` 批量转发，支持 UDP sockmap 加速。
 - `src/bpf.zig`：纯 Zig eBPF/syscall 封装，包含 sockhash map、SK_SKB parser/verdict 程序、reuseport 分流程序、BPF observer、UDP 批量 I/O 和 Linux socket/epoll/eventfd helper。
 
@@ -35,7 +37,7 @@ zig build run -- --config config.yaml
 
 - 热加载（`SIGHUP`）：监听地址变化时先绑新端口再停旧监听；失败则整体回滚到旧配置。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 TCP sockmap 模式时已有 TCP 连接保持原模式；改变 UDP sockmap 模式时已有 UDP 会话被清除并按新模式重建。
 - 优雅退出：先停止 accept，等待已有 TCP 连接，超时后强制关闭。
-- TCP 性能：大块自适应读缓冲（单块上限 112 KiB）、批量 flush、水位线背压控制；多 worker 时尝试 `SO_ATTACH_REUSEPORT_EBPF`，失败时回退内核原生 `SO_REUSEPORT` hash。
+- TCP 性能：`splice(2)` socket→pipe→socket 零拷贝快路径，背压时回退 64..256 KiB 自适应读缓冲、批量 flush 和水位线控制；每次 epoll 唤醒复用单调时间戳。多 worker 时尝试 `SO_ATTACH_REUSEPORT_EBPF`，失败时回退内核原生 `SO_REUSEPORT` hash。
 - UDP 性能：I/O 线程池（默认每 CPU 一个，`performance.udpIOThreads` 可调）经 `SO_REUSEPORT` 共享监听端口；每线程用 epoll 驱动自己的监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发；会话建立是同步的。
 - sockmap 加速：`performance.tcpSockmapAcceleration` / `performance.udpSockmapAcceleration` 支持 `enabled` / `disabled` / `auto`。权限不足、内核不支持或配对失败时自动回退用户态 relay，不影响服务启动。
 - 并发约定：跨线程共享状态使用 `std.atomic.Value` 或 `log.Mutex`；worker/engine 私有可变状态只在对应线程上访问。

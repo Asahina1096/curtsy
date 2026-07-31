@@ -69,12 +69,17 @@ pub const RuntimeOptions = struct {
 
 pub const PerformanceConfiguration = struct {
     pub const default_udp_socket_buffer_bytes: i64 = 4 * 1_024 * 1_024;
+    pub const default_udp_datagram_buffer_bytes: i64 = 65_536;
 
     tcp_sockmap_acceleration: SockmapAccelerationMode = .auto,
     udp_sockmap_acceleration: SockmapAccelerationMode = .auto,
     // Zero keeps the kernel default socket buffers; any positive value is
     // silently clamped to net.core.rmem_max/wmem_max without CAP_NET_ADMIN.
     udp_socket_buffer_bytes: i64 = default_udp_socket_buffer_bytes,
+    // Per-slot receive buffer size for the batched UDP relay. Smaller values
+    // improve cache/TLB locality for small-datagram workloads; datagrams
+    // larger than this are truncated.
+    udp_datagram_buffer_bytes: i64 = default_udp_datagram_buffer_bytes,
     // Zero auto-tunes to the worker thread count.
     udp_io_threads: i64 = 0,
 };
@@ -529,7 +534,7 @@ const allowed_keys = [_]struct { path: []const u8, keys: []const []const u8 }{
     .{ .path = "limits", .keys = &.{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations", "maxUDPPendingDatagrams", "maxUDPPendingBytes" } },
     .{ .path = "logging", .keys = &.{"level"} },
     .{ .path = "runtime", .keys = &.{ "workerThreads", "tuningDaemon", "tuningIntervalSeconds" } },
-    .{ .path = "performance", .keys = &.{ "tcpSockmapAcceleration", "udpSockmapAcceleration", "udpSocketBufferBytes", "udpIOThreads" } },
+    .{ .path = "performance", .keys = &.{ "tcpSockmapAcceleration", "udpSockmapAcceleration", "udpSocketBufferBytes", "udpDatagramBufferBytes", "udpIOThreads" } },
 };
 
 fn allowedKeysFor(path: []const u8) ?[]const []const u8 {
@@ -810,6 +815,9 @@ const Decoder = struct {
         if (mappingGet(map, "udpSocketBufferBytes")) |v| {
             performance.udp_socket_buffer_bytes = try self.decodeInt(v, "performance.udpSocketBufferBytes");
         }
+        if (mappingGet(map, "udpDatagramBufferBytes")) |v| {
+            performance.udp_datagram_buffer_bytes = try self.decodeInt(v, "performance.udpDatagramBufferBytes");
+        }
         const io_threads = try self.decodeAutoTunedInt(map, "udpIOThreads", "performance.udpIOThreads", 0);
         performance.udp_io_threads = io_threads.value;
         return performance;
@@ -830,6 +838,9 @@ fn mappingGet(map: []const Entry, key: []const u8) ?*Value {
 const max_timeout_seconds: i64 = std.math.maxInt(i64) / 1_000_000_000; // 9223372036
 const max_udp_associations: i64 = std.math.maxInt(u32) / 2; // 2147483647
 const max_udp_socket_buffer_bytes: i64 = 1 << 28; // 268435456
+// 576 covers the minimum IPv4 MTU; 65536 is the maximum UDP payload size.
+const min_udp_datagram_buffer_bytes: i64 = 576;
+const max_udp_datagram_buffer_bytes: i64 = 65_536;
 
 fn validate(gpa: Allocator, diag: *Diagnostics, config: ForwarderConfiguration) LoadError!void {
     if (config.version != 1) {
@@ -918,6 +929,12 @@ fn validate(gpa: Allocator, diag: *Diagnostics, config: ForwarderConfiguration) 
     }
     if (config.performance.udp_io_threads < 0) {
         setDiag(gpa, diag, "performance.udpIOThreads must be zero for auto or positive", .{});
+        return error.InvalidConfiguration;
+    }
+    if (config.performance.udp_datagram_buffer_bytes < min_udp_datagram_buffer_bytes or
+        config.performance.udp_datagram_buffer_bytes > max_udp_datagram_buffer_bytes)
+    {
+        setDiag(gpa, diag, "performance.udpDatagramBufferBytes must be between {d} and {d}", .{ min_udp_datagram_buffer_bytes, max_udp_datagram_buffer_bytes });
         return error.InvalidConfiguration;
     }
     if (!isValidLogLevel(config.logging.level)) {
@@ -1239,6 +1256,7 @@ test "loads defaults" {
     try testing.expectEqual(SockmapAccelerationMode.auto, config.performance.tcp_sockmap_acceleration);
     try testing.expectEqual(SockmapAccelerationMode.auto, config.performance.udp_sockmap_acceleration);
     try testing.expectEqual(PerformanceConfiguration.default_udp_socket_buffer_bytes, config.performance.udp_socket_buffer_bytes);
+    try testing.expectEqual(PerformanceConfiguration.default_udp_datagram_buffer_bytes, config.performance.udp_datagram_buffer_bytes);
     try testing.expectEqual(0, config.performance.udp_io_threads);
 }
 
@@ -1260,7 +1278,7 @@ test "loads overrides" {
         \\  maxUDPPendingDatagrams: 8
         \\  maxUDPPendingBytes: 4096
         \\runtime: { workerThreads: 2, tuningDaemon: false, tuningIntervalSeconds: 10 }
-        \\performance: { tcpSockmapAcceleration: enabled, udpSockmapAcceleration: disabled, udpSocketBufferBytes: 8388608, udpIOThreads: 2 }
+        \\performance: { tcpSockmapAcceleration: enabled, udpSockmapAcceleration: disabled, udpSocketBufferBytes: 8388608, udpDatagramBufferBytes: 8192, udpIOThreads: 2 }
         \\logging: { level: debug }
         \\
     );
@@ -1290,6 +1308,7 @@ test "loads overrides" {
     try testing.expectEqual(SockmapAccelerationMode.enabled, config.performance.tcp_sockmap_acceleration);
     try testing.expectEqual(SockmapAccelerationMode.disabled, config.performance.udp_sockmap_acceleration);
     try testing.expectEqual(8 * 1_024 * 1_024, config.performance.udp_socket_buffer_bytes);
+    try testing.expectEqual(8 * 1_024, config.performance.udp_datagram_buffer_bytes);
     try testing.expectEqual(2, config.performance.udp_io_threads);
 }
 

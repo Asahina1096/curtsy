@@ -21,5 +21,3 @@ override_dh_auto_install:
 	install -D -m 0644 config.example.yaml debian/curtsy/etc/curtsy/config.yaml
 	install -D -m 0644 debian/60-curtsy.conf debian/curtsy/usr/lib/sysctl.d/60-curtsy.conf
 
-override_dh_installsystemd:
-	dh_installsystemd --no-enable --no-start

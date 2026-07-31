@@ -36,7 +36,7 @@ pub const Level = enum(u8) {
 /// Minimal three-state futex mutex. Zig 0.16 removed std.Thread.Mutex and
 /// std.Io.Mutex requires an Io runtime, which the logger cannot depend on —
 /// it must be callable from any thread with no runtime handle. The critical
-/// section is two write syscalls, so contention is rare and brief.
+/// section is a single write syscall, so contention is rare and brief.
 pub const Mutex = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(unlocked),
 
@@ -100,7 +100,7 @@ pub const LogStore = struct {
         if (!self.isEnabled(level)) return;
         var buf: [max_message_bytes]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
-        self.emit(message);
+        self.emit(message, &buf);
     }
 
     /// Lazy log for expensive messages: `render` is invoked only when the
@@ -113,7 +113,7 @@ pub const LogStore = struct {
     ) void {
         if (!self.isEnabled(level)) return;
         var buf: [max_message_bytes]u8 = undefined;
-        self.emit(render(context, &buf));
+        self.emit(render(context, &buf), &buf);
     }
 
     pub fn trace(self: *LogStore, comptime fmt: []const u8, args: anytype) void {
@@ -144,11 +144,18 @@ pub const LogStore = struct {
         self.log(.critical, fmt, args);
     }
 
-    fn emit(self: *LogStore, message: []const u8) void {
+    /// Single write including the trailing newline, so the critical section
+    /// is one syscall. scratch must be the buffer backing message.
+    fn emit(self: *LogStore, message: []const u8, scratch: *[max_message_bytes]u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        writeAllFd(std.posix.STDERR_FILENO, message);
-        writeAllFd(std.posix.STDERR_FILENO, "\n");
+        if (message.len < max_message_bytes) {
+            scratch[message.len] = '\n';
+            writeAllFd(std.posix.STDERR_FILENO, scratch[0 .. message.len + 1]);
+        } else {
+            writeAllFd(std.posix.STDERR_FILENO, message);
+            writeAllFd(std.posix.STDERR_FILENO, "\n");
+        }
     }
 };
 

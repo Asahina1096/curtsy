@@ -62,20 +62,20 @@ pub const UdpAssociationBudget = struct {
 
     pub fn tryAcquire(self: *UdpAssociationBudget, limit: u64) bool {
         while (true) {
-            const current = self.used.load(.acquire);
+            const current = self.used.load(.monotonic);
             if (current >= limit) return false;
-            if (self.used.cmpxchgWeak(current, current + 1, .acq_rel, .acquire) == null) return true;
+            if (self.used.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) == null) return true;
         }
     }
 
     pub fn release(self: *UdpAssociationBudget, n: u64) void {
         if (n == 0) return;
-        const previous = self.used.fetchSub(n, .acq_rel);
+        const previous = self.used.fetchSub(n, .monotonic);
         std.debug.assert(previous >= n); // UDP association budget released more than acquired
     }
 
     pub fn count(self: *const UdpAssociationBudget) u64 {
-        return self.used.load(.acquire);
+        return self.used.load(.monotonic);
     }
 };
 
@@ -291,11 +291,48 @@ pub const UdpRelayEngine = struct {
         client_fd: ?fd_t = null,
         pairing: ?bpf.SockmapRuntime.Pairing = null,
         last_activity_ms: u64,
+        /// Next time a steered association's BPF activity timestamp must be
+        /// consulted. BPF activity only moves the deadline later, so checks
+        /// are scheduled by remaining idle time instead of every sweep —
+        /// mirroring the TCP sockmap_next_check_ns scheme and avoiding two
+        /// map lookups per session per sweep.
+        sockmap_next_check_ms: u64 = 0,
     };
 
     const batch_size = bpf.udp_batch_capacity;
-    const datagram_capacity = 65_536;
     const sweep_interval_ms: i32 = 50;
+    /// Cap on recvmmsg batches drained per readiness event so one hot socket
+    /// cannot starve the other ready fds on this engine.
+    const max_batches_per_drain: usize = 16;
+    /// After a sockmap pairing failure (typically a full map), skip further
+    /// acceleration attempts for this long instead of paying the failed
+    /// socket+pair cost for every new association.
+    const accelerate_failure_cooldown_ms: u64 = 60_000;
+    const send_error_log_interval_ms: u64 = 1_000;
+
+    /// Hashes SocketAddr by its significant bytes only (matching
+    /// SocketAddr.eql) instead of field-by-field autoHash.
+    const SocketAddrContext = struct {
+        pub fn hash(_: SocketAddrContext, key: SocketAddr) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(switch (key.family) {
+                .v4 => key.addr[0..4],
+                .v6 => &key.addr,
+            });
+            var tail: [7]u8 = undefined;
+            tail[0] = @intFromEnum(key.family);
+            std.mem.writeInt(u16, tail[1..3], key.port, .little);
+            std.mem.writeInt(u32, tail[3..7], key.scope_id, .little);
+            hasher.update(&tail);
+            return hasher.final();
+        }
+
+        pub fn eql(_: SocketAddrContext, a: SocketAddr, b: SocketAddr) bool {
+            return a.eql(b);
+        }
+    };
+
+    const AssociationMap = std.HashMap(SocketAddr, Association, SocketAddrContext, std.hash_map.default_max_load_percentage);
 
     runtime: *RuntimeConfiguration,
     log: *LogStore,
@@ -309,6 +346,9 @@ pub const UdpRelayEngine = struct {
     loader: SockmapRuntimeLoader,
 
     command_mutex: Mutex = .{},
+    /// Fast path flag so processCommands skips the mutex when no command
+    /// was ever enqueued.
+    command_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pending_commands: std.ArrayList(Command) = .empty,
     drained_commands: std.ArrayList(Command) = .empty,
     /// Guards wake_fd signalling (enqueue/stop) against the close in stop(),
@@ -325,13 +365,17 @@ pub const UdpRelayEngine = struct {
     epoll_fd: fd_t = -1,
     wake_fd: fd_t = -1,
     listen_fds: []fd_t = &.{},
-    associations: std.AutoHashMap(SocketAddr, Association),
+    associations: AssociationMap,
     upstream_to_client: std.AutoHashMap(fd_t, SocketAddr),
     client_fd_to_client: std.AutoHashMap(fd_t, SocketAddr),
     listen_bound: std.AutoHashMap(fd_t, posix.sockaddr.storage),
     sockmap_runtime: ?bpf.SockmapRuntime = null,
     warned_at_limit: bool = false,
     sweep_buffer: std.ArrayList(SocketAddr) = .empty,
+    last_sweep_ms: u64 = 0,
+    accelerate_cooldown_until_ms: u64 = 0,
+    send_error_drops: u64 = 0,
+    last_send_error_log_ms: u64 = 0,
 
     pub fn init(
         runtime: *RuntimeConfiguration,
@@ -352,7 +396,7 @@ pub const UdpRelayEngine = struct {
             .announce_listen = announce_listen,
             .enable_sockmap_override = enable_sockmap_acceleration,
             .loader = loader orelse default_sockmap_runtime_loader,
-            .associations = std.AutoHashMap(SocketAddr, Association).init(allocator),
+            .associations = AssociationMap.init(allocator),
             .upstream_to_client = std.AutoHashMap(fd_t, SocketAddr).init(allocator),
             .client_fd_to_client = std.AutoHashMap(fd_t, SocketAddr).init(allocator),
             .listen_bound = std.AutoHashMap(fd_t, posix.sockaddr.storage).init(allocator),
@@ -418,6 +462,16 @@ pub const UdpRelayEngine = struct {
         } else {
             self.log.info("udp sockmap acceleration disabled", .{});
         }
+
+        // Pre-size the session maps so steady-state growth never rehashes
+        // (and heap-allocates) on the I/O thread's first-datagram path.
+        const per_engine_capacity: u32 = @intCast(@min(
+            @divTrunc(@max(1, snapshot.configuration.limits.max_udp_associations), @as(i64, self.engine_count)) + 1,
+            1 << 20,
+        ));
+        self.associations.ensureTotalCapacity(per_engine_capacity) catch {};
+        self.upstream_to_client.ensureTotalCapacity(per_engine_capacity) catch {};
+        self.client_fd_to_client.ensureTotalCapacity(per_engine_capacity) catch {};
 
         owned_fds = try created_fds.toOwnedSlice(self.allocator);
         owned_addresses = try addresses.toOwnedSlice(self.allocator);
@@ -534,6 +588,7 @@ pub const UdpRelayEngine = struct {
             self.command_mutex.unlock();
             return;
         };
+        self.command_pending.store(true, .release);
         self.command_mutex.unlock();
         self.signal_mutex.lock();
         if (self.wake_fd >= 0) bpf.eventfdSignal(self.wake_fd);
@@ -544,7 +599,10 @@ pub const UdpRelayEngine = struct {
         setThreadName();
         defer self.teardown();
 
-        const buffer = self.allocator.alloc(u8, batch_size * datagram_capacity) catch {
+        // Slot capacity is configurable: smaller buffers improve cache/TLB
+        // locality for small-datagram workloads.
+        const slot_capacity: usize = @intCast(self.runtime.current().configuration.performance.udp_datagram_buffer_bytes);
+        const buffer = self.allocator.alloc(u8, batch_size * slot_capacity) catch {
             self.log.critical("udp relay buffer allocation failed", .{});
             return;
         };
@@ -553,10 +611,12 @@ pub const UdpRelayEngine = struct {
         var recv_slots: [batch_size]bpf.UdpSlot = undefined;
         for (&recv_slots, 0..) |*slot, index| {
             slot.* = .{
-                .data = buffer[index * datagram_capacity ..].ptr,
-                .capacity = datagram_capacity,
+                .data = buffer[index * slot_capacity ..].ptr,
+                .capacity = @intCast(slot_capacity),
             };
         }
+        var recv_io: bpf.UdpRecvBatchIo = undefined;
+        recv_io.init(&recv_slots);
         var send_slots: [batch_size]bpf.UdpSlot = undefined;
         var ready_fds: [batch_size + 1]fd_t = undefined;
 
@@ -566,26 +626,37 @@ pub const UdpRelayEngine = struct {
                 continue;
             };
 
+            // One timestamp per epoll wake, reused by every drain/forward.
+            const now_ms = monotonicMilliseconds();
+
             self.processCommands();
 
             for (ready_fds[0..ready]) |fd| {
                 if (fd == self.wake_fd) {
                     bpf.eventfdDrain(self.wake_fd);
-                } else if (self.client_fd_to_client.contains(fd)) {
-                    self.drainClient(fd, &recv_slots);
-                } else if (self.upstream_to_client.contains(fd)) {
-                    self.drainUpstream(fd, &recv_slots);
+                } else if (self.client_fd_to_client.get(fd)) |client| {
+                    self.drainClient(fd, client, &recv_slots, &recv_io, now_ms);
+                } else if (self.upstream_to_client.get(fd)) |client| {
+                    self.drainUpstream(fd, client, &recv_slots, &recv_io, now_ms);
                 } else {
-                    self.drainListen(fd, &recv_slots, &send_slots);
+                    self.drainListen(fd, &recv_slots, &send_slots, &recv_io, now_ms);
                 }
             }
-            self.sweepExpiredAssociations();
+            // The 50 ms sweep is throttled by elapsed time, not by wake
+            // count: busy engines would otherwise rescan all sessions after
+            // every batch.
+            if (now_ms -% self.last_sweep_ms >= sweep_interval_ms) {
+                self.last_sweep_ms = now_ms;
+                self.sweepExpiredAssociations(now_ms);
+            }
         }
     }
 
     fn processCommands(self: *UdpRelayEngine) void {
+        if (!self.command_pending.load(.acquire)) return;
         self.command_mutex.lock();
         std.mem.swap(std.ArrayList(Command), &self.pending_commands, &self.drained_commands);
+        self.command_pending.store(false, .monotonic);
         self.command_mutex.unlock();
         for (self.drained_commands.items) |command| {
             switch (command) {
@@ -686,14 +757,17 @@ pub const UdpRelayEngine = struct {
         fd: fd_t,
         recv_slots: *[batch_size]bpf.UdpSlot,
         send_slots: *[batch_size]bpf.UdpSlot,
+        recv_io: *bpf.UdpRecvBatchIo,
+        now_ms: u64,
     ) void {
-        while (true) {
-            const received = bpf.udpRecvBatch(fd, recv_slots) catch {
+        var batches: usize = 0;
+        while (batches < max_batches_per_drain) : (batches += 1) {
+            const received = recv_io.recv(fd, recv_slots) catch {
                 self.log.err("udp listener read failed error={s}", .{errnoDescription()});
                 return;
             };
             if (received == 0) return;
-            self.forwardClientDatagrams(received, fd, recv_slots, send_slots);
+            self.forwardClientDatagrams(received, fd, recv_slots, send_slots, now_ms);
         }
     }
 
@@ -703,28 +777,30 @@ pub const UdpRelayEngine = struct {
         listen_fd: fd_t,
         recv_slots: *[batch_size]bpf.UdpSlot,
         send_slots: *[batch_size]bpf.UdpSlot,
+        now_ms: u64,
     ) void {
         var run_fd: fd_t = -1;
         var run_length: usize = 0;
         for (recv_slots[0..count]) |*slot| {
             const client = socketAddrFromStorage(&slot.address) orelse continue;
-            const association: Association = blk: {
+            const upstream_fd: fd_t = blk: {
                 if (self.associations.getPtr(client)) |existing| {
-                    existing.last_activity_ms = monotonicMilliseconds();
-                    break :blk existing.*;
+                    existing.last_activity_ms = now_ms;
+                    break :blk existing.upstream_fd;
                 }
                 break :blk self.openAssociation(
                     client,
                     slot.address,
                     slot.address_length,
                     listen_fd,
+                    now_ms,
                 ) orelse continue;
             };
-            if (association.upstream_fd != run_fd) {
+            if (upstream_fd != run_fd) {
                 if (run_length > 0) {
-                    _ = self.sendAllDatagrams(run_fd, null, 0, send_slots[0..run_length], "direction=client_to_upstream");
+                    _ = self.sendAllDatagrams(run_fd, null, 0, send_slots[0..run_length], "direction=client_to_upstream", now_ms);
                 }
-                run_fd = association.upstream_fd;
+                run_fd = upstream_fd;
                 run_length = 0;
             }
             send_slots[run_length].data = slot.data;
@@ -732,45 +808,60 @@ pub const UdpRelayEngine = struct {
             run_length += 1;
         }
         if (run_length > 0) {
-            _ = self.sendAllDatagrams(run_fd, null, 0, send_slots[0..run_length], "direction=client_to_upstream");
+            _ = self.sendAllDatagrams(run_fd, null, 0, send_slots[0..run_length], "direction=client_to_upstream", now_ms);
         }
     }
 
     // Fallback path for an accelerated association: datagrams queued on the
     // connected client socket before pairing completed (or passed through via
     // SK_PASS) are relayed by userspace like ordinary listen-socket traffic.
-    fn drainClient(self: *UdpRelayEngine, fd: fd_t, recv_slots: *[batch_size]bpf.UdpSlot) void {
-        const client = self.client_fd_to_client.get(fd) orelse return;
+    fn drainClient(
+        self: *UdpRelayEngine,
+        fd: fd_t,
+        client: SocketAddr,
+        recv_slots: *[batch_size]bpf.UdpSlot,
+        recv_io: *bpf.UdpRecvBatchIo,
+        now_ms: u64,
+    ) void {
         const association = self.associations.getPtr(client) orelse return;
-        while (true) {
-            const received = bpf.udpRecvBatch(fd, recv_slots) catch {
+        var batches: usize = 0;
+        while (batches < max_batches_per_drain) : (batches += 1) {
+            const received = recv_io.recv(fd, recv_slots) catch {
                 self.log.err("udp client socket read failed client={f} error={s}", .{ client, errnoDescription() });
                 self.closeAssociation(client);
                 return;
             };
             if (received == 0) return;
-            association.last_activity_ms = monotonicMilliseconds();
+            association.last_activity_ms = now_ms;
             _ = self.sendAllDatagrams(
                 association.upstream_fd,
                 null,
                 0,
                 recv_slots[0..received],
                 "direction=client_to_upstream",
+                now_ms,
             );
         }
     }
 
-    fn drainUpstream(self: *UdpRelayEngine, fd: fd_t, recv_slots: *[batch_size]bpf.UdpSlot) void {
-        const client = self.upstream_to_client.get(fd) orelse return;
+    fn drainUpstream(
+        self: *UdpRelayEngine,
+        fd: fd_t,
+        client: SocketAddr,
+        recv_slots: *[batch_size]bpf.UdpSlot,
+        recv_io: *bpf.UdpRecvBatchIo,
+        now_ms: u64,
+    ) void {
         const association = self.associations.getPtr(client) orelse return;
-        while (true) {
-            const received = bpf.udpRecvBatch(fd, recv_slots) catch {
+        var batches: usize = 0;
+        while (batches < max_batches_per_drain) : (batches += 1) {
+            const received = recv_io.recv(fd, recv_slots) catch {
                 self.log.err("udp upstream error client={f} error={s}", .{ client, errnoDescription() });
                 self.closeAssociation(client);
                 return;
             };
             if (received == 0) return;
-            association.last_activity_ms = monotonicMilliseconds();
+            association.last_activity_ms = now_ms;
             const address: *const posix.sockaddr = @ptrCast(&association.client_address);
             _ = self.sendAllDatagrams(
                 association.listen_fd,
@@ -778,6 +869,7 @@ pub const UdpRelayEngine = struct {
                 association.client_address_length,
                 recv_slots[0..received],
                 "direction=upstream_to_client",
+                now_ms,
             );
         }
     }
@@ -789,30 +881,37 @@ pub const UdpRelayEngine = struct {
         address_length: socklen_t,
         slots: []const bpf.UdpSlot,
         comptime context: []const u8,
+        now_ms: u64,
     ) bool {
         if (slots.len == 0) return true;
         var sent_total: usize = 0;
         while (sent_total < slots.len) {
             const sent = bpf.udpSendBatch(fd, address, address_length, slots[sent_total..]) catch {
-                self.log.warning("udp datagrams dropped {s} sent={d} dropped={d} error={s}", .{
-                    context,
-                    sent_total,
-                    slots.len - sent_total,
-                    errnoDescription(),
-                });
+                self.noteSendError(slots.len - sent_total, context, errnoDescription(), now_ms);
                 return false;
             };
             if (sent == 0) {
-                self.log.warning("udp datagrams dropped {s} sent={d} dropped={d} error=sendmmsg made no progress", .{
-                    context,
-                    sent_total,
-                    slots.len - sent_total,
-                });
+                self.noteSendError(slots.len - sent_total, context, "sendmmsg made no progress", now_ms);
                 return false;
             }
             sent_total += sent;
         }
         return true;
+    }
+
+    /// Drop logging is rate-limited per engine: sustained backpressure would
+    /// otherwise serialize all engine threads on the shared log mutex once
+    /// per failed batch.
+    fn noteSendError(self: *UdpRelayEngine, dropped: usize, comptime context: []const u8, error_text: []const u8, now_ms: u64) void {
+        self.send_error_drops += dropped;
+        if (now_ms -% self.last_send_error_log_ms < send_error_log_interval_ms) return;
+        self.last_send_error_log_ms = now_ms;
+        self.log.warning("udp datagrams dropped {s} dropped={d} total_dropped={d} error={s}", .{
+            context,
+            dropped,
+            self.send_error_drops,
+            error_text,
+        });
     }
 
     fn openAssociation(
@@ -821,7 +920,8 @@ pub const UdpRelayEngine = struct {
         client_address: posix.sockaddr.storage,
         client_address_length: socklen_t,
         listen_fd: fd_t,
-    ) ?Association {
+        now_ms: u64,
+    ) ?fd_t {
         const snapshot = self.runtime.current();
         const limit: u64 = @intCast(snapshot.configuration.limits.max_udp_associations);
         if (!self.budget.tryAcquire(limit)) {
@@ -831,7 +931,7 @@ pub const UdpRelayEngine = struct {
             }
             return null;
         }
-        return self.establishAssociation(client, client_address, client_address_length, listen_fd, &snapshot) catch |err| {
+        return self.establishAssociation(client, client_address, client_address_length, listen_fd, &snapshot, now_ms) catch |err| {
             self.budget.release(1);
             self.log.err("udp association failed client={f} error={s}", .{ client, @errorName(err) });
             return null;
@@ -845,7 +945,8 @@ pub const UdpRelayEngine = struct {
         client_address_length: socklen_t,
         listen_fd: fd_t,
         snapshot: *const ResolvedConfiguration,
-    ) Error!Association {
+        now_ms: u64,
+    ) Error!fd_t {
         var upstream_storage: posix.sockaddr.storage = undefined;
         const upstream_len = snapshot.upstream_address.toSockaddrStorage(@ptrCast(&upstream_storage));
         const upstream_fd = try bpf.udpUpstreamSocket(@ptrCast(&upstream_storage), upstream_len);
@@ -861,14 +962,17 @@ pub const UdpRelayEngine = struct {
             }
             if (client_fd) |fd| _ = linux.close(fd);
         }
-        if (self.sockmap_runtime != null) {
+        if (self.sockmap_runtime != null and now_ms >= self.accelerate_cooldown_until_ms) {
             if (self.listen_bound.get(listen_fd)) |bind_storage| {
                 if (self.accelerateAssociation(bind_storage, client_address, client_address_length, upstream_fd)) |accelerated| {
                     client_fd = accelerated.fd;
                     pairing = accelerated.pairing;
                 } else |err| {
                     // Kernel steering is best-effort per association; fall
-                    // back to the userspace relay for this client.
+                    // back to the userspace relay for this client. Repeated
+                    // failures (e.g. a full sockhash) pause further attempts
+                    // so every new session does not pay the failed pair cost.
+                    self.accelerate_cooldown_until_ms = now_ms + accelerate_failure_cooldown_ms;
                     self.log.debug("udp sockmap pairing failed client={f} error={s}", .{ client, @errorName(err) });
                 }
             }
@@ -882,7 +986,7 @@ pub const UdpRelayEngine = struct {
             .upstream_fd = upstream_fd,
             .client_fd = client_fd,
             .pairing = pairing,
-            .last_activity_ms = monotonicMilliseconds(),
+            .last_activity_ms = now_ms,
         };
         try self.associations.put(client, association);
         errdefer _ = self.associations.remove(client);
@@ -893,7 +997,7 @@ pub const UdpRelayEngine = struct {
         }
         self.warned_at_limit = false;
         self.log.debug("udp association opened client={f} upstream={f}", .{ client, snapshot.upstream_address });
-        return association;
+        return upstream_fd;
     }
 
     const Acceleration = struct {
@@ -960,11 +1064,10 @@ pub const UdpRelayEngine = struct {
         self.sweep_buffer.clearRetainingCapacity();
     }
 
-    fn sweepExpiredAssociations(self: *UdpRelayEngine) void {
+    fn sweepExpiredAssociations(self: *UdpRelayEngine, now_ms: u64) void {
         const timeout_seconds = self.runtime.current().configuration.timeouts.udp_session_seconds;
         const timeout_ms = @as(u64, @intCast(@max(1, timeout_seconds))) * 1_000;
         const timeout_ns = timeout_ms * 1_000_000;
-        const now = monotonicMilliseconds();
 
         self.sweep_buffer.clearRetainingCapacity();
         defer self.sweep_buffer.clearRetainingCapacity();
@@ -974,14 +1077,19 @@ pub const UdpRelayEngine = struct {
             const expired = blk: {
                 if (association.pairing) |p| {
                     // Steered traffic never reaches userspace; the BPF peer
-                    // state holds the last-activity timestamp instead.
+                    // state holds the last-activity timestamp instead. The
+                    // check is due only when the remaining idle time from the
+                    // previous lookup has elapsed.
+                    if (now_ms < association.sockmap_next_check_ms) break :blk false;
                     if (self.sockmap_runtime) |*runtime| {
                         const remaining = runtime.idleRemainingNs(p.client_cookie, p.upstream_cookie, timeout_ns) catch break :blk true;
-                        break :blk remaining == 0;
+                        if (remaining == 0) break :blk true;
+                        association.sockmap_next_check_ms = now_ms + @max(1, remaining / 1_000_000);
+                        break :blk false;
                     }
                     break :blk true;
                 }
-                break :blk now -% association.last_activity_ms >= timeout_ms;
+                break :blk now_ms -% association.last_activity_ms >= timeout_ms;
             };
             if (expired) {
                 self.log.debug("udp association expired client={f}", .{entry.key_ptr.*});
