@@ -8,7 +8,7 @@ Curtsy 是一个使用 Zig 编写的 TCP/UDP 透明流量转发器，仅支持 L
 
 - 语言与工具链：Zig 0.16+。代码无条件使用 Linux syscall、epoll、eventfd、signalfd、recvmmsg/sendmmsg 与 eBPF API，不保留其他平台的编译期回退。
 - 关键配置清单：`build.zig`（构建定义）、`config.example.yaml`（配置示例）。
-- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.0）；`debian/` 目录提供 Debian 打包（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。
+- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.1）；`debian/` 目录提供 Debian 打包（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。
 
 ## 构建与测试命令
 

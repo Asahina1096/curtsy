@@ -1,3 +1,23 @@
+curtsy (0.3.1) noble; urgency=medium
+
+  * Cut data-plane syscall overhead across the TCP/UDP relays:
+    - TCP: cached timer deadlines with throttled sweeps, 1024-event epoll
+      batches, batched budget release, connection freelist, and one less
+      epoll_ctl per closed connection.
+    - UDP: 50ms-throttled expiry sweeps, idle-time-scheduled sockmap
+      session checks (99% fewer bpf() calls under steer-heavy load),
+      per-wake timestamp reuse, pointer-based association access, faster
+      SocketAddr hashing, pre-sized session maps, rate-limited drop logs,
+      and a cooldown after sockmap pairing failures.
+    - Logging now emits one write syscall per line; the tuning daemon
+      loads its kprobe observer only when a limit is auto-tuned.
+  * Add performance.udpDatagramBufferBytes to size the batched UDP
+    receive slots (576..65536, default 65536).
+  * Build for the architecture baseline CPU by default; pass
+    -Dcpu=native for host-optimized binaries.
+
+ -- Curtsy contributors <maintainers@example.invalid>  Fri, 31 Jul 2026 00:00:00 +0000
+
 curtsy (0.3.0) noble; urgency=medium
 
   * Complete the runtime migration to Zig and remove the previous source tree.

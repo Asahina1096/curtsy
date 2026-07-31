@@ -15,7 +15,7 @@ const config = @import("config.zig");
 const log = @import("log.zig");
 const service = @import("service.zig");
 
-const version = "0.3.0";
+const version = "0.3.1";
 
 const usage =
     \\Usage: curtsy --config <path> [--check-config]
