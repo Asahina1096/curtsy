@@ -1090,11 +1090,12 @@ const Worker = struct {
         // immediate connect failures fail over to the next pick; without one
         // the loop below runs exactly once with the configured upstream.
         const selector = listener.options.upstream_selector;
-        const max_attempts: usize = if (selector == null) 1 else max_failover_attempts;
+        const can_failover = if (selector) |s| s.isMulti() else false;
+        const max_attempts: usize = if (can_failover) max_failover_attempts else 1;
         var connect_errno: linux.E = .SUCCESS;
         var attempt: usize = 0;
         connect_attempts: while (true) {
-            if (selector) |s| connection.upstream_addr = s.pick(client_address, now);
+            if (can_failover) connection.upstream_addr = selector.?.pick(client_address, now);
             switch (self.connectUpstreamOnce(connection)) {
                 .connected => {
                     connect_errno = .SUCCESS;
@@ -1195,6 +1196,7 @@ const Worker = struct {
     fn retryUpstream(self: *Worker, connection: *Connection, now: u64) bool {
         const listener = self.listener;
         const selector = listener.options.upstream_selector orelse return false;
+        if (!selector.isMulti()) return false;
         selector.reportFailure(connection.upstream_addr, now);
         connection.failover_attempts += 1;
         if (connection.failover_attempts >= max_failover_attempts) return false;
@@ -2474,10 +2476,16 @@ const MockSelector = struct {
     fn selector(self: *MockSelector) UpstreamSelector {
         return .{
             .context = self,
+            .is_multi_fn = isMulti,
             .pick_fn = pick,
             .report_success_fn = reportSuccess,
             .report_failure_fn = reportFailure,
         };
+    }
+
+    fn isMulti(context: *anyopaque) bool {
+        const self: *MockSelector = @ptrCast(@alignCast(context));
+        return self.addresses.len > 1;
     }
 
     fn deinit(self: *MockSelector) void {
@@ -2553,6 +2561,41 @@ test "tcp selector chooses the upstream per connection" {
     }
     try testing.expectEqual(@as(usize, 0), mock.failures.items.len);
     try testing.expectEqual(@as(usize, 4), mock.successes.items.len);
+}
+
+test "tcp single upstream selector keeps the fixed upstream path" {
+    var echo = try EchoServer.start();
+    defer echo.stop();
+    const address = config.SocketAddr.parseIp("127.0.0.1", echo.port).?;
+
+    var mock = MockSelector{ .addresses = &.{address} };
+    defer mock.deinit();
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 1,
+        .enable_sockmap_acceleration = false,
+        .upstream_selector = mock.selector(),
+    });
+    defer listener.deinit();
+    try listener.start();
+    defer {
+        listener.stopAccepting();
+        listener.forceCloseConnections();
+    }
+
+    const client = try connectClient(listener.localAddresses()[0].port);
+    defer closeFd(client);
+    try writeAll(client, "ping");
+    var received: [4]u8 = undefined;
+    try readFully(client, &received);
+    try testing.expectEqualStrings("ping", &received);
+
+    try testing.expectEqual(@as(usize, 0), mock.picks.items.len);
+    try testing.expectEqual(@as(usize, 0), mock.failures.items.len);
 }
 
 test "tcp selector fails over from a dead upstream and evicts it" {

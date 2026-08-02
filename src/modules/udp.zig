@@ -119,10 +119,8 @@ pub const SockmapRuntimeLoader = *const fn (max_entries: u32, verifier_log: ?[]u
 pub const default_sockmap_runtime_loader: SockmapRuntimeLoader = bpf.SockmapRuntime.createUdp;
 
 /// Optional upstream-selection hook (upstream module). When set, each new
-/// association asks the selector for its upstream address instead of using
-/// the configured one, and upstream socket errors/successes are reported
-/// back for passive health tracking. When null the listener behaves exactly
-/// as a single-upstream forwarder.
+/// association asks the selector for its upstream address, and upstream
+/// socket errors/successes are reported back for passive health tracking.
 pub const UpstreamSelector = upstream.Selector;
 
 // ---------------------------------------------------------------------------
@@ -1393,10 +1391,16 @@ const MockUdpSelector = struct {
     fn selector(self: *MockUdpSelector) UpstreamSelector {
         return .{
             .context = self,
+            .is_multi_fn = isMulti,
             .pick_fn = pick,
             .report_success_fn = reportSuccess,
             .report_failure_fn = reportFailure,
         };
+    }
+
+    fn isMulti(context: *anyopaque) bool {
+        const self: *MockUdpSelector = @ptrCast(@alignCast(context));
+        return self.addresses.len > 1;
     }
 
     fn deinit(self: *MockUdpSelector) void {

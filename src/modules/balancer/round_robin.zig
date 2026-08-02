@@ -9,10 +9,6 @@ const upstream = @import("../upstream.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const State = struct {
-    sequence: []u32,
-};
-
 pub const balancer: upstream.Balancer = .{
     .name = "round_robin",
     .build = build,
@@ -21,22 +17,28 @@ pub const balancer: upstream.Balancer = .{
 };
 
 fn build(allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque {
+    _ = allocator;
+    _ = addresses;
     _ = weights;
-    const state = try allocator.create(State);
-    errdefer allocator.destroy(state);
-    state.sequence = try allocator.alloc(u32, addresses.len);
-    for (state.sequence, 0..) |*slot, i| slot.* = @intCast(i);
-    return state;
+    return null;
 }
 
 fn destroy(allocator: Allocator, opaque_state: ?*anyopaque) void {
-    const state: *State = @ptrCast(@alignCast(opaque_state orelse return));
-    allocator.free(state.sequence);
-    allocator.destroy(state);
+    _ = allocator;
+    _ = opaque_state;
 }
 
 fn pick(opaque_state: ?*anyopaque, upstreams: []const upstream.UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize {
+    _ = opaque_state;
     _ = client;
-    const state: *State = @ptrCast(@alignCast(opaque_state.?));
-    return upstream.pickSequential(state.sequence, upstreams, cursor, now_ns);
+    const len: u32 = @intCast(upstreams.len);
+    const start = cursor.fetchAdd(1, .monotonic) % len;
+    var index = start;
+    var remaining = upstreams.len;
+    while (remaining > 0) : (remaining -= 1) {
+        if (upstreams[index].eligible(now_ns)) return index;
+        index += 1;
+        if (index == len) index = 0;
+    }
+    return start;
 }

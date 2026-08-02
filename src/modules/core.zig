@@ -625,12 +625,16 @@ pub const ForwarderService = struct {
     }
 
     /// Spawn one protocol listener through the protocol module registry. The
-    /// selector hook is attached only when the rule has multiple upstreams;
-    /// a single upstream keeps the legacy fixed-upstream fast path.
+    /// pool selector stays attached across reloads so single/multi-upstream
+    /// transitions do not require rebinding the listen sockets.
     fn createListener(self: *ForwarderService, candidate: *const ResolvedRule, rt: *RuleRuntime, protocol: ForwardProtocol) Error!*Listener {
         _ = candidate;
-        const selector: ?upstream.Selector = if (rt.pool.count() > 1) upstream.poolSelector(&rt.pool) else null;
-        return fw.protocolModule(protocol).create(self.allocator, rt.resolved, &self.logger, selector);
+        return fw.protocolModule(protocol).create(
+            self.allocator,
+            rt.resolved,
+            &self.logger,
+            upstream.poolSelector(&rt.pool),
+        );
     }
 
     /// Update a matched rule in place: pool upstream set, protocol toggles,
@@ -658,28 +662,19 @@ pub const ForwarderService = struct {
             });
         }
 
-        // Refresh the upstream pool. A balance policy change recreates the
-        // pool in place (health state resets); an upstream set change rebinds
-        // and inherits health by address. Selector contexts stay valid either
-        // way because the pool storage never moves.
-        const old_addresses = try rt.pool.currentAddresses(self.allocator);
-        defer self.allocator.free(old_addresses);
-        const upstream_changed = !net.addressesEqual(old_addresses, candidate.upstream_addresses);
-
-        if (candidate.rule.balance != rt.balance) {
+        // Publish upstream and balance changes as one generation. Listener
+        // threads keep selecting without a lock, and matching addresses carry
+        // their health state into the new generation.
+        const upstream_changed = !rt.pool.addressesEqual(candidate.upstream_addresses);
+        const weights_changed = !ruleWeightsEqual(rt.rule, candidate.rule);
+        if (candidate.rule.balance != rt.balance or upstream_changed or weights_changed) {
             const weights = try self.ruleWeights(candidate.rule);
             defer self.allocator.free(weights);
-            rt.pool.deinit();
-            rt.pool = try upstream.UpstreamPool.init(
-                self.allocator,
+            try rt.pool.reconfigure(
                 candidate.upstream_addresses,
                 weights,
                 candidate.rule.balance,
             );
-        } else if (upstream_changed) {
-            const weights = try self.ruleWeights(candidate.rule);
-            defer self.allocator.free(weights);
-            try rt.pool.rebind(candidate.upstream_addresses, weights);
         }
 
         const protocols = candidate.effectiveProtocols();
@@ -1056,6 +1051,14 @@ pub const ForwarderService = struct {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn ruleWeightsEqual(a: RuleConfiguration, b: RuleConfiguration) bool {
+    if (a.upstreams.len != b.upstreams.len) return false;
+    for (a.upstreams, b.upstreams) |old, new| {
+        if (old.weight != new.weight) return false;
+    }
+    return true;
+}
 
 /// Rule overrides plus auto thread pools divided across rules when more
 /// than one rule exists.

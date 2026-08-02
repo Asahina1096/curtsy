@@ -4,19 +4,20 @@
 
 ## 项目概述
 
-Curtsy 是一个使用 Zig 编写的 TCP/UDP 透明流量转发器，仅支持 Linux。它在固定地址和端口上监听 TCP、UDP 或两种协议，并把流量转发到固定上游。默认只运行一条监听规则和一个上游；配置出现顶层 `rules` 列表时启用可选的多规则模块（多监听规则 + 规则内多上游负载均衡）。不终止 TLS、不检查流量内容、不记录转发数据正文。
+Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/UDP 透明流量转发器，仅支持 Linux。它在固定地址和端口上监听 TCP、UDP 或两种协议，并把流量转发到固定上游。默认只运行一条监听规则和一个上游；配置出现顶层 `rules` 列表时启用可选的多规则模块（多监听规则 + 规则内多上游负载均衡）。不终止 TLS、不检查流量内容、不记录转发数据正文。
 
-- 语言与工具链：Zig 0.16+。代码无条件使用 Linux syscall、epoll、eventfd、signalfd、recvmmsg/sendmmsg 与 eBPF API，不保留其他平台的编译期回退。
+- 语言与工具链：仓库内 `.toolchain` 固定 Zig 0.16.0 和 libbpf/libelf/zlib/zstd 静态依赖；eBPF 内核程序位于 `src/ebpf/*.bpf.c`，由 Zig 发行包内置的 Clang 前端在构建期编译为标准 BPF ELF。正常构建不从 PATH、`/usr/include` 或 `/usr/lib` 解析依赖。用户态代码无条件使用 Linux syscall、epoll、eventfd、signalfd、recvmmsg/sendmmsg 与 eBPF API，不保留其他平台的编译期回退。
 - 关键配置清单：`build.zig`（构建定义）、`config.example.yaml`（配置示例）。
 - 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.1）；`debian/` 目录提供 Debian 打包（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。
 
 ## 构建与测试命令
 
 ```bash
-zig build -Doptimize=ReleaseSafe      # 产物位于 zig-out/bin/curtsy
-zig build test                        # 运行全部 Zig 单元/回环测试
-zig build run -- --config config.yaml --check-config
-zig build run -- --config config.yaml
+./tools/bootstrap-build-deps.sh       # 首次构建或更新固定依赖时运行
+.toolchain/zig/zig build -Doptimize=ReleaseSafe
+.toolchain/zig/zig build test
+.toolchain/zig/zig build run -- --config config.yaml --check-config
+.toolchain/zig/zig build run -- --config config.yaml
 ```
 
 默认按架构基线 CPU 编译（`-mcpu baseline`），保证二进制可移植；本地开发想要本机优化时显式传 `-Dcpu=native`。
@@ -34,7 +35,9 @@ zig build run -- --config config.yaml
 - `src/net.zig`：`SocketAddr`、resolver（可注入测试）、listen 地址展开（`*` → 双栈通配对）、协议列表助手。
 - `src/log.zig`：带原子阈值和 futex mutex 的日志门面，输出到 stderr。
 - `src/autotune.zig`：CPU/内存自适应默认值公式。
-- `src/bpf.zig`：纯 Zig eBPF/syscall 封装，包含 sockhash map、SK_SKB parser/verdict 程序、reuseport 分流程序、BPF observer、UDP 批量 I/O 和 Linux socket/epoll/eventfd helper。
+- `src/bpf.zig`：eBPF/syscall 运行时封装，负责使用 libbpf 打开内嵌 BPF ELF、配置 map/只读常量、取得 FD、管理 link/object 生命周期，以及 sockhash 操作、UDP 批量 I/O 和 Linux socket/epoll/eventfd helper。
+- `src/ebpf/`：C 编写的 eBPF 内核程序，包括 SK_SKB parser/verdict、reuseport 分流程序和 kprobe observer；Clang 产出的 ELF（含 BTF/重定位）嵌入 `curtsy`，运行时由 libbpf 加载。
+- `src/libbpf_shim.c`：隔离 Zig 与 libbpf C API 的薄封装，避免在 Zig 侧复制 libbpf 结构布局。
 
 模块（src/modules/）：
 
@@ -71,7 +74,7 @@ zig build run -- --config config.yaml
 - `src/modules/upstream.zig` 覆盖三种选路策略、摘除阈值与冷却恢复、全摘除回退、单上游退化、`rebind` 健康继承与 balancer 注册表。
 - `src/modules/tcp.zig` 使用真实回环网络测试 TCP 回显往返、缓冲预算、UDP 会话隔离与超时重载、多 worker 共享端口与预算、backlog 原地更新、通配符双栈监听等；selector 钩子测试覆盖按连接选路、故障转移与摘除。
 - `src/modules/udp.zig` 使用回环 UDP echo 测试 selector 按会话选路、ICMP 错误上报与摘除后重选。测试绑定 `127.0.0.1` 的 0 号端口，无需 root。
-- 新增功能应附带同风格测试；修改转发逻辑后运行完整 `zig build test`。
+- 新增功能应附带同风格测试；修改转发逻辑后运行完整 `.toolchain/zig/zig build test`。
 
 ## 安全注意事项
 

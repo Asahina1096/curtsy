@@ -2,13 +2,12 @@ Source: curtsy
 Section: net
 Priority: optional
 Maintainer: Curtsy contributors <maintainers@example.invalid>
-Build-Depends: debhelper-compat (= 13),
- zig
+Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
 Package: curtsy
-Architecture: any
+Architecture: amd64
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Description: transparent TCP and UDP traffic forwarder
  Curtsy is a Zig-based Linux TCP and UDP traffic forwarder. It listens on one

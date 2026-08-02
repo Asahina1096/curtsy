@@ -8,10 +8,11 @@
 //! the pool itself only tracks eligibility and generations.
 //!
 //! A pool is a stable per-rule object whose address is captured by the
-//! TCP/UDP selector hooks; configuration reloads swap the internal
-//! generation under a mutex (inheriting health state by address) so the
-//! selector context never changes. A single-entry pool degrades to a
-//! constant pick with no bookkeeping.
+//! TCP/UDP selector hooks; configuration reloads atomically publish a new
+//! stable generation (inheriting health state by address) so picks never
+//! serialize with each other. Old generations are reclaimed when the pool is
+//! destroyed, after its listeners have stopped. A single-entry pool degrades
+//! to a constant pick with no cursor bookkeeping.
 //!
 //! Eviction is passive: consecutive failures at or above `failure_threshold`
 //! park an upstream for a cooldown that backs off exponentially on repeated
@@ -19,7 +20,6 @@
 //! eligible again and real traffic decides.
 
 const std = @import("std");
-const log = @import("../log.zig");
 const net = @import("../net.zig");
 
 const round_robin = @import("balancer/round_robin.zig");
@@ -97,9 +97,14 @@ pub fn balancerNames(buf: []u8) []const u8 {
 /// single-upstream forwarder.
 pub const Selector = struct {
     context: *anyopaque,
+    is_multi_fn: *const fn (context: *anyopaque) bool,
     pick_fn: *const fn (context: *anyopaque, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr,
     report_success_fn: *const fn (context: *anyopaque, upstream: net.SocketAddr) void,
     report_failure_fn: *const fn (context: *anyopaque, upstream: net.SocketAddr, now_ns: u64) void,
+
+    pub fn isMulti(self: Selector) bool {
+        return self.is_multi_fn(self.context);
+    }
 
     pub fn pick(self: Selector, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr {
         return self.pick_fn(self.context, client, now_ns);
@@ -119,6 +124,11 @@ fn poolPick(context: *anyopaque, client: ?net.SocketAddr, now_ns: u64) net.Socke
     return pool.pick(client, now_ns);
 }
 
+fn poolIsMulti(context: *anyopaque) bool {
+    const pool: *UpstreamPool = @ptrCast(@alignCast(context));
+    return pool.count() > 1;
+}
+
 fn poolReportSuccess(context: *anyopaque, upstream_addr: net.SocketAddr) void {
     const pool: *UpstreamPool = @ptrCast(@alignCast(context));
     pool.reportSuccess(upstream_addr);
@@ -133,6 +143,7 @@ fn poolReportFailure(context: *anyopaque, upstream_addr: net.SocketAddr, now_ns:
 pub fn poolSelector(pool: *UpstreamPool) Selector {
     return .{
         .context = pool,
+        .is_multi_fn = poolIsMulti,
         .pick_fn = poolPick,
         .report_success_fn = poolReportSuccess,
         .report_failure_fn = poolReportFailure,
@@ -145,8 +156,10 @@ pub fn poolSelector(pool: *UpstreamPool) Selector {
 
 const Generation = struct {
     upstreams: []UpstreamState,
+    balancer: *const Balancer,
     /// Strategy state built by the balancer module (e.g. pick sequence).
     strategy: ?*anyopaque,
+    retired_next: ?*Generation = null,
 
     fn indexOf(self: *const Generation, address: net.SocketAddr) ?usize {
         for (self.upstreams, 0..) |*upstream, i| {
@@ -158,13 +171,10 @@ const Generation = struct {
 
 pub const UpstreamPool = struct {
     allocator: Allocator,
-    balancer: *const Balancer,
-    /// Guards generation/retired; critical sections are per-connection
-    /// picks and failure reports, never per-packet work.
-    mutex: log.Mutex = .{},
-    generation: *Generation,
-    /// Previous generation, retired one swap late; any reader of it finished
-    /// its critical section before the swap that replaced it completed.
+    /// Readers only load this pointer. Published generations stay alive until
+    /// deinit, matching the service's retained-cycle lifetime across reloads.
+    generation: std.atomic.Value(*Generation),
+    /// Written only by the configuration thread.
     retired: ?*Generation = null,
     cursor: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -177,46 +187,45 @@ pub const UpstreamPool = struct {
         balancer: *const Balancer,
     ) error{OutOfMemory}!UpstreamPool {
         const generation = try buildGeneration(allocator, addresses, weights, balancer, null);
-        errdefer destroyGeneration(allocator, balancer, generation);
         return .{
             .allocator = allocator,
-            .balancer = balancer,
-            .generation = generation,
+            .generation = std.atomic.Value(*Generation).init(generation),
         };
     }
 
     pub fn deinit(self: *UpstreamPool) void {
-        destroyGeneration(self.allocator, self.balancer, self.generation);
-        if (self.retired) |retired| destroyGeneration(self.allocator, self.balancer, retired);
+        destroyGeneration(self.allocator, self.generation.load(.monotonic));
+        var retired = self.retired;
+        while (retired) |generation| {
+            retired = generation.retired_next;
+            destroyGeneration(self.allocator, generation);
+        }
     }
 
     /// Number of upstreams in the current generation.
     pub fn count(self: *UpstreamPool) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.generation.upstreams.len;
+        return self.generation.load(.acquire).upstreams.len;
     }
 
     /// Choose an upstream address. Single-upstream pools return immediately
     /// without touching any counters. Evicted upstreams are skipped; when all
     /// are evicted the eviction state is ignored rather than refusing traffic.
     pub fn pick(self: *UpstreamPool, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const generation = self.generation;
+        const generation = self.generation.load(.acquire);
         if (generation.upstreams.len == 1) return generation.upstreams[0].address;
-        const index = self.balancer.pick(generation.strategy, generation.upstreams, &self.cursor, client, now_ns);
+        const index = generation.balancer.pick(generation.strategy, generation.upstreams, &self.cursor, client, now_ns);
         return generation.upstreams[index].address;
     }
 
     /// Record a successful exchange with an upstream: clears its failure
     /// count and eviction backoff.
     pub fn reportSuccess(self: *UpstreamPool, address: net.SocketAddr) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const index = self.generation.indexOf(address) orelse return;
-        const upstream = &self.generation.upstreams[index];
+        const generation = self.generation.load(.acquire);
+        if (generation.upstreams.len == 1) return;
+        const index = generation.indexOf(address) orelse return;
+        const upstream = &generation.upstreams[index];
         upstream.consecutive_failures.store(0, .monotonic);
+        upstream.evicted_until_ns.store(0, .monotonic);
         upstream.eviction_streak.store(0, .monotonic);
     }
 
@@ -224,15 +233,15 @@ pub const UpstreamPool = struct {
     /// upstream is parked with exponential backoff. A single-upstream pool
     /// ignores reports (there is nowhere else to go).
     pub fn reportFailure(self: *UpstreamPool, address: net.SocketAddr, now_ns: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const generation = self.generation;
+        const generation = self.generation.load(.acquire);
         if (generation.upstreams.len == 1) return;
         const index = generation.indexOf(address) orelse return;
         const upstream = &generation.upstreams[index];
 
         const failures = upstream.consecutive_failures.fetchAdd(1, .monotonic) + 1;
-        if (failures < failure_threshold) return;
+        // Exactly one reporter performs the eviction transition. Concurrent
+        // failures above the threshold belong to the same failure burst.
+        if (failures != failure_threshold) return;
 
         upstream.consecutive_failures.store(0, .monotonic);
         const streak = upstream.eviction_streak.fetchAdd(1, .monotonic) + 1;
@@ -240,36 +249,44 @@ pub const UpstreamPool = struct {
         const backoff = @min(base_evict_ns << shift, max_evict_ns);
         const until = now_ns + backoff;
         // Never shorten an active eviction when failures race.
-        const current = upstream.evicted_until_ns.load(.monotonic);
-        upstream.evicted_until_ns.store(@max(current, until), .monotonic);
+        _ = upstream.evicted_until_ns.fetchMax(until, .monotonic);
     }
 
-    /// Swap the upstream set (configuration reload). Health state is carried
-    /// over for addresses present in both generations. The pool object itself
-    /// stays put, so selector contexts captured by listeners remain valid.
+    /// Swap the upstream set while keeping the current balance policy.
     pub fn rebind(
         self: *UpstreamPool,
         addresses: []const net.SocketAddr,
         weights: []const u32,
     ) error{OutOfMemory}!void {
-        const replacement = try buildGeneration(self.allocator, addresses, weights, self.balancer, self.generation);
-        self.mutex.lock();
-        const old = self.generation;
-        self.generation = replacement;
-        if (self.retired) |retired| destroyGeneration(self.allocator, self.balancer, retired);
-        self.retired = old;
-        self.mutex.unlock();
+        const current = self.generation.load(.acquire);
+        try self.reconfigure(addresses, weights, current.balancer);
     }
 
-    /// Snapshot of the current upstream addresses (used to detect upstream
-    /// set changes across reloads). Caller owns the returned slice.
-    pub fn currentAddresses(self: *UpstreamPool, allocator: Allocator) error{OutOfMemory}![]net.SocketAddr {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const generation = self.generation;
-        const addresses = try allocator.alloc(net.SocketAddr, generation.upstreams.len);
-        for (generation.upstreams, 0..) |*upstream, i| addresses[i] = upstream.address;
-        return addresses;
+    /// Atomically publish an upstream/balancer generation. Health state is
+    /// carried over for addresses present in both generations. Retaining old
+    /// generations avoids reader-side locks and makes policy changes safe
+    /// while listener threads are selecting peers.
+    pub fn reconfigure(
+        self: *UpstreamPool,
+        addresses: []const net.SocketAddr,
+        weights: []const u32,
+        balancer: *const Balancer,
+    ) error{OutOfMemory}!void {
+        const current = self.generation.load(.acquire);
+        const replacement = try buildGeneration(self.allocator, addresses, weights, balancer, current);
+        const old = self.generation.swap(replacement, .acq_rel);
+        old.retired_next = self.retired;
+        self.retired = old;
+    }
+
+    /// Allocation-free address comparison used by the reload path.
+    pub fn addressesEqual(self: *UpstreamPool, addresses: []const net.SocketAddr) bool {
+        const generation = self.generation.load(.acquire);
+        if (generation.upstreams.len != addresses.len) return false;
+        for (generation.upstreams, addresses) |upstream_state, address| {
+            if (!upstream_state.address.eql(address)) return false;
+        }
+        return true;
     }
 };
 
@@ -277,15 +294,18 @@ pub const UpstreamPool = struct {
 /// robin): rotate through the strategy sequence from the shared cursor,
 /// skipping evicted upstreams, serving the first entry when all are parked.
 pub fn pickSequential(sequence: []const u32, upstreams: []const UpstreamState, cursor: *std.atomic.Value(u32), now_ns: u64) usize {
-    const start = cursor.fetchAdd(1, .monotonic) % @as(u32, @intCast(sequence.len));
-    var first: ?usize = null;
-    var step: u32 = 0;
-    while (step < sequence.len) : (step += 1) {
-        const index = sequence[(start + step) % @as(u32, @intCast(sequence.len))];
-        if (first == null) first = index;
+    const sequence_len: u32 = @intCast(sequence.len);
+    const start = cursor.fetchAdd(1, .monotonic) % sequence_len;
+    const first: usize = sequence[start];
+    var position = start;
+    var remaining = sequence.len;
+    while (remaining > 0) : (remaining -= 1) {
+        const index = sequence[position];
         if (upstreams[index].eligible(now_ns)) return index;
+        position += 1;
+        if (position == sequence_len) position = 0;
     }
-    return first.?;
+    return first;
 }
 
 fn buildGeneration(
@@ -313,12 +333,12 @@ fn buildGeneration(
     errdefer balancer.destroy(allocator, strategy);
 
     const generation = try allocator.create(Generation);
-    generation.* = .{ .upstreams = upstreams, .strategy = strategy };
+    generation.* = .{ .upstreams = upstreams, .balancer = balancer, .strategy = strategy };
     return generation;
 }
 
-fn destroyGeneration(allocator: Allocator, balancer: *const Balancer, generation: *Generation) void {
-    balancer.destroy(allocator, generation.strategy);
+fn destroyGeneration(allocator: Allocator, generation: *Generation) void {
+    generation.balancer.destroy(allocator, generation.strategy);
     allocator.free(generation.upstreams);
     allocator.destroy(generation);
 }
@@ -484,6 +504,44 @@ test "rebind swaps upstreams and inherits health by address" {
     try testing.expect(pool.pick(null, now).eql(addresses[1])); // 0 still parked
 }
 
+test "reconfigure switches balancer and weights without replacing the pool" {
+    const addresses = testAddresses(2);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    defer pool.deinit();
+
+    try pool.reconfigure(
+        addresses[0..2],
+        &.{ 1, 3 },
+        balancerByName("weighted_round_robin").?,
+    );
+
+    var counts = [_]usize{ 0, 0 };
+    for (0..8) |_| {
+        const picked = pool.pick(null, 0);
+        if (picked.eql(addresses[0])) counts[0] += 1;
+        if (picked.eql(addresses[1])) counts[1] += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), counts[0]);
+    try testing.expectEqual(@as(usize, 6), counts[1]);
+}
+
+test "success immediately clears an active eviction" {
+    const addresses = testAddresses(2);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    defer pool.deinit();
+
+    const now: u64 = 1_000;
+    for (0..failure_threshold) |_| pool.reportFailure(addresses[0], now);
+    for (0..4) |_| try testing.expect(pool.pick(null, now).eql(addresses[1]));
+
+    pool.reportSuccess(addresses[0]);
+    var recovered = false;
+    for (0..4) |_| {
+        if (pool.pick(null, now).eql(addresses[0])) recovered = true;
+    }
+    try testing.expect(recovered);
+}
+
 test "reports for unknown addresses are ignored" {
     const addresses = testAddresses(2);
     var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
@@ -511,8 +569,57 @@ test "pool selector adapts pick and reports" {
     defer pool.deinit();
 
     const selector = poolSelector(&pool);
+    try testing.expect(selector.isMulti());
     try testing.expect(selector.pick(null, 0).eql(addresses[0]));
     for (0..failure_threshold) |_| selector.reportFailure(addresses[0], 1_000);
     try testing.expect(selector.pick(null, 1_000).eql(addresses[1]));
     selector.reportSuccess(addresses[1]);
+}
+
+test "pool selector observes single to multi upstream reloads" {
+    const addresses = testAddresses(2);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..1], &.{1}, defaultBalancer());
+    defer pool.deinit();
+
+    const selector = poolSelector(&pool);
+    try testing.expect(!selector.isMulti());
+    try pool.rebind(addresses[0..2], &.{ 1, 1 });
+    try testing.expect(selector.isMulti());
+}
+
+test "concurrent picks remain valid while generations are published" {
+    const addresses = testAddresses(3);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    defer pool.deinit();
+
+    var invalid = std.atomic.Value(bool).init(false);
+    const Picker = struct {
+        fn run(target: *UpstreamPool, expected: []const net.SocketAddr, bad: *std.atomic.Value(bool)) void {
+            for (0..100_000) |_| {
+                const picked = target.pick(null, 0);
+                var found = false;
+                for (expected) |address| {
+                    if (picked.eql(address)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) bad.store(true, .release);
+            }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Picker.run, .{ &pool, addresses[0..3], &invalid });
+    }
+    for (0..64) |i| {
+        if (i % 2 == 0) {
+            try pool.reconfigure(addresses[0..3], &.{ 1, 2, 3 }, balancerByName("weighted_round_robin").?);
+        } else {
+            try pool.reconfigure(addresses[0..2], &.{ 1, 1 }, balancerByName("source_hash").?);
+        }
+    }
+    for (&threads) |*thread| thread.join();
+    try testing.expect(!invalid.load(.acquire));
 }

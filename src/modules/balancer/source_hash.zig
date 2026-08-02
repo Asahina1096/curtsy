@@ -34,10 +34,12 @@ fn pick(state: ?*anyopaque, upstreams: []const upstream.UpstreamState, cursor: *
     const start: usize = if (client) |address| hashClient(address) % upstreams.len else blk: {
         break :blk cursor.fetchAdd(1, .monotonic) % @as(u32, @intCast(upstreams.len));
     };
-    var step: usize = 0;
-    while (step < upstreams.len) : (step += 1) {
-        const index = (start + step) % upstreams.len;
+    var index = start;
+    var remaining = upstreams.len;
+    while (remaining > 0) : (remaining -= 1) {
         if (upstreams[index].eligible(now_ns)) return index;
+        index += 1;
+        if (index == upstreams.len) index = 0;
     }
     return start;
 }

@@ -1,20 +1,53 @@
-//! Pure Zig eBPF and Linux syscall support: raw bpf() syscall
-//! wrappers, sockhash map runtimes with cookie pairing and activity
-//! timestamps, the TCP sockmap loader (stream parser + verdict), the UDP
-//! verdict-only loader (BPF_SK_SKB_VERDICT, kernel >= 5.12), the
-//! SO_ATTACH_REUSEPORT_EBPF program loader, the kprobe-based BPF observer,
-//! batched UDP I/O (recvmmsg/sendmmsg), and the epoll/eventfd/UDP socket
-//! primitives the relay engines use.
+//! Linux syscall and eBPF runtime support. Kernel programs are written in C
+//! under src/ebpf, compiled by Clang into standard BPF ELF objects, and loaded
+//! through libbpf (ELF relocations, maps, BTF and verifier logs). This module
+//! owns their runtime handles and also provides batched UDP I/O plus the
+//! epoll/eventfd/socket primitives used by the relay engines.
 //!
-//! Linux-only, no external dependencies. Every eBPF loader fails with an
-//! error when privileges or kernel support are missing; callers fall back
-//! to userspace paths. Nothing here may crash on loader failure.
+//! Linux-only. Every eBPF loader fails with an error when privileges or kernel
+//! support are missing; callers fall back to userspace paths. Nothing here may
+//! crash on loader failure.
 
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const BPF = linux.BPF;
-const Insn = BPF.Insn;
+const bpf_programs = @import("bpf_programs");
+
+const embedded_programs = struct {
+    const tcp_sockmap = bpf_programs.tcp_sockmap;
+    const udp_sockmap = bpf_programs.udp_sockmap;
+    const reuseport = bpf_programs.reuseport;
+    const observer = bpf_programs.observer;
+};
+
+const LibbpfObject = opaque {};
+const LibbpfLink = opaque {};
+
+extern fn curtsy_libbpf_open(
+    data: *const anyopaque,
+    size: usize,
+    kernel_log: ?[*]u8,
+    kernel_log_size: usize,
+    error_out: *c_int,
+) ?*LibbpfObject;
+extern fn curtsy_libbpf_close(object: *LibbpfObject) void;
+extern fn curtsy_libbpf_set_map_max_entries(object: *LibbpfObject, map_name: [*:0]const u8, max_entries: u32) c_int;
+extern fn curtsy_libbpf_set_rodata(object: *LibbpfObject, data: *const anyopaque, size: usize) c_int;
+extern fn curtsy_libbpf_set_expected_attach_type(object: *LibbpfObject, program_name: [*:0]const u8, attach_type: u32) c_int;
+extern fn curtsy_libbpf_load(object: *LibbpfObject) c_int;
+extern fn curtsy_libbpf_map_fd(object: *LibbpfObject, map_name: [*:0]const u8) c_int;
+extern fn curtsy_libbpf_program_fd(object: *LibbpfObject, program_name: [*:0]const u8) c_int;
+extern fn curtsy_libbpf_has_program(object: *LibbpfObject, program_name: [*:0]const u8) c_int;
+extern fn curtsy_libbpf_program_type(object: *LibbpfObject, program_name: [*:0]const u8) c_int;
+extern fn curtsy_libbpf_dup_program_fd(object: *LibbpfObject, program_name: [*:0]const u8) c_int;
+extern fn curtsy_libbpf_attach_kprobe(
+    object: *LibbpfObject,
+    program_name: [*:0]const u8,
+    function_name: [*:0]const u8,
+    error_out: *c_int,
+) ?*LibbpfLink;
+extern fn curtsy_libbpf_destroy_link(link: *LibbpfLink) void;
 
 pub const fd_t = linux.fd_t;
 pub const socklen_t = linux.socklen_t;
@@ -68,33 +101,43 @@ fn sysFd(rc: usize) Error!fd_t {
     return @intCast(try sys(rc));
 }
 
+fn libbpfError(return_code: c_int) Error {
+    const positive: u32 = @intCast(-@as(i64, return_code));
+    const errno_code: u16 = @intCast(@min(positive, std.math.maxInt(u16)));
+    return errnoError(@enumFromInt(errno_code));
+}
+
+fn libbpfStatus(return_code: c_int) Error!void {
+    if (return_code < 0) return libbpfError(return_code);
+}
+
+fn libbpfFd(return_code: c_int) Error!fd_t {
+    if (return_code < 0) return libbpfError(return_code);
+    return @intCast(return_code);
+}
+
+fn openBpfObject(bytes: []const u8, verifier_log: ?[]u8) Error!*LibbpfObject {
+    var error_code: c_int = 0;
+    var log_pointer: ?[*]u8 = null;
+    var log_size: usize = 0;
+    if (verifier_log) |log| {
+        if (log.len > 0) {
+            log_pointer = log.ptr;
+            log_size = log.len;
+        }
+    }
+    return curtsy_libbpf_open(bytes.ptr, bytes.len, log_pointer, log_size, &error_code) orelse {
+        if (error_code >= 0) error_code = -@as(c_int, @intFromEnum(linux.E.INVAL));
+        return libbpfError(error_code);
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Raw bpf() syscall wrappers
 // ---------------------------------------------------------------------------
 
 fn bpfCall(cmd: BPF.Cmd, attr: *BPF.Attr) usize {
     return linux.bpf(cmd, attr, @sizeOf(BPF.Attr));
-}
-
-fn copyObjectName(dest: *[16]u8, name: []const u8) void {
-    const length = @min(name.len, dest.len - 1);
-    @memcpy(dest[0..length], name[0..length]);
-}
-
-fn createMap(
-    map_type: BPF.MapType,
-    key_size: u32,
-    value_size: u32,
-    max_entries: u32,
-    name: []const u8,
-) Error!fd_t {
-    var attr: BPF.Attr = std.mem.zeroes(BPF.Attr);
-    attr.map_create.map_type = @intFromEnum(map_type);
-    attr.map_create.key_size = key_size;
-    attr.map_create.value_size = value_size;
-    attr.map_create.max_entries = max_entries;
-    copyObjectName(&attr.map_create.map_name, name);
-    return sysFd(bpfCall(.map_create, &attr));
 }
 
 fn mapUpdate(map_fd: fd_t, key: *const anyopaque, value: *const anyopaque) Error!void {
@@ -137,37 +180,6 @@ fn progDetach(target_fd: fd_t, program_fd: fd_t, attach_type: BPF.AttachType) vo
     _ = bpfCall(.prog_detach, &attr);
 }
 
-/// Loads a GPL-licensed eBPF program, capturing the verifier log into the
-/// caller-provided buffer (NUL-terminated, empty on entry when provided).
-fn loadProgram(
-    prog_type: BPF.ProgType,
-    expected_attach_type: ?BPF.AttachType,
-    program_name: []const u8,
-    insns: []const Insn,
-    verifier_log: ?[]u8,
-) Error!fd_t {
-    const license = "GPL";
-
-    var attr: BPF.Attr = std.mem.zeroes(BPF.Attr);
-    attr.prog_load.prog_type = @intFromEnum(prog_type);
-    attr.prog_load.insn_cnt = @intCast(insns.len);
-    attr.prog_load.insns = @intFromPtr(insns.ptr);
-    attr.prog_load.license = @intFromPtr(license.ptr);
-    if (expected_attach_type) |attach_type| {
-        attr.prog_load.expected_attach_type = @intFromEnum(attach_type);
-    }
-    copyObjectName(&attr.prog_load.prog_name, program_name);
-    if (verifier_log) |log| {
-        if (log.len > 0) {
-            log[0] = 0;
-            attr.prog_load.log_level = 1;
-            attr.prog_load.log_buf = @intFromPtr(log.ptr);
-            attr.prog_load.log_size = @intCast(@min(log.len, std.math.maxInt(u32)));
-        }
-    }
-    return sysFd(bpfCall(.prog_load, &attr));
-}
-
 fn getSocketCookie(socket_fd: fd_t) Error!u64 {
     var cookie: u64 = 0;
     var cookie_length: socklen_t = @sizeOf(u64);
@@ -197,80 +209,6 @@ const PeerState = extern struct {
     last_activity_ns: u64,
 };
 
-const sk_pass = 1;
-const activity_refresh_ns = 10 * 1000 * 1000;
-
-/// Fills `instructions` with the shared sockmap verdict program: look up
-/// the peer by socket cookie, throttle-refresh activity, redirect to the
-/// peer's transmit path; fall back to SK_PASS until pairing completes.
-/// Returns the populated instruction count (at most 32).
-fn fillVerdictInstructions(instructions: *[32]Insn, sockhash_fd: fd_t, peer_fd: fd_t) usize {
-    const program = [_]Insn{
-        // r6 = skb; cookie at fp-8
-        Insn.mov(.r6, .r1),
-        Insn.call(.get_socket_cookie),
-        Insn.jeq(.r0, 0, 24),
-        Insn.stx(.double_word, .r10, -8, .r0),
-
-        // state = peer_map[cookie]; peer key at fp-16
-        Insn.ld_map_fd1(.r1, peer_fd),
-        Insn.ld_map_fd2(peer_fd),
-        Insn.mov(.r2, .r10),
-        Insn.add(.r2, -8),
-        Insn.call(.map_lookup_elem),
-        Insn.jeq(.r0, 0, 17),
-        Insn.mov(.r8, .r0),
-        Insn.ldx(.double_word, .r7, .r8, 0),
-        Insn.stx(.double_word, .r10, -16, .r7),
-
-        // Keep the peer cacheline read-mostly; refresh activity at most
-        // every 10 ms.
-        Insn.ldx(.double_word, .r9, .r8, @offsetOf(PeerState, "last_activity_ns")),
-        Insn.call(.ktime_get_coarse_ns),
-        Insn.mov(.r1, .r0),
-        Insn.sub(.r1, .r9),
-        Insn.jlt(.r1, activity_refresh_ns, 1),
-        Insn.stx(.double_word, .r8, @offsetOf(PeerState, "last_activity_ns"), .r0),
-
-        // Redirect this received stream to the peer socket's transmit path.
-        Insn.mov(.r1, .r6),
-        Insn.ld_map_fd1(.r2, sockhash_fd),
-        Insn.ld_map_fd2(sockhash_fd),
-        Insn.mov(.r3, .r10),
-        Insn.add(.r3, -16),
-        Insn.mov(.r4, 0),
-        Insn.call(.sk_redirect_hash),
-        Insn.exit(),
-
-        // No complete pairing: retain the userspace relay fallback.
-        Insn.mov(.r0, sk_pass),
-        Insn.exit(),
-    };
-    @memcpy(instructions[0..program.len], &program);
-    return program.len;
-}
-
-fn loadVerdictProgram(
-    sockhash_fd: fd_t,
-    peer_fd: fd_t,
-    attach_type: BPF.AttachType,
-    program_name: []const u8,
-    verifier_log: ?[]u8,
-) Error!fd_t {
-    var instructions: [32]Insn = undefined;
-    const count = fillVerdictInstructions(&instructions, sockhash_fd, peer_fd);
-    return loadProgram(.sk_skb, attach_type, program_name, instructions[0..count], verifier_log);
-}
-
-fn loadSockmapParser(verifier_log: ?[]u8) Error!fd_t {
-    // offsetof(struct __sk_buff, len) == 0
-    const instructions = [_]Insn{
-        Insn.ldx(.word, .r0, .r1, 0),
-        Insn.exit(),
-    };
-    return loadProgram(.sk_skb, .sk_skb_stream_parser, "curtsy_parser", &instructions, verifier_log);
-}
-
 // ---------------------------------------------------------------------------
 // SO_ATTACH_REUSEPORT_EBPF program
 // ---------------------------------------------------------------------------
@@ -284,19 +222,11 @@ pub const so_attach_reuseport_ebpf: i32 = linux.SO.ATTACH_REUSEPORT_EBPF;
 pub fn loadReusePortBpf(socket_count: u32, verifier_log: ?[]u8) Error!fd_t {
     if (socket_count == 0) return errnoError(.INVAL);
 
-    // offsetof(struct __sk_buff, hash) == 68
-    const instructions = [_]Insn{
-        Insn.ldx(.word, .r0, .r1, 68),
-        .{
-            .code = BPF.ALU | BPF.MOD | BPF.K,
-            .dst = 0,
-            .src = 0,
-            .off = 0,
-            .imm = @bitCast(socket_count),
-        },
-        Insn.exit(),
-    };
-    return loadProgram(.socket_filter, null, "curtsy_reuse", &instructions, verifier_log);
+    const object = try openBpfObject(embedded_programs.reuseport, verifier_log);
+    defer curtsy_libbpf_close(object);
+    try libbpfStatus(curtsy_libbpf_set_rodata(object, &socket_count, @sizeOf(u32)));
+    try libbpfStatus(curtsy_libbpf_load(object));
+    return libbpfFd(curtsy_libbpf_dup_program_fd(object, "reuseport_select"));
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +238,7 @@ pub fn loadReusePortBpf(socket_count: u32, verifier_log: ?[]u8) Error!fd_t {
 /// TCP pairs use a stream parser + stream verdict; UDP pairs use a
 /// verdict-only program (BPF_SK_SKB_VERDICT, kernel >= 5.12).
 pub const SockmapRuntime = struct {
+    object: ?*LibbpfObject,
     sockhash_fd: fd_t,
     peer_fd: fd_t,
     parser_fd: fd_t, // -1 for the UDP variant
@@ -337,6 +268,7 @@ pub const SockmapRuntime = struct {
         if (max_entries == 0) return errnoError(.INVAL);
 
         var runtime = SockmapRuntime{
+            .object = null,
             .sockhash_fd = -1,
             .peer_fd = -1,
             .parser_fd = -1,
@@ -349,30 +281,27 @@ pub const SockmapRuntime = struct {
             lastErrno = saved;
         }
 
-        runtime.sockhash_fd = try createMap(
-            .sockhash,
-            @sizeOf(u64),
-            @sizeOf(u32),
-            max_entries,
-            if (for_udp) "curtsy_udpsocks" else "curtsy_socks",
-        );
-        runtime.peer_fd = try createMap(
-            .hash,
-            @sizeOf(u64),
-            @sizeOf(PeerState),
-            max_entries,
-            if (for_udp) "curtsy_udppeer" else "curtsy_peers",
-        );
-        if (!for_udp) {
-            runtime.parser_fd = try loadSockmapParser(verifier_log);
+        const bytes = if (for_udp) embedded_programs.udp_sockmap else embedded_programs.tcp_sockmap;
+        runtime.object = try openBpfObject(bytes, verifier_log);
+        const object = runtime.object.?;
+        try libbpfStatus(curtsy_libbpf_set_map_max_entries(object, "sockhash", max_entries));
+        try libbpfStatus(curtsy_libbpf_set_map_max_entries(object, "peer_map", max_entries));
+        if (for_udp) {
+            try libbpfStatus(curtsy_libbpf_set_expected_attach_type(
+                object,
+                "udp_verdict",
+                @intFromEnum(BPF.AttachType.sk_skb_verdict),
+            ));
         }
-        runtime.program_fd = try loadVerdictProgram(
-            runtime.sockhash_fd,
-            runtime.peer_fd,
-            runtime.verdict_attach_type,
-            if (for_udp) "curtsy_udp" else "curtsy_sockmap",
-            verifier_log,
-        );
+        try libbpfStatus(curtsy_libbpf_load(object));
+
+        runtime.sockhash_fd = try libbpfFd(curtsy_libbpf_map_fd(object, "sockhash"));
+        runtime.peer_fd = try libbpfFd(curtsy_libbpf_map_fd(object, "peer_map"));
+        if (!for_udp) runtime.parser_fd = try libbpfFd(curtsy_libbpf_program_fd(object, "tcp_stream_parser"));
+        runtime.program_fd = try libbpfFd(curtsy_libbpf_program_fd(
+            object,
+            if (for_udp) "udp_verdict" else "tcp_stream_verdict",
+        ));
 
         if (runtime.parser_fd >= 0) {
             try progAttach(runtime.sockhash_fd, runtime.parser_fd, .sk_skb_stream_parser);
@@ -388,11 +317,9 @@ pub const SockmapRuntime = struct {
         if (self.parser_fd >= 0 and self.sockhash_fd >= 0) {
             progDetach(self.sockhash_fd, self.parser_fd, .sk_skb_stream_parser);
         }
-        if (self.program_fd >= 0) _ = linux.close(self.program_fd);
-        if (self.parser_fd >= 0) _ = linux.close(self.parser_fd);
-        if (self.peer_fd >= 0) _ = linux.close(self.peer_fd);
-        if (self.sockhash_fd >= 0) _ = linux.close(self.sockhash_fd);
+        if (self.object) |object| curtsy_libbpf_close(object);
         self.* = .{
+            .object = null,
             .sockhash_fd = -1,
             .peer_fd = -1,
             .parser_fd = -1,
@@ -488,15 +415,21 @@ pub const BpfObserver = struct {
         udp_recvmsg: u64 = 0,
     };
 
+    object: ?*LibbpfObject,
     counters_fd: fd_t,
-    program_fds: [observer_counter_count]fd_t,
-    event_fds: [observer_counter_count][]fd_t,
+    links: [observer_counter_count]?*LibbpfLink,
 
     const functions = [observer_counter_count][:0]const u8{
         "tcp_sendmsg",
         "tcp_recvmsg",
         "udp_sendmsg",
         "udp_recvmsg",
+    };
+    const programs = [observer_counter_count][:0]const u8{
+        "observe_tcp_sendmsg",
+        "observe_tcp_recvmsg",
+        "observe_udp_sendmsg",
+        "observe_udp_recvmsg",
     };
 
     /// Loads one kprobe program per counter and attaches it to the
@@ -507,9 +440,9 @@ pub const BpfObserver = struct {
         if (target_pid == 0) return errnoError(.INVAL);
 
         var observer = BpfObserver{
+            .object = null,
             .counters_fd = -1,
-            .program_fds = .{ -1, -1, -1, -1 },
-            .event_fds = .{ &.{}, &.{}, &.{}, &.{} },
+            .links = .{ null, null, null, null },
         };
         errdefer {
             const saved = lastErrno;
@@ -517,24 +450,20 @@ pub const BpfObserver = struct {
             lastErrno = saved;
         }
 
-        observer.counters_fd = try createMap(
-            .array,
-            @sizeOf(u32),
-            @sizeOf(u64),
-            observer_counter_count,
-            "curtsy_tune",
-        );
+        observer.object = try openBpfObject(embedded_programs.observer, verifier_log);
+        const object = observer.object.?;
+        try libbpfStatus(curtsy_libbpf_set_rodata(object, &target_pid, @sizeOf(u32)));
+        try libbpfStatus(curtsy_libbpf_load(object));
+        observer.counters_fd = try libbpfFd(curtsy_libbpf_map_fd(object, "counters"));
 
         for (0..observer_counter_count) |i| {
-            observer.program_fds[i] = try loadObserverProgram(
-                observer.counters_fd,
-                target_pid,
-                @intCast(i),
-                verifier_log,
-            );
-            observer.event_fds[i] = attachKprobe(observer.program_fds[i], functions[i]) catch |err| {
-                // The verifier log still holds the successful load output,
-                // which is noise at this point; report the failing stage.
+            var attach_error: c_int = 0;
+            observer.links[i] = curtsy_libbpf_attach_kprobe(
+                object,
+                programs[i],
+                functions[i],
+                &attach_error,
+            ) orelse {
                 if (verifier_log) |log| {
                     if (log.len > 0) {
                         const text = std.fmt.bufPrint(log, "stage=kprobe_attach function={s}", .{functions[i]}) catch null;
@@ -543,7 +472,8 @@ pub const BpfObserver = struct {
                         }
                     }
                 }
-                return err;
+                if (attach_error >= 0) attach_error = -@as(c_int, @intFromEnum(linux.E.INVAL));
+                return libbpfError(attach_error);
             };
         }
         return observer;
@@ -551,20 +481,12 @@ pub const BpfObserver = struct {
 
     pub fn destroy(self: *BpfObserver) void {
         for (0..observer_counter_count) |i| {
-            for (self.event_fds[i]) |fd| {
-                _ = linux.close(fd);
-            }
-            if (self.event_fds[i].len > 0) std.heap.c_allocator.free(self.event_fds[i]);
-            self.event_fds[i] = &.{};
-            if (self.program_fds[i] >= 0) {
-                _ = linux.close(self.program_fds[i]);
-                self.program_fds[i] = -1;
-            }
+            if (self.links[i]) |link| curtsy_libbpf_destroy_link(link);
+            self.links[i] = null;
         }
-        if (self.counters_fd >= 0) {
-            _ = linux.close(self.counters_fd);
-            self.counters_fd = -1;
-        }
+        if (self.object) |object| curtsy_libbpf_close(object);
+        self.object = null;
+        self.counters_fd = -1;
     }
 
     pub fn read(self: *const BpfObserver) Error!Counters {
@@ -581,104 +503,6 @@ pub const BpfObserver = struct {
         };
     }
 };
-
-fn loadObserverProgram(
-    counters_fd: fd_t,
-    target_pid: u32,
-    counter_index: u32,
-    verifier_log: ?[]u8,
-) Error!fd_t {
-    const instructions = [_]Insn{
-        // Ignore events not caused by this Curtsy process: jump straight to
-        // the return-0 tail (instruction 14), not the counter increment.
-        Insn.call(.get_current_pid_tgid),
-        Insn.rsh(.r0, 32),
-        Insn.jne(.r0, @as(i32, @bitCast(target_pid)), 11),
-
-        // key = counter_index
-        Insn.mov(.r6, .r10),
-        Insn.add(.r6, -4),
-        Insn.mov(.r1, @as(i32, @intCast(counter_index))),
-        Insn.stx(.word, .r10, -4, .r1),
-
-        // counter = counters[key]
-        Insn.ld_map_fd1(.r1, counters_fd),
-        Insn.ld_map_fd2(counters_fd),
-        Insn.mov(.r2, .r6),
-        Insn.call(.map_lookup_elem),
-        Insn.jeq(.r0, 0, 2),
-
-        // (*counter)++
-        Insn.mov(.r1, 1),
-        Insn.xadd(.r0, .r1),
-
-        Insn.mov(.r0, 0),
-        Insn.exit(),
-    };
-    return loadProgram(.kprobe, null, "curtsy_tune", &instructions, verifier_log);
-}
-
-fn readUintFromFile(path: [*:0]const u8) Error!i32 {
-    const fd = try sysFd(linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
-    defer _ = linux.close(fd);
-    var buffer: [32]u8 = undefined;
-    const count = try sys(linux.read(fd, &buffer, buffer.len));
-    const text = std.mem.trim(u8, buffer[0..count], " \t\r\n");
-    return std.fmt.parseInt(i32, text, 10) catch errnoError(.INVAL);
-}
-
-/// All kprobe attaches happen on the tuning thread; cache the PMU type
-/// instead of re-reading the sysfs file for every probe.
-threadlocal var cached_kprobe_type: i32 = -1;
-
-/// Attaches the program to a kprobe PMU event on every online CPU
-/// (pid == -1 with cpu == -1 is rejected by perf_event_open). Returns the
-/// per-CPU event fds (allocated with the C allocator; owned by the caller).
-fn attachKprobe(program_fd: fd_t, function_name: [:0]const u8) Error![]fd_t {
-    if (cached_kprobe_type < 0) {
-        cached_kprobe_type = readUintFromFile("/sys/bus/event_source/devices/kprobe/type") catch {
-            return errnoError(.OPNOTSUPP);
-        };
-    }
-    const kprobe_type = cached_kprobe_type;
-    if (kprobe_type < 0) return errnoError(.OPNOTSUPP);
-
-    const cpu_count = std.Thread.getCpuCount() catch return errnoError(.OPNOTSUPP);
-    if (cpu_count < 1) return errnoError(.OPNOTSUPP);
-
-    const fds = std.heap.c_allocator.alloc(fd_t, cpu_count) catch return error.NoMemory;
-    errdefer std.heap.c_allocator.free(fds);
-
-    var attached: usize = 0;
-    errdefer {
-        for (fds[0..attached]) |fd| {
-            _ = linux.close(fd);
-        }
-    }
-
-    for (0..cpu_count) |cpu| {
-        var attributes = std.mem.zeroes(linux.perf_event_attr);
-        attributes.type = @enumFromInt(@as(u32, @intCast(kprobe_type)));
-        attributes.size = @sizeOf(linux.perf_event_attr);
-        attributes.config1 = @intFromPtr(function_name.ptr);
-        attributes.sample_period_or_freq = 1;
-        attributes.wakeup_events_or_watermark = 1;
-
-        const event_fd = try sysFd(linux.perf_event_open(
-            &attributes,
-            -1,
-            @intCast(cpu),
-            -1,
-            linux.PERF.FLAG.FD_CLOEXEC,
-        ));
-        errdefer _ = linux.close(event_fd);
-        _ = try sys(linux.ioctl(event_fd, linux.PERF.EVENT_IOC.SET_BPF, @intCast(program_fd)));
-        _ = try sys(linux.ioctl(event_fd, linux.PERF.EVENT_IOC.ENABLE, 0));
-        fds[cpu] = event_fd;
-        attached += 1;
-    }
-    return fds[0..attached];
-}
 
 // ---------------------------------------------------------------------------
 // Batched UDP I/O (recvmmsg/sendmmsg, 64-datagram batches)
@@ -1090,6 +914,38 @@ test "sockmap loader rejects invalid arguments without privileges" {
     try testing.expectError(error.Invalid, SockmapRuntime.createTcp(0, null));
     try testing.expectError(error.Invalid, SockmapRuntime.createUdp(0, null));
     try testing.expectError(error.Invalid, BpfObserver.create(0, null));
+}
+
+test "embedded BPF ELF objects open through libbpf" {
+    const tcp = try openBpfObject(embedded_programs.tcp_sockmap, null);
+    defer curtsy_libbpf_close(tcp);
+    try libbpfStatus(curtsy_libbpf_set_map_max_entries(tcp, "sockhash", 16));
+    try libbpfStatus(curtsy_libbpf_set_map_max_entries(tcp, "peer_map", 16));
+    try libbpfStatus(curtsy_libbpf_has_program(tcp, "tcp_stream_parser"));
+    try libbpfStatus(curtsy_libbpf_has_program(tcp, "tcp_stream_verdict"));
+
+    const udp = try openBpfObject(embedded_programs.udp_sockmap, null);
+    defer curtsy_libbpf_close(udp);
+    try libbpfStatus(curtsy_libbpf_set_map_max_entries(udp, "sockhash", 16));
+    try libbpfStatus(curtsy_libbpf_set_map_max_entries(udp, "peer_map", 16));
+    try libbpfStatus(curtsy_libbpf_has_program(udp, "udp_verdict"));
+
+    const socket_count: u32 = 7;
+    const reuseport = try openBpfObject(embedded_programs.reuseport, null);
+    defer curtsy_libbpf_close(reuseport);
+    try libbpfStatus(curtsy_libbpf_set_rodata(reuseport, &socket_count, @sizeOf(u32)));
+    try libbpfStatus(curtsy_libbpf_has_program(reuseport, "reuseport_select"));
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(BPF.ProgType.socket_filter)),
+        curtsy_libbpf_program_type(reuseport, "reuseport_select"),
+    );
+
+    const target_pid: u32 = 1234;
+    const observer = try openBpfObject(embedded_programs.observer, null);
+    defer curtsy_libbpf_close(observer);
+    try libbpfStatus(curtsy_libbpf_set_rodata(observer, &target_pid, @sizeOf(u32)));
+    try libbpfStatus(curtsy_libbpf_has_program(observer, "observe_tcp_sendmsg"));
+    try libbpfStatus(curtsy_libbpf_has_program(observer, "observe_udp_recvmsg"));
 }
 
 test "eBPF loaders (gated: CURTSY_ENABLE_EBPF_TESTS)" {

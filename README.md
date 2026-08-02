@@ -1,15 +1,29 @@
 # Curtsy
 
-Curtsy 是一个使用 Zig 编写的 Linux TCP/UDP 透明流量转发器。它在一个地址和端口上监听 TCP、UDP 或两种协议，并把流量转发到固定上游。
+Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 Linux TCP/UDP 透明流量转发器。它在一个地址和端口上监听 TCP、UDP 或两种协议，并把流量转发到固定上游。
 
 默认只运行一条监听规则和一个上游，不终止 TLS、不检查流量内容、不记录转发数据正文。配置中出现顶层 `rules` 列表时会启用可选的多规则模块：一个进程内运行多条独立的监听规则，每条规则可配置多个上游并做负载均衡。
 
 ## 构建
 
-需要 Zig 0.16 或更高版本：
+首次构建先准备仓库内工具链：
 
 ```bash
-zig build -Doptimize=ReleaseSafe
+./tools/bootstrap-build-deps.sh
+```
+
+脚本下载经过校验的 Zig 0.16.0 和固定版本静态库到 `.toolchain/`。该目录
+不提交到版本库。正常构建只使用这里的 Zig、Clang 前端、libbpf、libelf、
+zlib 和 zstd，不读取 PATH 中的编译器，也不查找 `/usr/include` 或
+`/usr/lib`。依赖缺失时构建会直接失败并提示运行 bootstrap。当前固定依赖
+包支持 x86_64 Linux；bootstrap 自身需要 `curl`、`tar`、`dpkg-deb` 和
+校验和工具，正常构建不调用这些命令。
+
+eBPF C 使用 Zig 发行包内置的 Clang 前端，生成带 BTF 和重定位信息的
+标准 BPF ELF；libbpf 及其依赖静态链接到 `curtsy`：
+
+```bash
+.toolchain/zig/zig build -Doptimize=ReleaseSafe
 ```
 
 生成的程序位于 `zig-out/bin/curtsy`。默认按架构基线 CPU 编译，可在任意同架构机器上运行；如需针对本机优化可加 `-Dcpu=native`（产物可能无法在更老的 CPU 上运行）。
@@ -17,20 +31,23 @@ zig build -Doptimize=ReleaseSafe
 常用命令：
 
 ```bash
-zig build test
-zig build run -- --config config.yaml --check-config
-zig build run -- --config config.yaml
+.toolchain/zig/zig build test
+.toolchain/zig/zig build run -- --config config.yaml --check-config
+.toolchain/zig/zig build run -- --config config.yaml
 ```
 
 ## Debian 打包
 
-仓库包含 debhelper 打包元数据。构建机需要 `dpkg-dev`、`debhelper` 和 Zig 0.16+，然后可构建 `.deb`：
+仓库包含 debhelper 打包元数据。先运行 bootstrap，再使用 `dpkg-dev` 和
+`debhelper` 构建 `.deb`；编译器和 BPF 相关依赖仍来自 `.toolchain/`：
 
 ```bash
 dpkg-buildpackage -us -uc -b
 ```
 
-构建会执行 `zig build -Doptimize=ReleaseSafe`，并在未设置 `DEB_BUILD_OPTIONS=nocheck` 时运行 `zig build test`。生成的二进制包位于仓库上级目录。
+构建会执行 `.toolchain/zig/zig build -Doptimize=ReleaseSafe`，并在未设置
+`DEB_BUILD_OPTIONS=nocheck` 时运行本地工具链测试。生成的二进制包位于
+仓库上级目录。
 
 安装后包含：
 
@@ -154,7 +171,7 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 ## 测试
 
 ```bash
-zig build test
+.toolchain/zig/zig build test
 ```
 
 默认测试不要求 eBPF 权限。eBPF loader 相关测试在无权限或内核不支持时会按预期跳过高权限路径。
