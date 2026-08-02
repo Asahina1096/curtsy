@@ -18,7 +18,9 @@
 //! establishes the session in userspace, then a per-client connected socket
 //! (bound to the listen address with SO_REUSEPORT) is paired with the
 //! upstream socket in that engine's own UDP sockhash; sessions never migrate
-//! between engines. Expiry for steered sessions reads the BPF activity time
+//! between engines. auto skips loopback upstreams (measured lower goodput and
+//! reordering through the verdict path there); enabled forces the attempt.
+//! Expiry for steered sessions reads the BPF activity time
 //! via `idleRemainingNs`. Expired or unpaired sessions fall back to the
 //! listener and re-establish; pairing failures and SK_PASS datagrams are
 //! relayed by userspace. Changing the mode via `updateConfiguration` clears
@@ -479,6 +481,10 @@ pub const UdpRelayEngine = struct {
     accelerate_cooldown_until_ms: u64 = 0,
     send_error_drops: u64 = 0,
     last_send_error_log_ms: u64 = 0,
+    /// Reusable sendmmsg header/iovec storage, confined to this engine's I/O
+    /// thread like the rest of the state below; avoids rebuilding the header
+    /// set on the stack for every send batch.
+    send_io: bpf.UdpSendBatchIo = undefined,
 
     pub fn init(
         runtime: *RuntimeConfiguration,
@@ -691,6 +697,7 @@ pub const UdpRelayEngine = struct {
         self.command_mutex.lock();
         self.pending_commands.append(self.allocator, command) catch {
             self.command_mutex.unlock();
+            self.log.warning("udp engine command dropped command={s}", .{@tagName(command)});
             return;
         };
         self.command_pending.store(true, .release);
@@ -884,22 +891,42 @@ pub const UdpRelayEngine = struct {
         send_slots: *[batch_size]bpf.UdpSlot,
         now_ms: u64,
     ) void {
+        const CachedClient = struct {
+            client: SocketAddr,
+            upstream_fd: fd_t,
+        };
         var run_fd: fd_t = -1;
         var run_length: usize = 0;
+        var cached: ?CachedClient = null;
         for (recv_slots[0..count]) |*slot| {
             const client = socketAddrFromStorage(&slot.address) orelse continue;
             const upstream_fd: fd_t = blk: {
+                // A datagram from the same client as the previous valid slot
+                // reuses the upstream fd already resolved for this batch run,
+                // skipping the association hash lookup (and its per-datagram
+                // last_activity write) for every further datagram of the run.
+                // The cache never survives across forwardClientDatagrams calls
+                // and holds no association pointers, only a SocketAddr + fd.
+                if (cached != null and cached.?.client.eql(client)) break :blk cached.?.upstream_fd;
                 if (self.associations.getPtr(client)) |existing| {
                     existing.last_activity_ms = now_ms;
+                    cached = .{ .client = client, .upstream_fd = existing.upstream_fd };
                     break :blk existing.upstream_fd;
                 }
-                break :blk self.openAssociation(
+                const opened = self.openAssociation(
                     client,
                     slot.address,
                     slot.address_length,
                     listen_fd,
                     now_ms,
-                ) orelse continue;
+                ) orelse {
+                    // No fd to reuse; force a fresh resolve for the next
+                    // datagram of this client (baseline retried the open).
+                    cached = null;
+                    continue;
+                };
+                cached = .{ .client = client, .upstream_fd = opened };
+                break :blk opened;
             };
             if (upstream_fd != run_fd) {
                 if (run_length > 0) {
@@ -998,7 +1025,7 @@ pub const UdpRelayEngine = struct {
         if (slots.len == 0) return true;
         var sent_total: usize = 0;
         while (sent_total < slots.len) {
-            const sent = bpf.udpSendBatch(fd, address, address_length, slots[sent_total..]) catch {
+            const sent = self.send_io.send(fd, address, address_length, slots[sent_total..]) catch {
                 self.noteSendError(slots.len - sent_total, context, errnoDescription(), now_ms);
                 return false;
             };

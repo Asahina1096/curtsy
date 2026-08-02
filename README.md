@@ -135,7 +135,7 @@ rules:
 
 ## TCP 性能
 
-TCP 转发路径使用每 worker 一个 epoll loop：每个 worker 持有 `SO_REUSEPORT` 监听 socket，连接和对应上游 socket 固定在同一线程。普通用户态 relay 优先使用每 worker 一个非阻塞 pipe，通过 `splice(2)` 完成 socket→pipe→socket 零拷贝；目标端产生背压时，pipe 中剩余数据会回退到原有的用户态缓冲队列。读缓冲采用 64 KiB 到 256 KiB 的自适应块，配合批量 flush 和水位线背压控制；待发送数据受全局 `limits.maxTCPBufferedBytes` 约束，防止大量慢速连接耗尽进程内存。worker 在一次 epoll 唤醒内复用同一个单调时钟时间戳，避免为每个数据块重复调用 `clock_gettime`。
+TCP 转发路径使用每 worker 一个 epoll loop：每个 worker 持有 `SO_REUSEPORT` 监听 socket，连接和对应上游 socket 固定在同一线程。普通用户态 relay 优先使用每 worker 一个非阻塞 pipe，通过 `splice(2)` 完成 socket→pipe→socket 零拷贝；目标端产生背压时，pipe 中剩余数据会回退到原有的用户态缓冲队列。读缓冲采用 64 KiB 到 1 MiB 的自适应块（pipe 容量按需增长，权限受限时会停留在内核允许的较小值），配合批量 flush 和水位线背压控制；splice 与 buffered 两条 relay 路径每次就绪事件最多搬移 2 MiB（每个 read 请求按剩余预算截断，避免单次超大请求越界），防止单条热连接独占 worker。待发送数据受全局 `limits.maxTCPBufferedBytes` 约束，防止大量慢速连接耗尽进程内存。worker 在一次 epoll 唤醒内复用同一个单调时钟时间戳，避免为每个数据块重复调用 `clock_gettime`。
 
 多 worker 时，Curtsy 会尝试通过 `SO_ATTACH_REUSEPORT_EBPF` 加载 reuseport eBPF 程序，按连接四元组 hash 分流到对应 worker。失败时回退到内核原生 `SO_REUSEPORT` hash，不影响服务启动。
 
@@ -157,7 +157,7 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 
 在具备 eBPF 权限且内核 >= 5.12 的 Linux 上，Curtsy 还可以为 UDP 会话启用 sockmap 内核转发：首个报文仍由用户态建立会话，随后为该客户端创建一个 connect 到其地址的专用 socket，并把客户端 socket 与上游 socket 配对放入 `BPF_MAP_TYPE_SOCKHASH`；`SK_SKB` verdict 程序用 `bpf_sk_redirect_hash` 把两个方向的报文直接转发到对端发送路径，不再经过用户态。每个 I/O 线程持有独立的 sockhash 与 verdict 程序，会话不跨线程迁移。
 
-`performance.udpSockmapAcceleration` 控制该路径，语义与 TCP 版本相同（`enabled` / `disabled` / 默认 `auto`）。权限不足、内核不支持或单会话配对失败时逐层回退到用户态 relay，服务启动不受影响；重定向失败而落入用户态的零星报文由引擎兜底转发。热加载改变此项时，已有 UDP 会话会被清除并按新模式重建。
+`performance.udpSockmapAcceleration` 控制该路径（`enabled` / `disabled` / 默认 `auto`）。与 TCP 不同，UDP 的 `auto` 会跳过 loopback 上游：实测 1400 字节回环负载下，UDP sockmap verdict 路径的吞吐更低并出现严重乱序，回环场景应使用用户态 relay；显式 `enabled` 仍会强制尝试（可用于与用户态路径对比），远端上游在 `auto` 下保持启用。权限不足、内核不支持或单会话配对失败时逐层回退到用户态 relay，服务启动不受影响；重定向失败而落入用户态的零星报文由引擎兜底转发。热加载改变此项时，已有 UDP 会话会被清除并按新模式重建。
 
 ## 配置约束
 
@@ -171,7 +171,14 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 ## 测试
 
 ```bash
+# 运行完整测试套件
 .toolchain/zig/zig build test
+
+# 仅编译测试（不执行），用于快速检查测试代码能否通过编译
+.toolchain/zig/zig build test-compile
+
+# 只运行名称包含指定子串的测试
+.toolchain/zig/zig build test -Dtest-filter="socket address formatting"
 ```
 
-默认测试不要求 eBPF 权限。eBPF loader 相关测试在无权限或内核不支持时会按预期跳过高权限路径。
+默认测试不要求 eBPF 权限。eBPF loader 相关测试在无权限或内核不支持时会按预期跳过高权限路径。`test-compile` 与 `test` 共用同一个测试二进制（含 `-Dtest-filter` 过滤），区别仅在于是否执行。

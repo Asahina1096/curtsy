@@ -589,28 +589,49 @@ pub fn udpSendBatch(
     address_length: socklen_t,
     slots: []const UdpSlot,
 ) Error!usize {
-    if (slots.len == 0) return errnoError(.INVAL);
-    var headers: [udp_batch_capacity]linux.mmsghdr = undefined;
-    var vectors: [udp_batch_capacity]posix.iovec = undefined;
-    const count = @min(slots.len, udp_batch_capacity);
-    for (slots[0..count], 0..) |*slot, i| {
-        vectors[i] = .{ .base = slot.data, .len = slot.length };
-        headers[i] = .{
-            .hdr = .{
-                .name = @constCast(address),
-                .namelen = address_length,
-                .iov = @ptrCast(&vectors[i]),
-                .iovlen = 1,
-                .control = null,
-                .controllen = 0,
-                .flags = 0,
-            },
-            .len = 0,
-        };
-    }
-    const sent = try sys(linux.sendmmsg(fd, &headers, @intCast(count), linux.MSG.DONTWAIT));
-    return sent;
+    var io: UdpSendBatchIo = undefined;
+    return io.send(fd, address, address_length, slots);
 }
+
+/// Reusable sendmmsg header set for a fixed slot array: headers and iovecs
+/// live here instead of being rebuilt on the caller's stack on every batch,
+/// so an engine that sends repeatedly only rewrites the entries for the
+/// slots it is about to send.
+pub const UdpSendBatchIo = struct {
+    headers: [udp_batch_capacity]linux.mmsghdr = undefined,
+    vectors: [udp_batch_capacity]posix.iovec = undefined,
+
+    /// Sends slots.len datagrams (at most 64) to address (null for connected
+    /// sockets), reusing this instance's header/iovec storage. Returns the
+    /// number of datagrams handed to the kernel, which may be less than
+    /// slots.len on partial batches.
+    pub fn send(
+        self: *UdpSendBatchIo,
+        fd: fd_t,
+        address: ?*const posix.sockaddr,
+        address_length: socklen_t,
+        slots: []const UdpSlot,
+    ) Error!usize {
+        if (slots.len == 0) return errnoError(.INVAL);
+        const count = @min(slots.len, udp_batch_capacity);
+        for (slots[0..count], 0..) |*slot, i| {
+            self.vectors[i] = .{ .base = slot.data, .len = slot.length };
+            self.headers[i] = .{
+                .hdr = .{
+                    .name = @constCast(address),
+                    .namelen = address_length,
+                    .iov = @ptrCast(&self.vectors[i]),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+        }
+        return sys(linux.sendmmsg(fd, &self.headers, @intCast(count), linux.MSG.DONTWAIT));
+    }
+};
 
 // ---------------------------------------------------------------------------
 // epoll / eventfd primitives
@@ -867,6 +888,101 @@ test "batched udp send/recv roundtrip between loopback sockets" {
 
     // Both datagrams consumed: next batch reports "would block" as 0.
     try testing.expectEqual(@as(usize, 0), try udpRecvBatch(listen_fd, &recv_slots));
+}
+
+test "udp send batch io reuses storage across addressed, connected and partial sends" {
+    // Destination A receives addressed sends; destination B receives a
+    // connected send.
+    const bound_a = blk: {
+        const address = loopbackV4Generic(0);
+        var bound: BoundAddress = undefined;
+        const fd = try udpListenSocket(&address, @sizeOf(posix.sockaddr.in), &bound);
+        errdefer closeFd(fd);
+        const in: *const posix.sockaddr.in = @ptrCast(&bound.address);
+        break :blk .{ .fd = fd, .port = std.mem.bigToNative(u16, in.port) };
+    };
+    defer closeFd(bound_a.fd);
+    const bound_b = blk: {
+        const address = loopbackV4Generic(0);
+        var bound: BoundAddress = undefined;
+        const fd = try udpListenSocket(&address, @sizeOf(posix.sockaddr.in), &bound);
+        errdefer closeFd(fd);
+        const in: *const posix.sockaddr.in = @ptrCast(&bound.address);
+        break :blk .{ .fd = fd, .port = std.mem.bigToNative(u16, in.port) };
+    };
+    defer closeFd(bound_b.fd);
+
+    // Unconnected sender for addressed sends; connected socket for B.
+    const sender = try udpListenSocket(&loopbackV4Generic(0), @sizeOf(posix.sockaddr.in), null);
+    defer closeFd(sender);
+    const connected = try udpUpstreamSocket(&loopbackV4Generic(bound_b.port), @sizeOf(posix.sockaddr.in));
+    defer closeFd(connected);
+
+    var payload_one = "addressed-one".*;
+    var payload_two = "addressed-two".*;
+    var payload_connected = "connected-send".*;
+    var payload_partial = "partial-slice".*;
+    const dest_a = loopbackV4Generic(bound_a.port);
+    const dest_a_ptr: *const posix.sockaddr = @ptrCast(&dest_a);
+
+    var io = UdpSendBatchIo{};
+
+    // Addressed batch to A.
+    var slots_a = [_]UdpSlot{
+        .{ .data = &payload_one, .length = payload_one.len },
+        .{ .data = &payload_two, .length = payload_two.len },
+    };
+    try testing.expectEqual(@as(usize, 2), try io.send(sender, dest_a_ptr, @sizeOf(posix.sockaddr.in), &slots_a));
+
+    // Connected send to B, reusing the same helper storage.
+    var slots_b = [_]UdpSlot{
+        .{ .data = &payload_connected, .length = payload_connected.len },
+    };
+    try testing.expectEqual(@as(usize, 1), try io.send(connected, null, 0, &slots_b));
+
+    // Partial slice: only slots[1..2] of a 3-entry array reaches the kernel.
+    var slots_c = [_]UdpSlot{
+        .{ .data = &payload_one, .length = payload_one.len },
+        .{ .data = &payload_partial, .length = payload_partial.len },
+        .{ .data = &payload_two, .length = payload_two.len },
+    };
+    try testing.expectEqual(@as(usize, 1), try io.send(sender, dest_a_ptr, @sizeOf(posix.sockaddr.in), slots_c[1..2]));
+
+    // A must receive all three addressed datagrams in send order.
+    var buffer_a_one: [64]u8 = undefined;
+    var buffer_a_two: [64]u8 = undefined;
+    var buffer_a_three: [64]u8 = undefined;
+    var recv_slots_a = [_]UdpSlot{
+        .{ .data = &buffer_a_one, .capacity = buffer_a_one.len },
+        .{ .data = &buffer_a_two, .capacity = buffer_a_two.len },
+        .{ .data = &buffer_a_three, .capacity = buffer_a_three.len },
+    };
+    var received_a: usize = 0;
+    for (0..100) |_| {
+        received_a += try udpRecvBatch(bound_a.fd, recv_slots_a[received_a..]);
+        if (received_a == recv_slots_a.len) break;
+        const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try testing.expectEqual(recv_slots_a.len, received_a);
+    try testing.expectEqualStrings("addressed-one", buffer_a_one[0..recv_slots_a[0].length]);
+    try testing.expectEqualStrings("addressed-two", buffer_a_two[0..recv_slots_a[1].length]);
+    try testing.expectEqualStrings("partial-slice", buffer_a_three[0..recv_slots_a[2].length]);
+
+    // B must receive the connected-send datagram.
+    var buffer_b: [64]u8 = undefined;
+    var recv_slots_b = [_]UdpSlot{
+        .{ .data = &buffer_b, .capacity = buffer_b.len },
+    };
+    var received_b: usize = 0;
+    for (0..100) |_| {
+        received_b += try udpRecvBatch(bound_b.fd, recv_slots_b[received_b..]);
+        if (received_b == recv_slots_b.len) break;
+        const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try testing.expectEqual(recv_slots_b.len, received_b);
+    try testing.expectEqualStrings("connected-send", buffer_b[0..recv_slots_b[0].length]);
 }
 
 test "udp set socket buffers" {

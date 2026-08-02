@@ -49,14 +49,7 @@ pub fn build(b: *std.Build) void {
     const bpf_programs_module = b.createModule(.{ .root_source_file = bpf_programs_source });
 
     // libc is required for getaddrinfo/inet_pton/inet_ntop in net.zig.
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    exe_mod.addImport("bpf_programs", bpf_programs_module);
-    configureLibbpfModule(b, exe_mod, dependencies);
+    const exe_mod = runtimeModule(b, b.path("src/main.zig"), target, optimize, bpf_programs_module, dependencies);
     const exe = b.addExecutable(.{
         .name = "curtsy",
         .root_module = exe_mod,
@@ -70,20 +63,39 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run curtsy");
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests live in the same source files; main.zig transitively imports
-    // the runtime modules so their tests run too.
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    // Unit tests live in the same source files; the test root in src/test.zig
+    // aggregates the runtime modules so their tests run as one suite. Both
+    // the compile and run tasks share the same filtered artifact.
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose names contain this substring");
+    const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
+    const test_mod = runtimeModule(b, b.path("src/test.zig"), target, optimize, bpf_programs_module, dependencies);
+    const unit_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
+
+    const test_compile_step = b.step("test-compile", "Compile the unit test suite without running it");
+    test_compile_step.dependOn(&unit_tests.step);
+
+    const run_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+}
+
+fn runtimeModule(
+    b: *std.Build,
+    root_source_file: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    bpf_programs_module: *std.Build.Module,
+    dependencies: LocalDependencies,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = root_source_file,
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    test_mod.addImport("bpf_programs", bpf_programs_module);
-    configureLibbpfModule(b, test_mod, dependencies);
-    const unit_tests = b.addTest(.{ .root_module = test_mod });
-    const run_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
+    module.addImport("bpf_programs", bpf_programs_module);
+    configureLibbpfModule(b, module, dependencies);
+    return module;
 }
 
 fn compileBpfObject(

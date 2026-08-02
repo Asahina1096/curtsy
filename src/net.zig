@@ -77,6 +77,15 @@ pub const SocketAddr = struct {
         };
     }
 
+    /// True for loopback addresses: the whole IPv4 127.0.0.0/8 block and
+    /// IPv6 ::1.
+    pub fn isLoopback(self: SocketAddr) bool {
+        return switch (self.family) {
+            .v4 => self.addr[0] == 127,
+            .v6 => std.mem.allEqual(u8, self.addr[0..15], 0) and self.addr[15] == 1,
+        };
+    }
+
     /// Copy this address into a sockaddr_storage; returns the active length.
     pub fn toSockaddrStorage(self: SocketAddr, storage: *std.os.linux.sockaddr.storage) std.os.linux.socklen_t {
         switch (self.family) {
@@ -321,4 +330,13 @@ test "resolves IPv4, IPv6 and hostnames" {
     try testing.expectEqual(SocketAddr.Family.v6, v6.family);
     const hostname = try resolverAddress(defaultResolver, "localhost", 9001, testing.allocator, &diag);
     try testing.expectEqual(@as(u16, 9001), hostname.port);
+}
+
+test "isLoopback recognizes ipv4 127/8 and ipv6 ::1" {
+    try testing.expect(SocketAddr.parseIp("127.0.0.1", 80).?.isLoopback());
+    try testing.expect(SocketAddr.parseIp("127.255.255.254", 80).?.isLoopback());
+    try testing.expect(SocketAddr.parseIp("::1", 80).?.isLoopback());
+    try testing.expect(!SocketAddr.parseIp("192.0.2.1", 80).?.isLoopback());
+    try testing.expect(!SocketAddr.parseIp("::2", 80).?.isLoopback());
+    try testing.expect(!SocketAddr.parseIp("::ffff:127.0.0.1", 80).?.isLoopback());
 }

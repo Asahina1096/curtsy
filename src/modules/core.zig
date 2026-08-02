@@ -86,7 +86,15 @@ pub const ResolvedConfiguration = struct {
     }
 
     pub fn shouldEnableUDPSockmap(self: *const ResolvedConfiguration) bool {
-        return self.configuration.performance.udp_sockmap_acceleration != .disabled;
+        // auto skips loopback upstreams: the measured 1400-byte loopback
+        // workload had lower goodput and severe reordering through the UDP
+        // sockmap verdict path. Explicit enabled still forces an attempt;
+        // remote upstreams stay eligible in auto.
+        return switch (self.configuration.performance.udp_sockmap_acceleration) {
+            .disabled => false,
+            .enabled => true,
+            .auto => !self.upstream_address.isLoopback(),
+        };
     }
 };
 
@@ -536,9 +544,10 @@ pub const ForwarderService = struct {
             for (self.rules_list.items) |rt| self.destroyRuleRuntime(rt);
             self.rules_list.clearRetainingCapacity();
         }
+        try self.rules_list.ensureTotalCapacity(self.allocator, self.resolved.rules.len);
         for (self.resolved.rules) |*candidate| {
             const rt = try self.createRuleRuntime(candidate, self.resolved.rules.len);
-            try self.rules_list.append(self.allocator, rt);
+            self.rules_list.appendAssumeCapacity(rt);
         }
     }
 
@@ -553,7 +562,9 @@ pub const ForwarderService = struct {
                 listener.destroy();
                 rt.udp_listener = null;
             }
-            self.retired_rules.append(self.allocator, rt) catch {};
+            self.retired_rules.append(self.allocator, rt) catch {
+                self.destroyRuleRuntime(rt);
+            };
         }
         self.rules_list.clearRetainingCapacity();
         self.mutex.unlock();
@@ -938,15 +949,17 @@ pub const ForwarderService = struct {
         defer self.allocator.free(matched);
         @memset(matched, false);
 
+        try next_rules.ensureTotalCapacity(self.allocator, candidate.rules.len);
+        try created.ensureTotalCapacity(self.allocator, candidate.rules.len);
         for (candidate.rules) |*candidate_rule| {
             if (self.findRule(candidate_rule.listen_addresses)) |index| {
                 matched[index] = true;
                 try self.updateRule(self.rules_list.items[index], candidate_rule, candidate.rules.len);
-                try next_rules.append(self.allocator, self.rules_list.items[index]);
+                next_rules.appendAssumeCapacity(self.rules_list.items[index]);
             } else {
                 const rt = try self.createRuleRuntime(candidate_rule, candidate.rules.len);
-                try created.append(self.allocator, rt);
-                try next_rules.append(self.allocator, rt);
+                created.appendAssumeCapacity(rt);
+                next_rules.appendAssumeCapacity(rt);
             }
         }
 
@@ -1482,33 +1495,49 @@ fn loopbackResolver(host: []const u8, port: u16) anyerror!SocketAddr {
     return SocketAddr.parseIp("127.0.0.1", port).?;
 }
 
-test "sockmap auto enables loopback and remote upstreams" {
+test "sockmap auto skips loopback upstreams for udp but not tcp" {
     var listen_v4 = [_]SocketAddr{SocketAddr.parseIp("127.0.0.1", 9_000).?};
+    var listen_v6 = [_]SocketAddr{SocketAddr.parseIp("::1", 9_000).?};
+
+    // IPv4 127.0.0.0/8 loopback upstream: TCP auto stays enabled, UDP auto
+    // skips the loopback path.
     const ipv4 = ResolvedConfiguration{
         .configuration = makeTestConfiguration("127.42.0.1"),
         .listen_addresses = &listen_v4,
         .upstream_address = SocketAddr.parseIp("127.42.0.1", 9_001).?,
     };
     try testing.expect(ipv4.shouldEnableTCPSockmap());
+    try testing.expect(!ipv4.shouldEnableUDPSockmap());
 
-    var enabled = makeTestConfiguration("127.0.0.1");
-    enabled.performance.tcp_sockmap_acceleration = .enabled;
-    const enabled_resolved = ResolvedConfiguration{
-        .configuration = enabled,
-        .listen_addresses = &listen_v4,
-        .upstream_address = SocketAddr.parseIp("127.0.0.1", 9_001).?,
+    // IPv6 ::1 loopback upstream behaves the same.
+    const ipv6 = ResolvedConfiguration{
+        .configuration = makeTestConfiguration("::1"),
+        .listen_addresses = &listen_v6,
+        .upstream_address = SocketAddr.parseIp("::1", 9_001).?,
     };
-    try testing.expect(enabled_resolved.shouldEnableTCPSockmap());
+    try testing.expect(ipv6.shouldEnableTCPSockmap());
+    try testing.expect(!ipv6.shouldEnableUDPSockmap());
 
-    var disabled = makeTestConfiguration("192.0.2.1");
-    disabled.performance.tcp_sockmap_acceleration = .disabled;
-    const disabled_resolved = ResolvedConfiguration{
-        .configuration = disabled,
+    // Remote upstream: both stay enabled in auto.
+    const remote = ResolvedConfiguration{
+        .configuration = makeTestConfiguration("192.0.2.1"),
         .listen_addresses = &listen_v4,
         .upstream_address = SocketAddr.parseIp("192.0.2.1", 9_001).?,
     };
-    try testing.expect(!disabled_resolved.shouldEnableTCPSockmap());
+    try testing.expect(remote.shouldEnableTCPSockmap());
+    try testing.expect(remote.shouldEnableUDPSockmap());
 
+    // Explicit enabled forces a UDP sockmap attempt even for loopback.
+    var udp_enabled = makeTestConfiguration("127.0.0.1");
+    udp_enabled.performance.udp_sockmap_acceleration = .enabled;
+    const udp_enabled_resolved = ResolvedConfiguration{
+        .configuration = udp_enabled,
+        .listen_addresses = &listen_v4,
+        .upstream_address = SocketAddr.parseIp("127.0.0.1", 9_001).?,
+    };
+    try testing.expect(udp_enabled_resolved.shouldEnableUDPSockmap());
+
+    // Explicit disabled always wins for UDP.
     var udp_disabled = makeTestConfiguration("192.0.2.1");
     udp_disabled.performance.udp_sockmap_acceleration = .disabled;
     const udp_disabled_resolved = ResolvedConfiguration{
@@ -1517,7 +1546,25 @@ test "sockmap auto enables loopback and remote upstreams" {
         .upstream_address = SocketAddr.parseIp("192.0.2.1", 9_001).?,
     };
     try testing.expect(!udp_disabled_resolved.shouldEnableUDPSockmap());
-    try testing.expect(ipv4.shouldEnableUDPSockmap());
+
+    // TCP enabled/disabled keep their prior semantics for loopback upstreams.
+    var tcp_enabled = makeTestConfiguration("127.0.0.1");
+    tcp_enabled.performance.tcp_sockmap_acceleration = .enabled;
+    const tcp_enabled_resolved = ResolvedConfiguration{
+        .configuration = tcp_enabled,
+        .listen_addresses = &listen_v4,
+        .upstream_address = SocketAddr.parseIp("127.0.0.1", 9_001).?,
+    };
+    try testing.expect(tcp_enabled_resolved.shouldEnableTCPSockmap());
+
+    var tcp_disabled = makeTestConfiguration("192.0.2.1");
+    tcp_disabled.performance.tcp_sockmap_acceleration = .disabled;
+    const tcp_disabled_resolved = ResolvedConfiguration{
+        .configuration = tcp_disabled,
+        .listen_addresses = &listen_v4,
+        .upstream_address = SocketAddr.parseIp("192.0.2.1", 9_001).?,
+    };
+    try testing.expect(!tcp_disabled_resolved.shouldEnableTCPSockmap());
 }
 
 fn hostBasedResolver(comptime listener_ip: []const u8) Resolver {

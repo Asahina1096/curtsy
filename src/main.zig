@@ -131,28 +131,3 @@ fn writeErr(comptime fmt: []const u8, args: anytype) void {
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
     log.writeAllFd(std.posix.STDERR_FILENO, text);
 }
-
-// Pull unit tests from the module tree into the test build.
-test {
-    _ = @import("net.zig");
-    _ = @import("yaml.zig");
-    _ = @import("module.zig");
-    _ = conf;
-    _ = core;
-    _ = log;
-    _ = @import("autotune.zig");
-    _ = @import("modules/upstream.zig");
-    _ = @import("modules/rules.zig");
-    _ = @import("modules/timeouts.zig");
-    _ = @import("modules/limits.zig");
-    _ = @import("modules/logging.zig");
-    _ = @import("modules/runtime.zig");
-    _ = @import("modules/performance.zig");
-    _ = @import("modules/tcp.zig");
-    _ = @import("modules/udp.zig");
-    _ = @import("modules/tuning.zig");
-    _ = @import("modules/balancer/round_robin.zig");
-    _ = @import("modules/balancer/source_hash.zig");
-    _ = @import("modules/balancer/weighted_round_robin.zig");
-    _ = @import("bpf.zig");
-}

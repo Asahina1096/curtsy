@@ -5,9 +5,9 @@
 //! is "*"). Accepted clients and their upstream connections live on the same
 //! worker loop. The relay provides:
 //!
-//! - adaptive read chunks of 64..256 KiB, at most 8 reads per readiness
-//!   event, a per-worker splice(2) zero-copy fast path, and buffered fallback
-//!   when the destination applies backpressure;
+//! - adaptive read chunks of 64 KiB..1 MiB, a per-worker splice(2) zero-copy
+//!   fast path, and buffered fallback when the destination applies
+//!   backpressure; both paths move at most 2 MiB per readiness event;
 //! - watermark backpressure: reading from a peer pauses when the outbound
 //!   queue exceeds 2 MiB and resumes below 1 MiB;
 //! - a global TCPBufferBudget caps queued userspace bytes across all workers;
@@ -47,13 +47,25 @@ fn failWith(e: linux.E) Error {
 const Error = error{SystemCall};
 
 /// Read buffers are allocated once per worker, so larger chunks reduce
-/// syscall pressure without creating per-read allocator churn.
+/// syscall pressure without creating per-read allocator churn. The splice
+/// path also uses max_read_chunk as the F_SETPIPE_SZ growth target: the
+/// kernel pipe usually adopts it, and GETPIPE_SZ records the actual value
+/// when an unprivileged process is capped below it.
 const min_read_chunk: usize = 64 * 1_024;
 const initial_read_chunk: usize = 128 * 1_024;
-const max_read_chunk: usize = 256 * 1_024;
+const max_read_chunk: usize = 1 * 1_024 * 1_024;
 
-/// At most one full read batch per readiness event.
+/// At most one full read batch per readiness event (buffered fallback).
 const max_reads_per_event: usize = 8;
+
+/// Cap on bytes moved by either relay path per readiness event. Without it
+/// the buffered path could move up to 8 MiB (8 reads of a grown 1 MiB chunk)
+/// when direct writes keep the pending queue empty, and the splice path could
+/// overshoot by nearly a full chunk. Both loops clamp each request to the
+/// remaining budget so one hot connection cannot monopolize the worker;
+/// small-pipe hosts reach the same byte cap through more, smaller splice
+/// iterations.
+const max_relay_bytes_per_event: usize = 2 * 1_024 * 1_024;
 
 /// Backpressure watermarks for the per-connection outbound queue. One full
 /// read batch stays below the high watermark with hysteresis above the low
@@ -984,8 +996,8 @@ const Worker = struct {
     }
 
     fn checkSockmapIdle(self: *Worker, connection: *Connection, now: u64) void {
-        const accelerator_ref = connection.accelerator orelse return;
-        const pairing = connection.pairing orelse return;
+        const accelerator_ref = connection.accelerator orelse unreachable;
+        const pairing = connection.pairing orelse unreachable;
         const remaining = accelerator_ref.idleRemainingNs(pairing, connection.idle_ns) catch |err| {
             self.listener.logger.warning("tcp sockmap activity lookup failed; closing connection error={s} errno={s}", .{
                 @errorName(err), @tagName(bpf.lastErrno),
@@ -1081,7 +1093,7 @@ const Worker = struct {
             .accelerator = state.accelerator,
         };
         if (client_address) |address| {
-            const text = std.fmt.bufPrint(&connection.client_text, "{f}", .{address}) catch "";
+            const text = std.fmt.bufPrint(&connection.client_text, "{f}", .{address}) catch unreachable;
             connection.client_text_len = text.len;
         }
 
@@ -1309,7 +1321,7 @@ const Worker = struct {
             }
             if (connection.dead) return;
         }
-        if (mask & linux.EPOLL.OUT != 0 and connection.mode != .connecting) {
+        if (mask & linux.EPOLL.OUT != 0) {
             self.flushPending(endpoint, now);
         }
     }
@@ -1350,16 +1362,18 @@ const Worker = struct {
         const peer = connection.peerOf(endpoint);
         if (peer.pendingLen() != 0 or peer.fin_when_drained or peer.wr_shutdown) return false;
 
-        var reads: usize = 0;
         var batch_bytes: usize = 0;
-        while (reads < max_reads_per_event) : (reads += 1) {
+        while (batch_bytes < max_relay_bytes_per_event) {
             if (!endpoint.read_open or !endpoint.read_wanted) break;
             if (peer.fin_when_drained or peer.wr_shutdown) {
                 self.killConnection(connection);
                 return true;
             }
 
-            const request = @min(endpoint.read_chunk, self.splice_capacity);
+            // Clamp to the remaining byte budget so one oversized request
+            // cannot overshoot the per-event cap. The loop condition keeps
+            // the remaining budget strictly positive here.
+            const request = @min(endpoint.read_chunk, self.splice_capacity, max_relay_bytes_per_event - batch_bytes);
             const rc = spliceNonBlocking(endpoint.fd, self.splice_pipe[1], request, true);
             const errno = linux.errno(rc);
             if (errno != .SUCCESS) {
@@ -1390,6 +1404,13 @@ const Worker = struct {
                 connection.bytes_to_upstream += @intCast(moved);
             } else {
                 connection.bytes_to_client += @intCast(moved);
+            }
+            // Grow the splice chunk after a full socket-to-pipe splice so a
+            // hot sustained stream issues fewer, larger splice requests.
+            // Growth beyond the pipe's actual capacity is harmless: the
+            // request is always min(read_chunk, splice_capacity).
+            if (moved == request and endpoint.read_chunk < max_read_chunk) {
+                endpoint.read_chunk = @min(endpoint.read_chunk * 2, max_read_chunk);
             }
 
             var remaining = moved;
@@ -1489,7 +1510,12 @@ const Worker = struct {
         const peer = connection.peerOf(endpoint);
         var reads: usize = 0;
         var batch_bytes: usize = 0;
-        while (reads < max_reads_per_event) : (reads += 1) {
+        // Bound bytes per event to max_relay_bytes_per_event as well; with a
+        // grown 1 MiB chunk, 8 reads could otherwise queue 8 MiB when direct
+        // writes keep the pending queue empty. max_reads_per_event is kept as
+        // a secondary bound so partial reads and EINTR retries still have
+        // headroom within the byte cap.
+        while (reads < max_reads_per_event and batch_bytes < max_relay_bytes_per_event) : (reads += 1) {
             if (!endpoint.read_open or !endpoint.read_wanted) break;
             if (peer.fin_when_drained or peer.wr_shutdown) {
                 // The peer's output is closing (half-close in progress); more
@@ -1499,7 +1525,11 @@ const Worker = struct {
                 return;
             }
 
-            const rc = linux.read(endpoint.fd, self.read_buffer.ptr, endpoint.read_chunk);
+            // Clamp to the remaining byte budget so one oversized read cannot
+            // overshoot the per-event cap. The loop condition keeps the
+            // remaining budget strictly positive here.
+            const request = @min(endpoint.read_chunk, max_relay_bytes_per_event - batch_bytes);
+            const rc = linux.read(endpoint.fd, self.read_buffer.ptr, request);
             const errno = linux.errno(rc);
             if (errno != .SUCCESS) {
                 switch (errno) {
@@ -1674,8 +1704,7 @@ const Worker = struct {
         // watermark.
         const source = connection.peerOf(endpoint);
         if (endpoint.budget_bytes <= write_buffer_low_watermark and
-            source.read_open and !source.read_wanted and
-            connection.mode != .connecting and !connection.dead)
+            source.read_open and !source.read_wanted and !connection.dead)
         {
             source.read_wanted = true;
             self.updateMask(source);
@@ -2284,6 +2313,61 @@ test "tcp large transfer completes through batched flushes" {
         try testing.expect(std.mem.allEqual(u8, recv_buf, 0xa5));
     }
     try testing.expectEqual(@as(i64, 0), listener.bufferedBytesUsed());
+}
+
+test "tcp splice relay sustains a large transfer" {
+    var echo = try EchoServer.start();
+    defer echo.stop();
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 1,
+        .enable_sockmap_acceleration = false,
+    });
+    defer listener.deinit();
+    try listener.start();
+    defer {
+        listener.stopAccepting();
+        listener.forceCloseConnections();
+    }
+
+    const client = try connectClient(listener.localAddresses()[0].port);
+    defer closeFd(client);
+    // Bound the send so a relay stall can never hang the writer thread; the
+    // receive timeout set by connectClient bounds the read side the same way.
+    var send_timeout = linux.timeval{ .sec = 10, .usec = 0 };
+    _ = linux.setsockopt(client, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&send_timeout), @sizeOf(linux.timeval));
+
+    const total: usize = 4 * 1_024 * 1_024; // 4 MiB through the splice fast path
+    const send_buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(send_buf);
+    @memset(send_buf, 0x5c);
+    const recv_buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(recv_buf);
+
+    // Push the payload from a separate thread so the blocking client socket
+    // cannot deadlock against its own receive buffer on the full-duplex
+    // echo; the main thread drains the echo concurrently. Sustained back
+    // pressure like this is what forces the splice chunk to grow. The writer
+    // reports no shared state; a full 4 MiB echo through readFully below is
+    // what proves the whole payload made the round trip.
+    const Writer = struct {
+        fn run(fd: fd_t, bytes: []const u8) !void {
+            try writeAll(fd, bytes);
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{ client, send_buf });
+    // Join exactly once on the success path below and on any error path
+    // (errdefer) before the test unwinds and closes the client fd.
+    errdefer writer.join();
+
+    try readFully(client, recv_buf);
+    try testing.expect(std.mem.allEqual(u8, recv_buf, 0x5c));
+    try testing.expectEqual(@as(i64, 0), listener.bufferedBytesUsed());
+    writer.join();
 }
 
 test "tcp listener uses resolved sockmap decision and allows test override" {
