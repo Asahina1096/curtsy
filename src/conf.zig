@@ -94,7 +94,15 @@ pub fn loadYaml(gpa: Allocator, text: []const u8, diag: *Diagnostics) LoadError!
     errdefer cycle.deinit();
     const arena = cycle.arena.allocator();
 
-    const root = try yaml.parse(arena, gpa, text, diag);
+    // The YAML parser keeps scalar strings as slices of the input document
+    // (splitLines slices it directly rather than copying every token), so the
+    // cycle's Value tree borrows that buffer. Copy the document into the arena
+    // so a cycle is self-contained: `loadFile` hands the parsed cycle to its
+    // caller and then frees the file bytes, and every module conf that stores
+    // a decoded string (listen/upstream hosts, logging level, ...) stays valid
+    // for as long as the cycle lives.
+    const owned_text = try arena.dupe(u8, text);
+    const root = try yaml.parse(arena, gpa, owned_text, diag);
     if (root.* != .mapping) {
         yaml.setDiag(gpa, diag, "YAML root must be a mapping", .{});
         return error.InvalidConfiguration;

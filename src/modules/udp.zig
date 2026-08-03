@@ -18,13 +18,20 @@
 //! establishes the session in userspace, then a per-client connected socket
 //! (bound to the listen address with SO_REUSEPORT) is paired with the
 //! upstream socket in that engine's own UDP sockhash; sessions never migrate
-//! between engines. auto skips loopback upstreams (measured lower goodput and
-//! reordering through the verdict path there); enabled forces the attempt.
-//! Expiry for steered sessions reads the BPF activity time
-//! via `idleRemainingNs`. Expired or unpaired sessions fall back to the
-//! listener and re-establish; pairing failures and SK_PASS datagrams are
-//! relayed by userspace. Changing the mode via `updateConfiguration` clears
-//! existing sessions and rebuilds under the new mode.
+//! between engines. auto starts on the stable userspace batched relay and is
+//! driven by a per-engine adaptive controller (`UdpSockmapPolicy`): the rule
+//! must not use a loopback upstream and the relay must observe a sustained,
+//! large-datagram workload over several consecutive windows before sockmap is
+//! attempted, and every failure path lands in a cooldown before re-probing.
+//! Loopback and small-packet workloads therefore stay on userspace; sockmap is
+//! best-effort with no packet-ordering guarantees. enabled forces a
+//! best-effort attempt; disabled always stays on userspace. Expiry for
+//! steered sessions reads the BPF activity time via `idleRemainingNs`.
+//! Expired or unpaired sessions fall back to the listener and re-establish;
+//! pairing failures and SK_PASS datagrams are relayed by userspace. Changing
+//! the mode via `updateConfiguration` clears existing sessions and rebuilds
+//! under the new mode; an enabled-to-auto reload synchronously blocks new
+//! associations from entering sockmap before the async teardown command runs.
 
 const std = @import("std");
 const config = @import("core.zig");
@@ -111,14 +118,312 @@ pub const RuntimeConfiguration = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Sockmap runtime loader (injectable, mirrors loadSockmapAccelerator)
+// Sockmap runtime interface (injectable, mirrors TCP's accelerator loader)
 // ---------------------------------------------------------------------------
 
-/// Factory for the per-engine UDP sockmap runtime. The default is
-/// `bpf.SockmapRuntime.createUdp`; tests inject a failing or counting fake.
-pub const SockmapRuntimeLoader = *const fn (max_entries: u32, verifier_log: ?[]u8) bpf.Error!bpf.SockmapRuntime;
+/// Type-erased UDP sockmap runtime. The engine only depends on this tiny
+/// vtable, so tests inject a counting/failing fake without loading any BPF
+/// object; the default backs it with a heap-allocated `bpf.SockmapRuntime`.
+pub const UdpSockmapRuntime = struct {
+    pub const Pairing = bpf.SockmapRuntime.Pairing;
 
-pub const default_sockmap_runtime_loader: SockmapRuntimeLoader = bpf.SockmapRuntime.createUdp;
+    pub const VTable = struct {
+        pair: *const fn (ctx: *anyopaque, client_fd: fd_t, upstream_fd: fd_t) bpf.Error!Pairing,
+        unpair: *const fn (ctx: *anyopaque, client_cookie: u64, upstream_cookie: u64) void,
+        idle_remaining_ns: *const fn (ctx: *anyopaque, client_cookie: u64, upstream_cookie: u64, idle_timeout_ns: u64) bpf.Error!u64,
+        destroy: *const fn (ctx: *anyopaque) void,
+    };
+
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    pub fn pair(self: *const UdpSockmapRuntime, client_fd: fd_t, upstream_fd: fd_t) bpf.Error!Pairing {
+        return self.vtable.pair(self.context, client_fd, upstream_fd);
+    }
+
+    pub fn unpair(self: *const UdpSockmapRuntime, client_cookie: u64, upstream_cookie: u64) void {
+        self.vtable.unpair(self.context, client_cookie, upstream_cookie);
+    }
+
+    pub fn idleRemainingNs(
+        self: *const UdpSockmapRuntime,
+        client_cookie: u64,
+        upstream_cookie: u64,
+        idle_timeout_ns: u64,
+    ) bpf.Error!u64 {
+        return self.vtable.idle_remaining_ns(self.context, client_cookie, upstream_cookie, idle_timeout_ns);
+    }
+
+    pub fn destroy(self: *UdpSockmapRuntime) void {
+        self.vtable.destroy(self.context);
+    }
+};
+
+/// Factory for the per-engine UDP sockmap runtime; the allocator backs the
+/// default boxed `bpf.SockmapRuntime`, and the optional context lets tests
+/// point fakes at their own state.
+pub const SockmapRuntimeLoader = *const fn (context: ?*anyopaque, allocator: Allocator, max_entries: u32, verifier_log: ?[]u8) bpf.Error!UdpSockmapRuntime;
+
+pub const default_sockmap_runtime_loader: SockmapRuntimeLoader = boxedSockmapRuntime;
+
+/// Heap box pairing the real runtime with the allocator that must free it.
+const RuntimeBox = struct {
+    allocator: Allocator,
+    runtime: bpf.SockmapRuntime,
+};
+
+fn boxedSockmapRuntime(context: ?*anyopaque, allocator: Allocator, max_entries: u32, verifier_log: ?[]u8) bpf.Error!UdpSockmapRuntime {
+    _ = context;
+    const box = allocator.create(RuntimeBox) catch return error.NoMemory;
+    box.runtime = bpf.SockmapRuntime.createUdp(max_entries, verifier_log) catch |err| {
+        allocator.destroy(box);
+        return err;
+    };
+    box.allocator = allocator;
+    return .{ .context = box, .vtable = &real_runtime_vtable };
+}
+
+const real_runtime_vtable = UdpSockmapRuntime.VTable{
+    .pair = realPair,
+    .unpair = realUnpair,
+    .idle_remaining_ns = realIdleRemainingNs,
+    .destroy = realDestroy,
+};
+
+fn realPair(ctx: *anyopaque, client_fd: fd_t, upstream_fd: fd_t) bpf.Error!UdpSockmapRuntime.Pairing {
+    const box: *RuntimeBox = @ptrCast(@alignCast(ctx));
+    return box.runtime.pair(client_fd, upstream_fd);
+}
+
+fn realUnpair(ctx: *anyopaque, client_cookie: u64, upstream_cookie: u64) void {
+    const box: *RuntimeBox = @ptrCast(@alignCast(ctx));
+    box.runtime.unpair(client_cookie, upstream_cookie);
+}
+
+fn realIdleRemainingNs(ctx: *anyopaque, client_cookie: u64, upstream_cookie: u64, idle_timeout_ns: u64) bpf.Error!u64 {
+    const box: *RuntimeBox = @ptrCast(@alignCast(ctx));
+    return box.runtime.idleRemainingNs(client_cookie, upstream_cookie, idle_timeout_ns);
+}
+
+fn realDestroy(ctx: *anyopaque) void {
+    const box: *RuntimeBox = @ptrCast(@alignCast(ctx));
+    box.runtime.destroy();
+    box.allocator.destroy(box);
+}
+
+// ---------------------------------------------------------------------------
+// UdpSockmapPolicy: conservative adaptive controller for auto mode
+// ---------------------------------------------------------------------------
+
+/// Conservative adaptive controller deciding when the per-engine UDP sockmap
+/// runtime may steer associations under `auto`.
+///
+/// It starts on the userspace relay and only arms sockmap after stable
+/// runtime evidence shows a workload where the verdict path is likely to
+/// help: the rule must not use a loopback upstream, and the relay must
+/// forward a sustained stream of large-enough datagrams over several
+/// consecutive 1-second windows (this excludes loopback and small-packet
+/// workloads, where the verdict path regresses throughput and reordering).
+/// Every failure path — an unusable verifier/loader, sustained pairing
+/// failures, or sustained userspace forwarding while supposedly steered —
+/// sends the controller into a cooldown before it may re-probe, so it never
+/// thrashes and always keeps a safe userspace fallback. Sockmap remains
+/// best-effort: no packet-ordering guarantees are claimed.
+///
+/// The controller is pure state; the engine feeds one pre-aggregated window
+/// per tick (`observeWindow`) and follows the returned `Action`. `enabled`
+/// forces the attempt unconditionally; `disabled` never attempts.
+pub const UdpSockmapPolicy = struct {
+    pub const Mode = config.SockmapAccelerationMode;
+
+    pub const State = enum(u8) {
+        /// sockmap off; collecting userspace evidence (auto only).
+        probing,
+        /// stable evidence observed; the runtime may be loaded now.
+        armed,
+        /// runtime loaded and steering new associations.
+        active,
+        /// after a failure/regression; no steering until the cooldown elapses.
+        cooling_down,
+    };
+
+    /// One pre-aggregated window of userspace activity.
+    pub const WindowSample = struct {
+        /// Datagrams forwarded by userspace in the window.
+        datagrams: u64,
+        /// Payload bytes forwarded by userspace in the window.
+        bytes: u64,
+        /// Rule eligibility (false when any upstream is loopback).
+        eligible: bool,
+    };
+
+    pub const Action = enum {
+        stay_off,
+        load,
+        keep_active,
+        regress,
+    };
+
+    // ------------------------------------------------------------------
+    // Internal tuning constants. Conservative by design; the policy is
+    // never enabled by traffic alone without these windows elapsing.
+    // ------------------------------------------------------------------
+
+    /// Evidence window length; the engine feeds one sample per window.
+    pub const window_ms: u64 = 1_000;
+    /// Consecutive qualifying windows required before auto arms.
+    pub const probe_stable_windows: u32 = 5;
+    /// Minimum sustained userspace datagrams per window to qualify.
+    pub const min_datagrams_per_window: u64 = 200;
+    /// Minimum average datagram size (bytes) — excludes small-packet loads.
+    pub const min_avg_datagram_bytes: u64 = 256;
+    /// Pairing failures (e.g. a full sockhash) tolerated while active before
+    /// the controller regresses to userspace.
+    pub const pairing_failure_threshold: u32 = 5;
+    /// Userspace datagrams per window while active that indicate steering is
+    /// not actually happening; sustained storms regress the controller.
+    pub const active_storm_datagrams: u64 = 500;
+    /// Consecutive storm windows required before regression (hysteresis).
+    pub const active_storm_windows: u32 = 2;
+    /// Cooldown after a load failure or regression before re-probing.
+    pub const fallback_cooldown_ms: u64 = 30_000;
+
+    mode: Mode = .auto,
+    state: State = .probing,
+    stable_windows: u32 = 0,
+    storm_windows: u32 = 0,
+    pairing_failures: u32 = 0,
+    cooldown_until_ms: u64 = 0,
+
+    /// Rebuilds the controller for `mode`; used on startup and whenever the
+    /// configured mode changes across a reload. A reload that keeps the same
+    /// mode leaves the controller (and any loaded runtime) in place, so e.g.
+    /// limits tuning does not reset an auto decision.
+    pub fn reset(self: *UdpSockmapPolicy, mode: Mode) void {
+        self.* = .{};
+        self.mode = mode;
+    }
+
+    /// auto: the controller currently allows new associations to be steered.
+    pub fn steerAllowed(self: *const UdpSockmapPolicy) bool {
+        return switch (self.mode) {
+            .disabled => false,
+            .enabled => true,
+            .auto => self.state == .active,
+        };
+    }
+
+    /// Feeds one window of userspace evidence at `now_ms`. The window is
+    /// already pre-aggregated by the engine (which ticks on its own cadence);
+    /// the sample's `datagrams`/`bytes` describe the whole window.
+    pub fn observeWindow(self: *UdpSockmapPolicy, now_ms: u64, sample: WindowSample) Action {
+        return switch (self.mode) {
+            .enabled => .keep_active,
+            .disabled => .stay_off,
+            .auto => self.observeAuto(now_ms, sample),
+        };
+    }
+
+    /// The engine loaded the runtime after `.load`; the controller becomes
+    /// active and clears its failure history.
+    pub fn noteLoaded(self: *UdpSockmapPolicy) void {
+        if (self.mode != .auto) return;
+        self.state = .active;
+        self.pairing_failures = 0;
+        self.stable_windows = 0;
+    }
+
+    /// The engine failed to load the runtime; enter the cooldown.
+    pub fn noteLoadFailure(self: *UdpSockmapPolicy, now_ms: u64) void {
+        if (self.mode != .auto) return;
+        self.state = .cooling_down;
+        self.cooldown_until_ms = now_ms + fallback_cooldown_ms;
+        self.pairing_failures = 0;
+    }
+
+    /// A pairing succeeded; steering works, so clear the failure streak.
+    pub fn notePairingSuccess(self: *UdpSockmapPolicy) void {
+        if (self.mode != .auto or self.state != .active) return;
+        self.pairing_failures = 0;
+    }
+
+    /// A pairing failed (typically a full sockhash). Sustained failures
+    /// regress the controller to a cooldown so a persistently broken map
+    /// falls back to the userspace relay instead of paying the pair cost for
+    /// every new association.
+    pub fn notePairingFailure(self: *UdpSockmapPolicy, now_ms: u64) void {
+        if (self.mode != .auto or self.state != .active) return;
+        self.pairing_failures += 1;
+        if (self.pairing_failures >= pairing_failure_threshold) {
+            self.state = .cooling_down;
+            self.cooldown_until_ms = now_ms + fallback_cooldown_ms;
+            self.pairing_failures = 0;
+        }
+    }
+
+    fn observeAuto(self: *UdpSockmapPolicy, now_ms: u64, sample: WindowSample) Action {
+        switch (self.state) {
+            .probing => {
+                if (sample.eligible and qualifies(sample)) {
+                    self.stable_windows += 1;
+                    if (self.stable_windows >= probe_stable_windows) {
+                        self.state = .armed;
+                        return .load;
+                    }
+                } else {
+                    self.stable_windows = 0;
+                }
+                return .stay_off;
+            },
+            .armed => {
+                // The load is attempted synchronously by the engine, so this
+                // state is transient; still re-verify the evidence so a stale
+                // arm cannot steer after a long quiet period.
+                if (sample.eligible and qualifies(sample)) return .load;
+                self.state = .probing;
+                self.stable_windows = 0;
+                return .stay_off;
+            },
+            .active => {
+                if (!sample.eligible) {
+                    self.regress(now_ms);
+                    return .regress;
+                }
+                if (sample.datagrams >= active_storm_datagrams) {
+                    self.storm_windows += 1;
+                    if (self.storm_windows >= active_storm_windows) {
+                        self.regress(now_ms);
+                        return .regress;
+                    }
+                } else {
+                    self.storm_windows = 0;
+                }
+                return .keep_active;
+            },
+            .cooling_down => {
+                if (now_ms >= self.cooldown_until_ms) {
+                    self.state = .probing;
+                    self.stable_windows = 0;
+                    self.storm_windows = 0;
+                    self.pairing_failures = 0;
+                }
+                return .stay_off;
+            },
+        }
+    }
+
+    fn regress(self: *UdpSockmapPolicy, now_ms: u64) void {
+        self.state = .cooling_down;
+        self.cooldown_until_ms = now_ms + fallback_cooldown_ms;
+        self.storm_windows = 0;
+        self.pairing_failures = 0;
+    }
+
+    fn qualifies(sample: WindowSample) bool {
+        return sample.datagrams >= min_datagrams_per_window and
+            (sample.bytes / @max(1, sample.datagrams)) >= min_avg_datagram_bytes;
+    }
+};
 
 /// Optional upstream-selection hook (upstream module). When set, each new
 /// association asks the selector for its upstream address, and upstream
@@ -138,6 +443,9 @@ pub const UdpListener = struct {
         listen_addresses: []SocketAddr = &.{},
         runtime: RuntimeConfiguration = undefined,
         engine: UdpRelayEngine = undefined,
+        /// Pending generation word returned by beginSteeringUpdate while the
+        /// listener publishes this slot's new runtime snapshot.
+        gate_update: u64 = 0,
     };
 
     allocator: Allocator,
@@ -145,7 +453,11 @@ pub const UdpListener = struct {
     log: *LogStore,
     enable_sockmap_override: ?bool,
     loader: ?SockmapRuntimeLoader,
+    loader_context: ?*anyopaque = null,
     upstream_selector: ?UpstreamSelector = null,
+    /// Reload-prepared listeners bind sockets but do not process datagrams
+    /// until the core commit calls activate().
+    start_paused: bool = false,
     /// Shared across all engine threads so the configured association limit
     /// stays a global bound rather than a per-thread one.
     budget: UdpAssociationBudget = .{},
@@ -236,15 +548,34 @@ pub const UdpListener = struct {
             engine_count,
             self.enable_sockmap_override,
             self.loader,
+            self.loader_context,
             announce_listen,
             self.upstream_selector,
         );
+        slot.engine.activated.store(!self.start_paused, .release);
         errdefer slot.engine.destroy();
         try slot.engine.start();
         try self.engines.append(self.allocator, slot);
     }
 
     pub fn updateConfiguration(self: *UdpListener, configuration: ResolvedConfiguration, reset_associations: bool) void {
+        // A reload that moves the mode away from enabled must stop new
+        // associations from entering sockmap synchronously: the engines only
+        // process the teardown command on their next I/O wake, so without
+        // this guard a datagram arriving in that window could still be
+        // steered under a configuration that now disallows it.
+        const old_mode = modeFromOverrideOrConfig(self.enable_sockmap_override, &self.runtime.current());
+        const new_mode = modeFromOverrideOrConfig(self.enable_sockmap_override, &configuration);
+        const blocks_steering = new_mode == .disabled or
+            (new_mode == .auto and (old_mode == .enabled or configuration.upstreamLoopback()));
+
+        // Begin a generation-tagged publication before changing any runtime
+        // snapshot. A stale engine reload may observe this pending generation,
+        // but it cannot clear its block or claim the update has been applied.
+        for (self.engines.items) |slot| {
+            slot.gate_update = slot.engine.beginSteeringUpdate(blocks_steering);
+        }
+
         // Timeout changes apply on each engine's next expiry sweep, which reads
         // the current snapshot; only upstream changes need association resets.
         self.runtime.update(configuration);
@@ -259,6 +590,7 @@ pub const UdpListener = struct {
                     .upstream_has_loopback = configuration.upstream_has_loopback,
                 });
             }
+            slot.engine.finishSteeringUpdate(slot.gate_update);
             slot.engine.updateAccelerator();
             if (reset_associations) {
                 slot.engine.resetAssociations();
@@ -275,6 +607,16 @@ pub const UdpListener = struct {
 
     pub fn associationCount(self: *const UdpListener) u64 {
         return self.budget.count();
+    }
+
+    pub fn activate(self: *UdpListener) void {
+        self.start_paused = false;
+        for (self.engines.items) |slot| {
+            if (slot.engine.activated.swap(true, .acq_rel)) continue;
+            slot.engine.signal_mutex.lock();
+            if (slot.engine.wake_fd >= 0) bpf.eventfdSignal(slot.engine.wake_fd);
+            slot.engine.signal_mutex.unlock();
+        }
     }
 
     pub fn stop(self: *UdpListener) void {
@@ -309,10 +651,12 @@ fn createProtocolListener(
     resolved: ResolvedConfiguration,
     logger: *LogStore,
     selector: ?upstream.Selector,
+    start_paused: bool,
 ) anyerror!*config.Listener {
     const listener = try outer_allocator.create(UdpListener);
     errdefer outer_allocator.destroy(listener);
     listener.* = UdpListener.initWithSelector(outer_allocator, resolved, logger, null, null, selector);
+    listener.start_paused = start_paused;
     errdefer listener.deinit();
     try listener.start();
 
@@ -320,6 +664,7 @@ fn createProtocolListener(
     wrapper.* = .{
         .allocator = outer_allocator,
         .context = listener,
+        .activate_fn = listenerActivate,
         .stop_accepting_fn = listenerStopImmediate,
         .destroy_fn = listenerDestroy,
         .update_configuration_fn = listenerUpdateConfiguration,
@@ -330,6 +675,11 @@ fn createProtocolListener(
         .associations_fn = listenerAssociations,
     };
     return wrapper;
+}
+
+fn listenerActivate(context: *anyopaque) void {
+    const listener: *UdpListener = @ptrCast(@alignCast(context));
+    listener.activate();
 }
 
 /// UDP associations expire on their own timers; retiring a UDP listener
@@ -378,7 +728,15 @@ pub const UdpRelayEngine = struct {
     const Command = enum {
         reset_associations,
         reload_accelerator,
+
+        fn bit(self: Command) u8 {
+            return @as(u8, 1) << @intFromEnum(self);
+        }
     };
+
+    const steering_blocked_bit: u64 = 1;
+    const steering_publishing_bit: u64 = 2;
+    const steering_generation_step: u64 = 4;
 
     const Association = struct {
         client: SocketAddr,
@@ -454,18 +812,25 @@ pub const UdpRelayEngine = struct {
     announce_listen: bool,
     enable_sockmap_override: ?bool,
     loader: SockmapRuntimeLoader,
+    loader_context: ?*anyopaque,
     upstream_selector: ?UpstreamSelector,
+    /// Conservative adaptive controller for auto mode; only touched by this
+    /// engine's I/O thread, so the fast path never takes a lock.
+    policy: UdpSockmapPolicy = .{},
+    /// Generation-tagged steering gate. Bit 0 blocks new sockmap pairings;
+    /// bit 1 marks a runtime snapshot publication in progress; upper bits are
+    /// a monotonically increasing generation. Only the engine clears a block,
+    /// using compare-exchange against the exact generation it applied.
+    steering_gate: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    command_mutex: Mutex = .{},
-    /// Fast path flag so processCommands skips the mutex when no command
-    /// was ever enqueued.
-    command_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    pending_commands: std.ArrayList(Command) = .empty,
-    drained_commands: std.ArrayList(Command) = .empty,
+    /// Allocation-free, coalescing command bits. Both commands are idempotent;
+    /// processCommands handles reload before reset when both are pending.
+    command_flags: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     /// Guards wake_fd signalling (enqueue/stop) against the close in stop(),
     /// so a signal write can never land on a closed or reused descriptor.
     signal_mutex: Mutex = .{},
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    activated: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     thread: ?std.Thread = null,
 
     bound_mutex: Mutex = .{},
@@ -480,13 +845,21 @@ pub const UdpRelayEngine = struct {
     upstream_to_client: std.AutoHashMap(fd_t, SocketAddr),
     client_fd_to_client: std.AutoHashMap(fd_t, SocketAddr),
     listen_bound: std.AutoHashMap(fd_t, posix.sockaddr.storage),
-    sockmap_runtime: ?bpf.SockmapRuntime = null,
+    sockmap_runtime: ?UdpSockmapRuntime = null,
     warned_at_limit: bool = false,
     sweep_buffer: std.ArrayList(SocketAddr) = .empty,
     last_sweep_ms: u64 = 0,
     accelerate_cooldown_until_ms: u64 = 0,
     send_error_drops: u64 = 0,
     last_send_error_log_ms: u64 = 0,
+    /// Cached auto eligibility (no loopback upstream); refreshed on startup
+    /// and reload so the I/O thread never locks the runtime snapshot.
+    sockmap_eligible: bool = false,
+    last_policy_tick_ms: u64 = 0,
+    /// Userspace receive totals accumulated for the policy window; reset by
+    /// the policy tick in run().
+    policy_recv_datagrams: u64 = 0,
+    policy_recv_bytes: u64 = 0,
     /// Reusable sendmmsg header/iovec storage, confined to this engine's I/O
     /// thread like the rest of the state below; avoids rebuilding the header
     /// set on the stack for every send batch.
@@ -507,6 +880,7 @@ pub const UdpRelayEngine = struct {
         engine_count: u32,
         enable_sockmap_acceleration: ?bool,
         loader: ?SockmapRuntimeLoader,
+        loader_context: ?*anyopaque,
         announce_listen: bool,
         upstream_selector: ?UpstreamSelector,
     ) UdpRelayEngine {
@@ -519,6 +893,7 @@ pub const UdpRelayEngine = struct {
             .announce_listen = announce_listen,
             .enable_sockmap_override = enable_sockmap_acceleration,
             .loader = loader orelse default_sockmap_runtime_loader,
+            .loader_context = loader_context,
             .upstream_selector = upstream_selector,
             .associations = AssociationMap.init(allocator),
             .upstream_to_client = std.AutoHashMap(fd_t, SocketAddr).init(allocator),
@@ -578,13 +953,20 @@ pub const UdpRelayEngine = struct {
             try bpf.epollAdd(epoll_fd, fd);
         }
 
-        const should_enable_sockmap = self.enable_sockmap_override orelse snapshot.shouldEnableUDPSockmap();
-        if (should_enable_sockmap) {
-            if (self.tryLoadAccelerator(&snapshot)) {
-                self.log.info("udp sockmap acceleration enabled", .{});
-            }
-        } else {
-            self.log.info("udp sockmap acceleration disabled", .{});
+        self.sockmap_eligible = !snapshot.upstreamLoopback();
+        const now_ms = monotonicMilliseconds();
+        self.last_policy_tick_ms = now_ms;
+        const mode = self.effectiveMode(&snapshot);
+        self.policy.reset(mode);
+        switch (mode) {
+            .enabled => {
+                if (self.tryLoadAccelerator(&snapshot)) {
+                    self.log.info("udp sockmap acceleration enabled", .{});
+                }
+            },
+            .auto, .disabled => {
+                self.log.info("udp sockmap acceleration disabled", .{});
+            },
         }
 
         // Pre-size the session maps so steady-state growth never rehashes
@@ -649,6 +1031,44 @@ pub const UdpRelayEngine = struct {
         self.enqueue(.reload_accelerator);
     }
 
+    /// Publishes a new pending gate generation before its runtime snapshot is
+    /// updated. Existing blocks are preserved even for an allowing update;
+    /// only the engine that applies the completed generation may clear them.
+    fn beginSteeringUpdate(self: *UdpRelayEngine, blocks_steering: bool) u64 {
+        while (true) {
+            const current = self.steering_gate.load(.acquire);
+            const blocked = (current & steering_blocked_bit) != 0 or blocks_steering;
+            const next = (current & ~@as(u64, 3)) + steering_generation_step |
+                steering_publishing_bit |
+                @as(u64, @intFromBool(blocked));
+            if (self.steering_gate.cmpxchgWeak(current, next, .acq_rel, .acquire) == null) return next;
+        }
+    }
+
+    /// Completes publication of the generation returned by beginSteeringUpdate.
+    /// A superseding update makes the compare-exchange fail, leaving its newer
+    /// gate untouched.
+    fn finishSteeringUpdate(self: *UdpRelayEngine, pending: u64) void {
+        _ = self.steering_gate.cmpxchgStrong(
+            pending,
+            pending & ~steering_publishing_bit,
+            .release,
+            .acquire,
+        );
+    }
+
+    /// Clears the block for an applied generation only when it is fully
+    /// published and still current. Returns whether the clear succeeded.
+    fn clearAppliedSteeringGate(self: *UdpRelayEngine, applied: u64) bool {
+        if (applied & steering_publishing_bit != 0) return false;
+        return self.steering_gate.cmpxchgStrong(
+            applied,
+            applied & ~steering_blocked_bit,
+            .release,
+            .acquire,
+        ) == null;
+    }
+
     pub fn stop(self: *UdpRelayEngine) void {
         const was_running = self.stop_requested.swap(true, .acq_rel);
         if (was_running) return;
@@ -680,8 +1100,6 @@ pub const UdpRelayEngine = struct {
         self.upstream_to_client.deinit();
         self.client_fd_to_client.deinit();
         self.listen_bound.deinit();
-        self.pending_commands.deinit(self.allocator);
-        self.drained_commands.deinit(self.allocator);
         self.sweep_buffer.deinit(self.allocator);
         if (self.bound_addresses.len > 0) {
             self.allocator.free(self.bound_addresses);
@@ -707,14 +1125,7 @@ pub const UdpRelayEngine = struct {
     }
 
     fn enqueue(self: *UdpRelayEngine, command: Command) void {
-        self.command_mutex.lock();
-        self.pending_commands.append(self.allocator, command) catch {
-            self.command_mutex.unlock();
-            self.log.warning("udp engine command dropped command={s}", .{@tagName(command)});
-            return;
-        };
-        self.command_pending.store(true, .release);
-        self.command_mutex.unlock();
+        _ = self.command_flags.fetchOr(command.bit(), .release);
         self.signal_mutex.lock();
         if (self.wake_fd >= 0) bpf.eventfdSignal(self.wake_fd);
         self.signal_mutex.unlock();
@@ -759,6 +1170,8 @@ pub const UdpRelayEngine = struct {
             for (ready_fds[0..ready]) |fd| {
                 if (fd == self.wake_fd) {
                     bpf.eventfdDrain(self.wake_fd);
+                } else if (!self.activated.load(.acquire)) {
+                    continue;
                 } else if (self.client_fd_to_client.get(fd)) |client| {
                     self.drainClient(fd, client, &recv_slots, &recv_io, now_ms);
                 } else if (self.upstream_to_client.get(fd)) |client| {
@@ -766,6 +1179,15 @@ pub const UdpRelayEngine = struct {
                 } else {
                     self.drainListen(fd, &recv_slots, &send_slots, &recv_io, now_ms);
                 }
+            }
+            // One policy tick per evidence window: feed the userspace totals
+            // accumulated during the window to the adaptive controller and act
+            // on its decision (load, keep, or regress to userspace). Ticks are
+            // throttled by elapsed time, and quiet windows simply reset the
+            // totals, so the controller never sees traffic-doubled samples.
+            if (now_ms -% self.last_policy_tick_ms >= UdpSockmapPolicy.window_ms) {
+                self.last_policy_tick_ms = now_ms;
+                self.handlePolicyTick(now_ms);
             }
             // The 50 ms sweep is throttled by elapsed time, not by wake
             // count: busy engines would otherwise rescan all sessions after
@@ -805,18 +1227,9 @@ pub const UdpRelayEngine = struct {
     }
 
     fn processCommands(self: *UdpRelayEngine) void {
-        if (!self.command_pending.load(.acquire)) return;
-        self.command_mutex.lock();
-        std.mem.swap(std.ArrayList(Command), &self.pending_commands, &self.drained_commands);
-        self.command_pending.store(false, .monotonic);
-        self.command_mutex.unlock();
-        for (self.drained_commands.items) |command| {
-            switch (command) {
-                .reset_associations => self.closeAllAssociations(),
-                .reload_accelerator => self.reloadAccelerator(),
-            }
-        }
-        self.drained_commands.clearRetainingCapacity();
+        const flags = self.command_flags.swap(0, .acq_rel);
+        if (flags & Command.reload_accelerator.bit() != 0) self.reloadAccelerator();
+        if (flags & Command.reset_associations.bit() != 0) self.closeAllAssociations();
     }
 
     fn teardown(self: *UdpRelayEngine) void {
@@ -849,7 +1262,7 @@ pub const UdpRelayEngine = struct {
     fn tryLoadAccelerator(self: *UdpRelayEngine, snapshot: *const ResolvedConfiguration) bool {
         var verifier_log: [4096]u8 = undefined;
         verifier_log[0] = 0;
-        self.sockmap_runtime = self.loader(sockmapMaxEntries(snapshot, self.engine_count), &verifier_log) catch {
+        self.sockmap_runtime = self.loader(self.loader_context, self.allocator, sockmapMaxEntries(snapshot, self.engine_count), &verifier_log) catch {
             self.log.warning(
                 "udp sockmap acceleration unavailable; using userspace relay error={s} verifier={s}",
                 .{ errnoDescription(), std.mem.sliceTo(&verifier_log, 0) },
@@ -857,6 +1270,62 @@ pub const UdpRelayEngine = struct {
             return false;
         };
         return true;
+    }
+
+    /// The mode the engine must honour: the test override wins when set,
+    /// otherwise the resolved configuration decides.
+    fn effectiveMode(self: *const UdpRelayEngine, snapshot: *const ResolvedConfiguration) config.SockmapAccelerationMode {
+        if (self.enable_sockmap_override) |forced| return if (forced) .enabled else .disabled;
+        return snapshot.configuration.performance.udp_sockmap_acceleration;
+    }
+
+    /// One policy tick: feed the userspace totals accumulated over the window
+    /// to the adaptive controller and act on its decision. Runs on the engine's
+    /// I/O thread; the counter reset keeps every window's evidence disjoint.
+    fn handlePolicyTick(self: *UdpRelayEngine, now_ms: u64) void {
+        const action = self.policy.observeWindow(now_ms, .{
+            .datagrams = self.policy_recv_datagrams,
+            .bytes = self.policy_recv_bytes,
+            .eligible = self.sockmap_eligible,
+        });
+        self.policy_recv_datagrams = 0;
+        self.policy_recv_bytes = 0;
+        switch (action) {
+            .load => self.tryLoadFromPolicy(now_ms),
+            .regress => {
+                self.log.info("udp sockmap acceleration disabled", .{});
+                self.syncSockmapToPolicy();
+            },
+            .stay_off, .keep_active => {},
+        }
+    }
+
+    /// The controller asked for the runtime; load it once and record the
+    /// outcome so the policy knows whether it is active or in a cooldown.
+    fn tryLoadFromPolicy(self: *UdpRelayEngine, now_ms: u64) void {
+        if (self.sockmap_runtime != null) {
+            self.policy.noteLoaded();
+            return;
+        }
+        const snapshot = self.runtime.current();
+        if (self.tryLoadAccelerator(&snapshot)) {
+            self.policy.noteLoaded();
+            self.log.info("udp sockmap acceleration enabled", .{});
+        } else {
+            self.policy.noteLoadFailure(now_ms);
+        }
+    }
+
+    /// Tear the runtime down unless the policy still allows steering. Called
+    /// after any policy transition (regression, pairing-failure storm) so a
+    /// runtime never survives its policy; associations are unpaired first,
+    /// then the runtime is destroyed, preserving the teardown ordering.
+    fn syncSockmapToPolicy(self: *UdpRelayEngine) void {
+        if (self.sockmap_runtime == null) return;
+        if (self.policy.steerAllowed()) return;
+        self.closeAllAssociations();
+        self.sockmap_runtime.?.destroy();
+        self.sockmap_runtime = null;
     }
 
     // Oversized requests are silently clamped to the kernel rmem/wmem maxima,
@@ -886,22 +1355,61 @@ pub const UdpRelayEngine = struct {
     }
 
     fn reloadAccelerator(self: *UdpRelayEngine) void {
+        const applied_gate = self.steering_gate.load(.acquire);
         const snapshot = self.runtime.current();
-        const requested = self.enable_sockmap_override orelse snapshot.shouldEnableUDPSockmap();
-        if (requested and self.sockmap_runtime == null) {
-            if (self.tryLoadAccelerator(&snapshot)) {
-                self.log.info("udp sockmap acceleration enabled", .{});
-                // Only newly established associations are steered.
-                self.closeAllAssociations();
-            }
-        } else if (!requested and self.sockmap_runtime != null) {
-            self.log.info("udp sockmap acceleration disabled", .{});
-            // Close first so existing sessions fall back to the userspace
-            // relay before the runtime is destroyed.
-            self.closeAllAssociations();
-            self.sockmap_runtime.?.destroy();
-            self.sockmap_runtime = null;
+        const mode = self.effectiveMode(&snapshot);
+        self.sockmap_eligible = !snapshot.upstreamLoopback();
+
+        switch (mode) {
+            .enabled => {
+                // Explicit enabled always forces the runtime; the controller is
+                // rebuilt only if it was not already enabled.
+                if (self.policy.mode != .enabled) self.policy.reset(.enabled);
+                if (self.sockmap_runtime == null) {
+                    if (self.tryLoadAccelerator(&snapshot)) {
+                        self.log.info("udp sockmap acceleration enabled", .{});
+                        // Only newly established associations are steered.
+                        self.closeAllAssociations();
+                    }
+                }
+            },
+            .auto => {
+                // An unchanged auto mode with a still-eligible rule (e.g. a
+                // routine tuning-daemon limits tick) keeps the adaptive
+                // runtime and policy exactly as they are. Teardown is only for
+                // transitions that revoke acceleration: coming from explicit
+                // enabled, or the rule becoming loopback-ineligible. In both
+                // cases the controller resets to probing so eligible traffic
+                // can re-arm it later (never "active" with a null runtime).
+                const came_from_forced = self.policy.mode == .enabled;
+                const now_ineligible = !self.sockmap_eligible;
+                if (self.sockmap_runtime != null and (came_from_forced or now_ineligible)) {
+                    // Close first so existing sessions fall back to the
+                    // userspace relay before the runtime is destroyed.
+                    self.log.info("udp sockmap acceleration disabled", .{});
+                    self.closeAllAssociations();
+                    self.sockmap_runtime.?.destroy();
+                    self.sockmap_runtime = null;
+                }
+                if (self.policy.mode != .auto or now_ineligible) {
+                    self.policy.reset(.auto);
+                }
+            },
+            .disabled => {
+                if (self.policy.mode != .disabled) self.policy.reset(.disabled);
+                if (self.sockmap_runtime != null) {
+                    self.log.info("udp sockmap acceleration disabled", .{});
+                    self.closeAllAssociations();
+                    self.sockmap_runtime.?.destroy();
+                    self.sockmap_runtime = null;
+                }
+            },
         }
+
+        // Clear the synchronous block only for the exact, fully-published
+        // generation applied above. A concurrent or still-publishing update
+        // changes the word, so this stale completion cannot clear its block.
+        _ = self.clearAppliedSteeringGate(applied_gate);
     }
 
     const RecvBatchResult = struct {
@@ -937,6 +1445,7 @@ pub const UdpRelayEngine = struct {
         recv_slots: *[batch_size]bpf.UdpSlot,
         recv_io: anytype,
         remaining_calls: usize,
+        count_policy: bool,
     ) RecvBatchResult {
         var offset: usize = 0;
         var calls: usize = 0;
@@ -949,6 +1458,19 @@ pub const UdpRelayEngine = struct {
             calls += 1;
             self.recv_calls += 1;
             self.recv_datagrams += received;
+            if (received > 0) {
+                // The adaptive policy's evidence is the client-side workload
+                // only: datagrams arriving on the listener (client ingress)
+                // and the accelerated client fallback socket. Upstream
+                // responses are excluded so a chatty upstream cannot arm the
+                // accelerator on the relay's reply volume.
+                if (count_policy) {
+                    var bytes: u64 = 0;
+                    for (recv_slots[offset .. offset + received]) |*slot| bytes += slot.length;
+                    self.policy_recv_datagrams += received;
+                    self.policy_recv_bytes += bytes;
+                }
+            }
             if (received == 0) { // EAGAIN: the socket has nothing more
                 would_block = true;
                 break;
@@ -968,7 +1490,7 @@ pub const UdpRelayEngine = struct {
     ) void {
         var remaining = max_batches_per_drain;
         while (remaining > 0) {
-            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining, true);
             remaining -= result.calls;
             if (result.count > 0) {
                 self.forwardClientDatagrams(result.count, fd, recv_slots, send_slots, now_ms);
@@ -1056,7 +1578,7 @@ pub const UdpRelayEngine = struct {
         const association = self.associations.getPtr(client) orelse return;
         var remaining = max_batches_per_drain;
         while (remaining > 0) {
-            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining, true);
             remaining -= result.calls;
             if (result.count > 0) {
                 association.last_activity_ms = now_ms;
@@ -1089,7 +1611,7 @@ pub const UdpRelayEngine = struct {
         const association = self.associations.getPtr(client) orelse return;
         var remaining = max_batches_per_drain;
         while (remaining > 0) {
-            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining, false);
             remaining -= result.calls;
             if (result.count > 0) {
                 association.last_activity_ms = now_ms;
@@ -1210,24 +1732,36 @@ pub const UdpRelayEngine = struct {
         self.applySocketBuffers(upstream_fd, "direction=upstream client={f}", .{client}, false);
 
         var client_fd: ?fd_t = null;
-        var pairing: ?bpf.SockmapRuntime.Pairing = null;
+        var pairing: ?UdpSockmapRuntime.Pairing = null;
         errdefer {
             if (pairing) |p| {
                 if (self.sockmap_runtime) |*runtime| runtime.unpair(p.client_cookie, p.upstream_cookie);
             }
             if (client_fd) |fd| _ = linux.close(fd);
         }
-        if (self.sockmap_runtime != null and now_ms >= self.accelerate_cooldown_until_ms) {
+        // Steering is gated by the adaptive controller AND the synchronous
+        // reload guard: once updateConfiguration has made the snapshot
+        // disallow sockmap, no newly established association may enter the map
+        // even while the async teardown command is still pending.
+        if (self.sockmap_runtime != null and
+            self.steering_gate.load(.acquire) & steering_blocked_bit == 0 and
+            self.policy.steerAllowed() and
+            now_ms >= self.accelerate_cooldown_until_ms)
+        {
             if (self.listen_bound.get(listen_fd)) |bind_storage| {
                 if (self.accelerateAssociation(bind_storage, client_address, client_address_length, upstream_fd)) |accelerated| {
                     client_fd = accelerated.fd;
                     pairing = accelerated.pairing;
+                    self.policy.notePairingSuccess();
                 } else |err| {
                     // Kernel steering is best-effort per association; fall
                     // back to the userspace relay for this client. Repeated
                     // failures (e.g. a full sockhash) pause further attempts
-                    // so every new session does not pay the failed pair cost.
+                    // so every new session does not pay the failed pair cost,
+                    // and sustained failures regress the auto controller.
                     self.accelerate_cooldown_until_ms = now_ms + accelerate_failure_cooldown_ms;
+                    self.policy.notePairingFailure(now_ms);
+                    self.syncSockmapToPolicy();
                     self.log.debug("udp sockmap pairing failed client={f} error={s}", .{ client, @errorName(err) });
                 }
             }
@@ -1309,15 +1843,15 @@ pub const UdpRelayEngine = struct {
     }
 
     fn closeAllAssociations(self: *UdpRelayEngine) void {
-        self.sweep_buffer.clearRetainingCapacity();
-        var iterator = self.associations.keyIterator();
-        while (iterator.next()) |key| {
-            self.sweep_buffer.append(self.allocator, key.*) catch break;
+        // Allocation-free teardown: removing the first key repeatedly cannot
+        // fail, so an OOM can never leave paired associations alive while the
+        // runtime is destroyed underneath them. Each removal unpairs first
+        // (kernel steering stops before the sockets are closed) and releases
+        // the association budget exactly once.
+        while (self.associations.count() > 0) {
+            var iterator = self.associations.keyIterator();
+            self.closeAssociation(iterator.next().?.*);
         }
-        for (self.sweep_buffer.items) |client| {
-            self.closeAssociation(client);
-        }
-        self.sweep_buffer.clearRetainingCapacity();
     }
 
     fn sweepExpiredAssociations(self: *UdpRelayEngine, now_ms: u64) void {
@@ -1366,6 +1900,13 @@ fn monotonicMilliseconds() u64 {
     var time: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &time);
     return @as(u64, @intCast(time.sec)) * 1_000 + @as(u64, @intCast(time.nsec)) / 1_000_000;
+}
+
+/// The sockmap mode for a resolved configuration, honoring the listener/engine
+/// test override when set.
+fn modeFromOverrideOrConfig(override: ?bool, resolved: *const ResolvedConfiguration) config.SockmapAccelerationMode {
+    if (override) |forced| return if (forced) .enabled else .disabled;
+    return resolved.configuration.performance.udp_sockmap_acceleration;
 }
 
 fn setThreadName() void {
@@ -1581,6 +2122,32 @@ fn waitForEcho(fd: fd_t, port: u16, message: []const u8, timeout_ms: u64) !bool 
     return false;
 }
 
+test "udp prepared listener does not forward until activated" {
+    var echo = try UdpEchoServer.start();
+    defer echo.stop();
+
+    var logger = LogStore.init("critical");
+    const resolved = try makeUdpTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = UdpListener.init(testing.allocator, resolved, &logger, false, null);
+    listener.start_paused = true;
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = try listener.localAddresses(testing.allocator);
+    defer testing.allocator.free(bound);
+    const client = try udpClient();
+    defer closeFd(client);
+
+    try udpSendTo(client, bound[0].port, "paused");
+    var buf: [64]u8 = undefined;
+    try testing.expect(try udpReceive(client, &buf) == null);
+
+    listener.activate();
+    try testing.expect(try waitForEcho(client, bound[0].port, "paused", 2_000));
+}
+
 test "udp selector chooses the upstream per association" {
     var echo_a = try UdpEchoServer.start();
     defer echo_a.stop();
@@ -1690,8 +2257,9 @@ const DrainHarness = struct {
         errdefer testing.allocator.free(resolved.listen_addresses);
         self.logger = LogStore.init("critical");
         self.resolved_listen = resolved.listen_addresses;
+        self.budget = .{};
         self.runtime = RuntimeConfiguration.init(resolved);
-        self.engine = UdpRelayEngine.init(&self.runtime, &self.logger, &self.budget, testing.allocator, 1, null, null, false, null);
+        self.engine = UdpRelayEngine.init(&self.runtime, &self.logger, &self.budget, testing.allocator, 1, null, null, null, false, null);
         for (&self.recv_slots, 0..) |*slot, i| {
             slot.* = .{ .data = self.buffer[i * 16 ..][0..16].ptr, .capacity = 16 };
         }
@@ -1728,7 +2296,7 @@ test "udp drain budget counts eagain and error recvmmsg syscalls" {
 
     // Empty socket: the single recvmmsg reports EAGAIN and is counted, so a
     // readiness event that turns out to be spurious still bills its syscall.
-    const eagain = engine.drainRecvBatch(fd, recv_slots, recv_io, UdpRelayEngine.max_batches_per_drain);
+    const eagain = engine.drainRecvBatch(fd, recv_slots, recv_io, UdpRelayEngine.max_batches_per_drain, true);
     try testing.expectEqual(@as(usize, 0), eagain.count);
     try testing.expectEqual(@as(usize, 1), eagain.calls);
     try testing.expect(eagain.would_block);
@@ -1741,7 +2309,7 @@ test "udp drain budget counts eagain and error recvmmsg syscalls" {
     // tears the socket down after forwarding any partial batch.
     const event_fd = try bpf.eventfdCreate();
     defer closeFd(event_fd);
-    const failed = engine.drainRecvBatch(event_fd, recv_slots, recv_io, UdpRelayEngine.max_batches_per_drain);
+    const failed = engine.drainRecvBatch(event_fd, recv_slots, recv_io, UdpRelayEngine.max_batches_per_drain, true);
     try testing.expectEqual(@as(usize, 0), failed.count);
     try testing.expectEqual(@as(usize, 1), failed.calls);
     try testing.expect(!failed.would_block);
@@ -1789,7 +2357,7 @@ test "udp drain budget yields multiple consolidated batches within one readiness
         var round_calls: usize = 0;
         var round_full: usize = 0;
         while (remaining > 0) {
-            const result = engine.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            const result = engine.drainRecvBatch(fd, recv_slots, recv_io, remaining, true);
             remaining -= result.calls;
             round_calls += result.calls;
             total += result.count;
@@ -1858,7 +2426,7 @@ test "udp drain budget counts success then error without re-adding work" {
         .{ .datagrams = 1 },
         .{ .failed = bpf.Error.Unexpected },
     } };
-    const result = engine.drainRecvBatch(-1, recv_slots, &script, UdpRelayEngine.max_batches_per_drain);
+    const result = engine.drainRecvBatch(-1, recv_slots, &script, UdpRelayEngine.max_batches_per_drain, true);
     try testing.expectEqual(@as(usize, 2), result.count);
     try testing.expectEqual(@as(usize, 3), result.calls);
     try testing.expect(!result.would_block);
@@ -1867,4 +2435,677 @@ test "udp drain budget counts success then error without re-adding work" {
     try testing.expectEqual(@as(u64, 3), engine.recv_calls);
     // Only the two successfully received datagrams are counted.
     try testing.expectEqual(@as(u64, 2), engine.recv_datagrams);
+}
+
+test "udp policy evidence counts client-side receives only, not upstream responses" {
+    var harness = try DrainHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    const recv_slots = &harness.recv_slots;
+
+    // Upstream responses (count_policy=false) count toward the batch stats
+    // but never feed the adaptive policy's userspace evidence.
+    var upstream_script = ScriptedRecvIo{ .results = &.{
+        .{ .datagrams = 2 },
+        .{ .datagrams = 0 },
+    } };
+    _ = engine.drainRecvBatch(-1, recv_slots, &upstream_script, UdpRelayEngine.max_batches_per_drain, false);
+    try testing.expectEqual(@as(u64, 2), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 0), engine.policy_recv_datagrams);
+    try testing.expectEqual(@as(u64, 0), engine.policy_recv_bytes);
+
+    // Client ingress and accelerated client fallback (count_policy=true) feed
+    // the evidence; each scripted slot carries one byte.
+    var client_script = ScriptedRecvIo{ .results = &.{
+        .{ .datagrams = 2 },
+        .{ .datagrams = 0 },
+    } };
+    _ = engine.drainRecvBatch(-1, recv_slots, &client_script, UdpRelayEngine.max_batches_per_drain, true);
+    try testing.expectEqual(@as(u64, 4), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 2), engine.policy_recv_datagrams);
+    try testing.expectEqual(@as(u64, 2), engine.policy_recv_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// UDP sockmap policy + reload race tests
+// ---------------------------------------------------------------------------
+
+/// Deterministic stand-in for a kernel sockmap runtime: no BPF is loaded;
+/// pair/idle/destroy just record calls and their relative order, so the
+/// engine's steering decisions and teardown ordering are observable without
+/// privileges.
+const FakeSockmapRuntime = struct {
+    const Event = enum { pair, unpair, destroy };
+
+    pair_calls: usize = 0,
+    unpair_calls: usize = 0,
+    destroy_calls: usize = 0,
+    fail_pairs: bool = false,
+    events: std.ArrayList(Event) = .empty,
+
+    fn deinit(self: *FakeSockmapRuntime) void {
+        self.events.deinit(testing.allocator);
+    }
+
+    fn loader(context: ?*anyopaque, allocator: Allocator, max_entries: u32, verifier_log: ?[]u8) bpf.Error!UdpSockmapRuntime {
+        _ = allocator;
+        _ = max_entries;
+        _ = verifier_log;
+        const self: *FakeSockmapRuntime = @ptrCast(@alignCast(context.?));
+        return .{ .context = self, .vtable = &fake_sockmap_vtable };
+    }
+
+    fn pair(ctx: *anyopaque, client_fd: fd_t, upstream_fd: fd_t) bpf.Error!UdpSockmapRuntime.Pairing {
+        _ = client_fd;
+        _ = upstream_fd;
+        const self: *FakeSockmapRuntime = @ptrCast(@alignCast(ctx));
+        self.pair_calls += 1;
+        self.events.append(testing.allocator, .pair) catch {};
+        if (self.fail_pairs) return error.TableFull;
+        return .{ .client_cookie = 1, .upstream_cookie = 2 };
+    }
+
+    fn unpair(ctx: *anyopaque, client_cookie: u64, upstream_cookie: u64) void {
+        _ = client_cookie;
+        _ = upstream_cookie;
+        const self: *FakeSockmapRuntime = @ptrCast(@alignCast(ctx));
+        self.unpair_calls += 1;
+        self.events.append(testing.allocator, .unpair) catch {};
+    }
+
+    fn idleRemainingNs(ctx: *anyopaque, client_cookie: u64, upstream_cookie: u64, idle_timeout_ns: u64) bpf.Error!u64 {
+        _ = ctx;
+        _ = client_cookie;
+        _ = upstream_cookie;
+        return idle_timeout_ns; // never expires
+    }
+
+    fn destroy(ctx: *anyopaque) void {
+        const self: *FakeSockmapRuntime = @ptrCast(@alignCast(ctx));
+        self.destroy_calls += 1;
+        self.events.append(testing.allocator, .destroy) catch {};
+    }
+};
+
+const fake_sockmap_vtable = UdpSockmapRuntime.VTable{
+    .pair = FakeSockmapRuntime.pair,
+    .unpair = FakeSockmapRuntime.unpair,
+    .idle_remaining_ns = FakeSockmapRuntime.idleRemainingNs,
+    .destroy = FakeSockmapRuntime.destroy,
+};
+
+fn waitForCondition(condition: *const fn () bool, timeout_ms: u64) bool {
+    var waited: u64 = 0;
+    while (waited < timeout_ms) {
+        if (condition()) return true;
+        sleepMs(5);
+        waited += 5;
+    }
+    return condition();
+}
+
+fn qualifyingSample() UdpSockmapPolicy.WindowSample {
+    return .{
+        .datagrams = UdpSockmapPolicy.min_datagrams_per_window,
+        .bytes = UdpSockmapPolicy.min_datagrams_per_window * UdpSockmapPolicy.min_avg_datagram_bytes,
+        .eligible = true,
+    };
+}
+
+test "udp sockmap policy: auto starts in userspace; enabled and disabled are unconditional" {
+    var policy = UdpSockmapPolicy{};
+    policy.reset(.auto);
+    try testing.expect(!policy.steerAllowed());
+    // auto ignores evidence until the qualifying windows elapse.
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        try testing.expectEqual(UdpSockmapPolicy.Action.stay_off, policy.observeWindow(1_000, .{ .datagrams = 0, .bytes = 0, .eligible = true }));
+    }
+    try testing.expect(!policy.steerAllowed());
+
+    var enabled = UdpSockmapPolicy{};
+    enabled.reset(.enabled);
+    try testing.expect(enabled.steerAllowed());
+    try testing.expectEqual(
+        UdpSockmapPolicy.Action.keep_active,
+        enabled.observeWindow(1_000, .{ .datagrams = 0, .bytes = 0, .eligible = false }),
+    );
+
+    var disabled = UdpSockmapPolicy{};
+    disabled.reset(.disabled);
+    try testing.expect(!disabled.steerAllowed());
+    try testing.expectEqual(
+        UdpSockmapPolicy.Action.stay_off,
+        disabled.observeWindow(1_000, .{ .datagrams = 0, .bytes = 0, .eligible = false }),
+    );
+}
+
+test "udp sockmap policy: auto arms only after stable, eligible, large-datagram evidence" {
+    var now: u64 = 1_000;
+    var policy = UdpSockmapPolicy{};
+    policy.reset(.auto);
+    const good = qualifyingSample();
+
+    // Small-packet workloads (average below the byte floor) never qualify.
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        try testing.expectEqual(
+            UdpSockmapPolicy.Action.stay_off,
+            policy.observeWindow(now, .{ .datagrams = 500, .bytes = 100 * 500, .eligible = true }),
+        );
+    }
+    try testing.expect(!policy.steerAllowed());
+
+    // Loopback-ineligible workloads never qualify either.
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        try testing.expectEqual(UdpSockmapPolicy.Action.stay_off, policy.observeWindow(now, .{
+            .datagrams = good.datagrams,
+            .bytes = good.bytes,
+            .eligible = false,
+        }));
+    }
+    try testing.expect(!policy.steerAllowed());
+
+    // A single quiet window resets the streak (hysteresis), so a partially
+    // accumulated run cannot arm.
+    for (0..UdpSockmapPolicy.probe_stable_windows - 1) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        try testing.expectEqual(UdpSockmapPolicy.Action.stay_off, policy.observeWindow(now, good));
+    }
+    now += UdpSockmapPolicy.window_ms;
+    try testing.expectEqual(UdpSockmapPolicy.Action.stay_off, policy.observeWindow(now, .{ .datagrams = 0, .bytes = 0, .eligible = true }));
+    for (0..UdpSockmapPolicy.probe_stable_windows - 1) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        try testing.expectEqual(UdpSockmapPolicy.Action.stay_off, policy.observeWindow(now, good));
+    }
+    try testing.expect(!policy.steerAllowed());
+
+    // The full stable run arms: the engine is asked to load, and only then
+    // does the policy allow steering.
+    now += UdpSockmapPolicy.window_ms;
+    try testing.expectEqual(UdpSockmapPolicy.Action.load, policy.observeWindow(now, good));
+    try testing.expect(!policy.steerAllowed());
+    policy.noteLoaded();
+    try testing.expect(policy.steerAllowed());
+}
+
+test "udp sockmap policy: load failure lands in cooldown then re-probes" {
+    var now: u64 = 1_000;
+    var policy = UdpSockmapPolicy{};
+    policy.reset(.auto);
+    const good = qualifyingSample();
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        _ = policy.observeWindow(now, good);
+    }
+    policy.noteLoadFailure(now);
+    try testing.expect(!policy.steerAllowed());
+
+    // The cooldown blocks further attempts until it elapses.
+    now += UdpSockmapPolicy.window_ms;
+    try testing.expectEqual(UdpSockmapPolicy.Action.stay_off, policy.observeWindow(now, good));
+    now += UdpSockmapPolicy.fallback_cooldown_ms;
+    try testing.expectEqual(UdpSockmapPolicy.Action.stay_off, policy.observeWindow(now, good));
+
+    // Evidence re-arms after the cooldown.
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        _ = policy.observeWindow(now, good);
+    }
+    now += UdpSockmapPolicy.window_ms;
+    try testing.expectEqual(UdpSockmapPolicy.Action.load, policy.observeWindow(now, good));
+}
+
+test "udp sockmap policy: sustained pairing failures regress; success resets the streak" {
+    var now: u64 = 1_000;
+    var policy = UdpSockmapPolicy{};
+    policy.reset(.auto);
+    const good = qualifyingSample();
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        _ = policy.observeWindow(now, good);
+    }
+    policy.noteLoaded();
+    try testing.expect(policy.steerAllowed());
+
+    // Below the threshold the controller tolerates failures...
+    for (0..UdpSockmapPolicy.pairing_failure_threshold - 1) |_| policy.notePairingFailure(now);
+    try testing.expect(policy.steerAllowed());
+    // ...a success clears the streak...
+    policy.notePairingSuccess();
+    for (0..UdpSockmapPolicy.pairing_failure_threshold - 1) |_| policy.notePairingFailure(now);
+    try testing.expect(policy.steerAllowed());
+    // ...and crossing it regresses to a cooldown (safe fallback).
+    policy.notePairingFailure(now);
+    try testing.expect(!policy.steerAllowed());
+}
+
+test "udp sockmap policy: sustained userspace storm while active regresses with hysteresis" {
+    var now: u64 = 1_000;
+    var policy = UdpSockmapPolicy{};
+    policy.reset(.auto);
+    const good = qualifyingSample();
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        _ = policy.observeWindow(now, good);
+    }
+    policy.noteLoaded();
+    try testing.expect(policy.steerAllowed());
+
+    const storm = UdpSockmapPolicy.WindowSample{
+        .datagrams = UdpSockmapPolicy.active_storm_datagrams,
+        .bytes = 0,
+        .eligible = true,
+    };
+    // A single storm window is tolerated (hysteresis)...
+    now += UdpSockmapPolicy.window_ms;
+    try testing.expectEqual(UdpSockmapPolicy.Action.keep_active, policy.observeWindow(now, storm));
+    try testing.expect(policy.steerAllowed());
+    // ...a second consecutive one regresses.
+    now += UdpSockmapPolicy.window_ms;
+    try testing.expectEqual(UdpSockmapPolicy.Action.regress, policy.observeWindow(now, storm));
+    try testing.expect(!policy.steerAllowed());
+}
+
+/// Never-started engine shell used to drive the adaptive policy end to end:
+/// no I/O thread spawns and no listener resources are bound, so the policy
+/// tick/load/regress plumbing is exercised deterministically. Allocated so the
+/// engine's runtime/budget pointers stay valid for the harness lifetime.
+const PolicyHarness = struct {
+    engine: UdpRelayEngine,
+    runtime: RuntimeConfiguration,
+    budget: UdpAssociationBudget,
+    logger: LogStore,
+    fake: FakeSockmapRuntime,
+    resolved_listen: []SocketAddr,
+
+    fn init() !*PolicyHarness {
+        const self = try testing.allocator.create(PolicyHarness);
+        errdefer testing.allocator.destroy(self);
+        const resolved = try makeUdpTestResolved(testing.allocator, 9);
+        errdefer testing.allocator.free(resolved.listen_addresses);
+        self.logger = LogStore.init("critical");
+        self.resolved_listen = resolved.listen_addresses;
+        self.fake = FakeSockmapRuntime{};
+        self.budget = .{};
+        self.runtime = RuntimeConfiguration.init(resolved);
+        self.engine = UdpRelayEngine.init(
+            &self.runtime,
+            &self.logger,
+            &self.budget,
+            testing.allocator,
+            1,
+            null,
+            FakeSockmapRuntime.loader,
+            &self.fake,
+            false,
+            null,
+        );
+        return self;
+    }
+
+    fn deinit(self: *PolicyHarness) void {
+        self.engine.destroy();
+        self.fake.deinit();
+        testing.allocator.free(self.resolved_listen);
+        testing.allocator.destroy(self);
+    }
+};
+
+/// Feeds `probe_stable_windows` qualifying evidence windows so the policy
+/// arms and the engine loads the (fake) runtime. Used by the harness tests.
+fn driveActivePolicy(engine: *UdpRelayEngine, now: *u64) void {
+    for (0..UdpSockmapPolicy.probe_stable_windows - 1) |_| {
+        engine.policy_recv_datagrams = UdpSockmapPolicy.min_datagrams_per_window;
+        engine.policy_recv_bytes = UdpSockmapPolicy.min_datagrams_per_window * UdpSockmapPolicy.min_avg_datagram_bytes;
+        now.* += UdpSockmapPolicy.window_ms;
+        engine.handlePolicyTick(now.*);
+    }
+    engine.policy_recv_datagrams = UdpSockmapPolicy.min_datagrams_per_window;
+    engine.policy_recv_bytes = UdpSockmapPolicy.min_datagrams_per_window * UdpSockmapPolicy.min_avg_datagram_bytes;
+    now.* += UdpSockmapPolicy.window_ms;
+    engine.handlePolicyTick(now.*);
+}
+
+test "udp steering gate: stale reload cannot clear a newer block" {
+    var harness = try PolicyHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+
+    const first_pending = engine.beginSteeringUpdate(true);
+    try testing.expect(first_pending & UdpRelayEngine.steering_blocked_bit != 0);
+    try testing.expect(first_pending & UdpRelayEngine.steering_publishing_bit != 0);
+    engine.finishSteeringUpdate(first_pending);
+    const first_ready = engine.steering_gate.load(.acquire);
+    try testing.expect(first_ready & UdpRelayEngine.steering_blocked_bit != 0);
+    try testing.expect(first_ready & UdpRelayEngine.steering_publishing_bit == 0);
+
+    // A later blocking publication supersedes the generation an older reload
+    // captured. Completing the older reload must not clear the newer block.
+    const newer_pending = engine.beginSteeringUpdate(true);
+    engine.finishSteeringUpdate(newer_pending);
+    const newer_ready = engine.steering_gate.load(.acquire);
+    try testing.expect(!engine.clearAppliedSteeringGate(first_ready));
+    try testing.expectEqual(newer_ready, engine.steering_gate.load(.acquire));
+    try testing.expect(newer_ready & UdpRelayEngine.steering_blocked_bit != 0);
+
+    // An allowing update advances the generation but preserves an outstanding
+    // block until that exact, fully-published generation has been applied.
+    const allowing_pending = engine.beginSteeringUpdate(false);
+    try testing.expect(allowing_pending & UdpRelayEngine.steering_blocked_bit != 0);
+    try testing.expect(!engine.clearAppliedSteeringGate(allowing_pending));
+    engine.finishSteeringUpdate(allowing_pending);
+    const allowing_ready = engine.steering_gate.load(.acquire);
+    try testing.expect(engine.clearAppliedSteeringGate(allowing_ready));
+    try testing.expect(engine.steering_gate.load(.acquire) & UdpRelayEngine.steering_blocked_bit == 0);
+}
+
+test "udp auto policy: engine loads the runtime after stable evidence and tears it down on regression" {
+    var harness = try PolicyHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    engine.sockmap_eligible = true; // non-loopback rule
+    var now: u64 = 1_000;
+    engine.policy.reset(.auto);
+    engine.last_policy_tick_ms = now;
+
+    // Auto starts on userspace: no runtime, no steering.
+    try testing.expect(engine.sockmap_runtime == null);
+    try testing.expect(!engine.policy.steerAllowed());
+
+    // Idle (quiet) windows never arm.
+    engine.policy_recv_datagrams = 0;
+    engine.policy_recv_bytes = 0;
+    for (0..UdpSockmapPolicy.probe_stable_windows) |_| {
+        now += UdpSockmapPolicy.window_ms;
+        engine.handlePolicyTick(now);
+    }
+    try testing.expect(engine.sockmap_runtime == null);
+
+    // Sustained qualifying windows load the runtime exactly once.
+    for (0..UdpSockmapPolicy.probe_stable_windows - 1) |_| {
+        engine.policy_recv_datagrams = UdpSockmapPolicy.min_datagrams_per_window;
+        engine.policy_recv_bytes = UdpSockmapPolicy.min_datagrams_per_window * UdpSockmapPolicy.min_avg_datagram_bytes;
+        now += UdpSockmapPolicy.window_ms;
+        engine.handlePolicyTick(now);
+        try testing.expect(engine.sockmap_runtime == null);
+    }
+    engine.policy_recv_datagrams = UdpSockmapPolicy.min_datagrams_per_window;
+    engine.policy_recv_bytes = UdpSockmapPolicy.min_datagrams_per_window * UdpSockmapPolicy.min_avg_datagram_bytes;
+    now += UdpSockmapPolicy.window_ms;
+    engine.handlePolicyTick(now);
+    try testing.expect(engine.sockmap_runtime != null);
+    try testing.expect(engine.policy.steerAllowed());
+    try testing.expectEqual(@as(usize, 0), harness.fake.destroy_calls);
+
+    // Sustained pairing failures tear the runtime down (safe fallback): the
+    // policy stops allowing steering, so the engine drops the runtime.
+    for (0..UdpSockmapPolicy.pairing_failure_threshold) |_| {
+        engine.policy.notePairingFailure(now);
+    }
+    try testing.expect(!engine.policy.steerAllowed());
+    engine.syncSockmapToPolicy();
+    try testing.expect(engine.sockmap_runtime == null);
+    try testing.expectEqual(@as(usize, 1), harness.fake.destroy_calls);
+}
+
+test "udp auto reload: unchanged eligible auto keeps the adaptive runtime active" {
+    var harness = try PolicyHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    var now: u64 = 1_000;
+
+    // Eligible auto rule: upstream_has_loopback=false overrides the loopback
+    // upstream so the policy can arm, and reloadAccelerator's own eligibility
+    // recomputation agrees.
+    var eligible = engine.runtime.current();
+    eligible.upstream_has_loopback = false;
+    engine.runtime.update(eligible);
+    engine.sockmap_eligible = true;
+    engine.policy.reset(.auto);
+    engine.last_policy_tick_ms = now;
+    driveActivePolicy(engine, &now);
+    try testing.expect(engine.sockmap_runtime != null);
+    try testing.expect(engine.policy.steerAllowed());
+
+    // A routine limits-only auto reload (tuning-daemon style) must not tear
+    // acceleration down: the runtime and active policy are preserved.
+    var tuned = engine.runtime.current();
+    tuned.configuration.limits.max_udp_associations = 512;
+    engine.runtime.update(tuned);
+    engine.reloadAccelerator();
+
+    try testing.expect(engine.sockmap_runtime != null);
+    try testing.expect(engine.policy.steerAllowed());
+    try testing.expectEqual(@as(usize, 0), harness.fake.destroy_calls);
+}
+
+test "udp auto reload: becoming loopback tears down in unpair-before-destroy order and can re-probe" {
+    var harness = try PolicyHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    var now: u64 = 1_000;
+
+    var eligible = engine.runtime.current();
+    eligible.upstream_has_loopback = false;
+    engine.runtime.update(eligible);
+    engine.sockmap_eligible = true;
+    engine.policy.reset(.auto);
+    engine.last_policy_tick_ms = now;
+    driveActivePolicy(engine, &now);
+    try testing.expect(engine.sockmap_runtime != null);
+
+    // Insert a steered association so the teardown exercises unpair before
+    // destroy. The budget is acquired once to keep release pairing correct.
+    const client = SocketAddr.parseIp("127.0.0.1", 40_000).?;
+    try testing.expect(engine.budget.tryAcquire(1_024));
+    engine.associations.put(client, .{
+        .client = client,
+        .client_address = std.mem.zeroes(posix.sockaddr.storage),
+        .client_address_length = @sizeOf(posix.sockaddr.in),
+        .listen_fd = -1,
+        .upstream_fd = -1,
+        .upstream_addr = SocketAddr.parseIp("127.0.0.1", 9_001).?,
+        .pairing = .{ .client_cookie = 1, .upstream_cookie = 2 },
+        .last_activity_ms = now,
+    }) catch unreachable;
+
+    // Reload to a loopback auto rule: the runtime must be torn down with
+    // unpair-before-destroy ordering and the controller reset to probing so it
+    // can re-arm later instead of staying "active" with a null runtime.
+    var loopback = engine.runtime.current();
+    loopback.upstream_has_loopback = true;
+    engine.runtime.update(loopback);
+    engine.reloadAccelerator();
+
+    try testing.expect(engine.sockmap_runtime == null);
+    try testing.expect(!engine.policy.steerAllowed());
+    try testing.expectEqual(@as(usize, 1), harness.fake.destroy_calls);
+    var saw_unpair = false;
+    var saw_destroy = false;
+    for (harness.fake.events.items) |event| {
+        if (saw_destroy) try testing.expect(event != .unpair);
+        if (event == .unpair) saw_unpair = true;
+        if (event == .destroy) saw_destroy = true;
+    }
+    try testing.expect(saw_unpair);
+    try testing.expect(saw_destroy);
+
+    // Once eligible again, the controller re-probes and reloads the runtime.
+    var eligible_again = engine.runtime.current();
+    eligible_again.upstream_has_loopback = false;
+    engine.runtime.update(eligible_again);
+    engine.sockmap_eligible = true;
+    engine.last_policy_tick_ms = now;
+    driveActivePolicy(engine, &now);
+    try testing.expect(engine.sockmap_runtime != null);
+    try testing.expect(engine.policy.steerAllowed());
+}
+
+test "udp enabled to auto reload stops new sockmap associations and tears down in order" {
+    var echo = try UdpEchoServer.start();
+    defer echo.stop();
+
+    var fake = FakeSockmapRuntime{};
+    defer fake.deinit();
+
+    var logger = LogStore.init("critical");
+    var resolved = try makeUdpTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+    resolved.configuration.performance.udp_sockmap_acceleration = .enabled;
+
+    var listener = UdpListener.initWithSelector(testing.allocator, resolved, &logger, null, FakeSockmapRuntime.loader, null);
+    listener.loader_context = &fake;
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = try listener.localAddresses(testing.allocator);
+    defer testing.allocator.free(bound);
+    const port = bound[0].port;
+
+    // Client A establishes and is steered under enabled.
+    const client_a = try udpClient();
+    defer closeFd(client_a);
+    try testing.expect(try waitForEcho(client_a, port, "hello-a", 2_000));
+    try testing.expectEqual(@as(usize, 1), fake.pair_calls);
+
+    // Reload to auto: the snapshot now disallows sockmap and updateConfiguration
+    // synchronously blocks new steering before the async teardown command runs.
+    var auto_resolved = resolved;
+    auto_resolved.configuration.performance.udp_sockmap_acceleration = .auto;
+    listener.updateConfiguration(auto_resolved, false);
+
+    // Client B establishes during the pending teardown window and must NOT
+    // enter sockmap, whether or not the reload command has processed: the
+    // synchronous guard and the reset policy both refuse to steer.
+    const client_b = try udpClient();
+    defer closeFd(client_b);
+    try testing.expect(try waitForEcho(client_b, port, "hello-b", 2_000));
+    try testing.expectEqual(@as(usize, 1), fake.pair_calls);
+
+    // The reload command tears the runtime down.
+    const torn_down = struct {
+        var fake_ptr: *FakeSockmapRuntime = undefined;
+        fn check() bool {
+            return fake_ptr.destroy_calls >= 1;
+        }
+    };
+    torn_down.fake_ptr = &fake;
+    try testing.expect(waitForCondition(torn_down.check, 2_000));
+
+    // Teardown ordering: every unpair happened before the destroy event.
+    var saw_destroy = false;
+    for (fake.events.items) |event| {
+        if (saw_destroy) try testing.expect(event != .unpair);
+        if (event == .destroy) saw_destroy = true;
+    }
+    try testing.expect(saw_destroy);
+}
+
+test "udp mode-unchanged reloads keep steering (enabled stays enabled)" {
+    var echo = try UdpEchoServer.start();
+    defer echo.stop();
+
+    var fake = FakeSockmapRuntime{};
+    defer fake.deinit();
+
+    var logger = LogStore.init("critical");
+    var resolved = try makeUdpTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+    resolved.configuration.performance.udp_sockmap_acceleration = .enabled;
+
+    var listener = UdpListener.initWithSelector(testing.allocator, resolved, &logger, null, FakeSockmapRuntime.loader, null);
+    listener.loader_context = &fake;
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = try listener.localAddresses(testing.allocator);
+    defer testing.allocator.free(bound);
+    const port = bound[0].port;
+
+    const client_a = try udpClient();
+    defer closeFd(client_a);
+    try testing.expect(try waitForEcho(client_a, port, "hello-a", 2_000));
+    try testing.expectEqual(@as(usize, 1), fake.pair_calls);
+
+    // A limits-only reload keeps the mode; steering must not be interrupted.
+    var same_mode = resolved;
+    same_mode.configuration.limits.max_udp_associations = 512;
+    listener.updateConfiguration(same_mode, false);
+
+    const client_b = try udpClient();
+    defer closeFd(client_b);
+    try testing.expect(try waitForEcho(client_b, port, "hello-b", 2_000));
+    try testing.expectEqual(@as(usize, 2), fake.pair_calls);
+    try testing.expectEqual(@as(usize, 0), fake.destroy_calls);
+}
+
+/// Loader failures caused by missing privileges are graceful skips in the
+/// default suite but must fail loudly under the dedicated `zig build test-ebpf`
+/// step (which sets CURTSY_REQUIRE_EBPF_TESTS): silently passing there without
+/// CAP_BPF/CAP_NET_ADMIN would hide a broken privileged environment.
+fn ebpfLoaderUnavailable(err: anyerror) bool {
+    if (std.c.getenv("CURTSY_REQUIRE_EBPF_TESTS") != null) return false;
+    return switch (err) {
+        error.PermissionDenied, error.AccessDenied, error.NotSupported, error.NoMemory => true,
+        else => false,
+    };
+}
+
+test "udp sockmap end-to-end with real BPF (gated: CURTSY_ENABLE_EBPF_TESTS)" {
+    // Privileged integration test: a real UdpListener loads the actual UDP
+    // sockmap runtime (verdict program + sockhash) and relays a real client
+    // to a real echo server while steering is active, then tears the runtime
+    // down cleanly on an enabled -> auto reload. Run as root (or with
+    // CAP_BPF/CAP_NET_ADMIN): `sudo zig build test-ebpf`. Unprivileged runs
+    // of the default suite skip gracefully; the dedicated test-ebpf step
+    // fails loudly instead when privileges are missing.
+    if (std.c.getenv("CURTSY_ENABLE_EBPF_TESTS") == null) return;
+
+    // Probe privileges first so a missing gate capability is an explicit skip
+    // in the default suite, and a hard failure under test-ebpf.
+    var probe_log: [4096]u8 = undefined;
+    var probe = default_sockmap_runtime_loader(null, testing.allocator, 1024, &probe_log) catch |err| {
+        if (ebpfLoaderUnavailable(err)) return;
+        return err;
+    };
+    probe.destroy();
+
+    var echo = try UdpEchoServer.start();
+    defer echo.stop();
+
+    var logger = LogStore.init("critical");
+    var resolved = try makeUdpTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+    resolved.configuration.performance.udp_sockmap_acceleration = .enabled;
+
+    var listener = UdpListener.initWithSelector(testing.allocator, resolved, &logger, null, null, null);
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = try listener.localAddresses(testing.allocator);
+    defer testing.allocator.free(bound);
+    const port = bound[0].port;
+
+    // Real client -> relay -> echo while the verdict program steers.
+    const client = try udpClient();
+    defer closeFd(client);
+    try testing.expect(try waitForEcho(client, port, "bpf-e2e", 2_000));
+    try testing.expectEqual(@as(u64, 1), listener.associationCount());
+
+    // enabled -> auto reload must tear the runtime down and keep relaying
+    // through the userspace path without crashing.
+    var auto_resolved = resolved;
+    auto_resolved.configuration.performance.udp_sockmap_acceleration = .auto;
+    listener.updateConfiguration(auto_resolved, false);
+    try testing.expect(try waitForEcho(client, port, "bpf-e2e-after", 2_000));
+
+    const settled = struct {
+        var listener_ptr: *UdpListener = undefined;
+        fn check() bool {
+            return listener_ptr.associationCount() <= 1;
+        }
+    };
+    settled.listener_ptr = &listener;
+    try testing.expect(waitForCondition(settled.check, 2_000));
 }

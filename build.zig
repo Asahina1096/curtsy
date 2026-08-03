@@ -53,9 +53,13 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "curtsy",
         .root_module = exe_mod,
-        .version = .{ .major = 0, .minor = 3, .patch = 0 },
+        .version = .{ .major = 0, .minor = 3, .patch = 2 },
     });
     exe.pie = true;
+    // A deterministic content-based ELF build id (.note.gnu.build-id) lets the
+    // Debian package coordinate a stripped binary with its debug symbols and
+    // keeps debuginfod/build-id tooling working.
+    exe.build_id = .sha1;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -77,6 +81,20 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // Privileged eBPF integration suite: a separate test root run with the
+    // eBPF gates enabled and REQUIRED, so missing CAP_BPF/CAP_NET_ADMIN (or an
+    // unsupported kernel) fails loudly instead of silently skipping. The step
+    // runs the whole module tree (the two gated tests are always part of it,
+    // so it can never silently select zero tests); pass -Dtest-filter to focus.
+    // Run as root: `.toolchain/zig/zig build test-ebpf`.
+    const ebpf_test_mod = runtimeModule(b, b.path("src/test_ebpf.zig"), target, optimize, bpf_programs_module, dependencies);
+    const ebpf_tests = b.addTest(.{ .root_module = ebpf_test_mod, .filters = test_filters });
+    const run_ebpf_tests = b.addRunArtifact(ebpf_tests);
+    run_ebpf_tests.setEnvironmentVariable("CURTSY_ENABLE_EBPF_TESTS", "1");
+    run_ebpf_tests.setEnvironmentVariable("CURTSY_REQUIRE_EBPF_TESTS", "1");
+    const test_ebpf_step = b.step("test-ebpf", "Run the privileged eBPF integration suite (requires root/CAP_BPF/CAP_NET_ADMIN); fails loudly without them");
+    test_ebpf_step.dependOn(&run_ebpf_tests.step);
 }
 
 fn runtimeModule(

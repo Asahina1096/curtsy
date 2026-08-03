@@ -1,0 +1,7 @@
+# Intentional embedded-library policy: the project links libbpf, libelf,
+# libz and libzstd statically (hermetic .toolchain dependencies, no runtime
+# system libraries except libc). This is a deliberate architecture decision,
+# not an accidental vendoring: the static copies are pinned by
+# tools/bootstrap-build-deps.sh and rebuilt from distro sources. libz is the
+# only one Lintian's heuristic detects.
+curtsy: embedded-library zlib [usr/bin/curtsy]

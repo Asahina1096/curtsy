@@ -169,6 +169,20 @@ const Generation = struct {
     }
 };
 
+/// Ownership-safe handle to an upstream generation that has been built but
+/// not yet published. The reload path prepares every rule's replacement
+/// generation up front (this can fail), then either commits them all in a
+/// single allocation-free pass or discards them all on a rejected reload.
+pub const PreparedGeneration = struct {
+    generation: *Generation,
+
+    /// Release an uncommitted generation. Only valid when commitGeneration was
+    /// NOT called for this handle.
+    pub fn discard(self: *const PreparedGeneration, pool: *UpstreamPool) void {
+        destroyGeneration(pool.allocator, self.generation);
+    }
+};
+
 pub const UpstreamPool = struct {
     allocator: Allocator,
     /// Readers only load this pointer. Published generations stay alive until
@@ -272,8 +286,28 @@ pub const UpstreamPool = struct {
         weights: []const u32,
         balancer: *const Balancer,
     ) error{OutOfMemory}!void {
+        const prepared = try self.prepareGeneration(addresses, weights, balancer);
+        self.commitGeneration(prepared);
+    }
+
+    /// Build a replacement generation without publishing it. Health state is
+    /// inherited from the current generation by address. The caller must
+    /// either commit it (allocation-free, non-failing) or discard it.
+    pub fn prepareGeneration(
+        self: *UpstreamPool,
+        addresses: []const net.SocketAddr,
+        weights: []const u32,
+        balancer: *const Balancer,
+    ) error{OutOfMemory}!PreparedGeneration {
         const current = self.generation.load(.acquire);
-        const replacement = try buildGeneration(self.allocator, addresses, weights, balancer, current);
+        return .{ .generation = try buildGeneration(self.allocator, addresses, weights, balancer, current) };
+    }
+
+    /// Publish a generation previously returned by prepareGeneration. No
+    /// allocation and no failure paths; the previous generation is retired
+    /// and reclaimed when the pool is destroyed.
+    pub fn commitGeneration(self: *UpstreamPool, prepared: PreparedGeneration) void {
+        const replacement = prepared.generation;
         const old = self.generation.swap(replacement, .acq_rel);
         old.retired_next = self.retired;
         self.retired = old;
@@ -523,6 +557,57 @@ test "reconfigure switches balancer and weights without replacing the pool" {
     }
     try testing.expectEqual(@as(usize, 2), counts[0]);
     try testing.expectEqual(@as(usize, 6), counts[1]);
+}
+
+test "prepared generation is not published until commit" {
+    const addresses = testAddresses(2);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    defer pool.deinit();
+
+    // Prepare a replacement upstream set: picks must keep using the old
+    // generation until commit.
+    const prepared = try pool.prepareGeneration(addresses[0..1], &.{1}, defaultBalancer());
+    try testing.expectEqual(@as(usize, 2), pool.count());
+    try testing.expect(pool.pick(null, 0).eql(addresses[0]));
+    try testing.expect(pool.pick(null, 0).eql(addresses[1]));
+
+    // Commit is allocation-free and non-failing; the old generation is retired.
+    pool.commitGeneration(prepared);
+    try testing.expectEqual(@as(usize, 1), pool.count());
+    try testing.expect(pool.pick(null, 0).eql(addresses[0]));
+}
+
+test "discard frees an uncommitted generation without changing picks" {
+    const addresses = testAddresses(2);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    defer pool.deinit();
+
+    const prepared = try pool.prepareGeneration(addresses[0..1], &.{1}, defaultBalancer());
+    prepared.discard(&pool);
+
+    // Nothing changed: the current generation still serves both upstreams.
+    try testing.expectEqual(@as(usize, 2), pool.count());
+    try testing.expect(pool.pick(null, 0).eql(addresses[0]));
+    try testing.expect(pool.pick(null, 0).eql(addresses[1]));
+}
+
+test "prepared generation inherits health by address at commit" {
+    const addresses = testAddresses(2);
+    var pool = try UpstreamPool.init(testing.allocator, addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    defer pool.deinit();
+
+    const now: u64 = 1_000;
+    for (0..failure_threshold) |_| pool.reportFailure(addresses[0], now);
+    try testing.expect(pool.pick(null, now).eql(addresses[1]));
+
+    // Re-prepare the same two upstreams: the eviction on address 0 must carry
+    // over to the prepared generation so a committed reload keeps health.
+    const prepared = try pool.prepareGeneration(addresses[0..2], &.{ 1, 1 }, defaultBalancer());
+    pool.commitGeneration(prepared);
+    for (0..4) |_| {
+        try testing.expect(pool.pick(null, now).eql(addresses[1]));
+    }
+    pool.reportSuccess(addresses[0]);
 }
 
 test "success immediately clears an active eviction" {

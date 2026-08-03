@@ -130,7 +130,7 @@ rules:
 
 ## 信号
 
-- `SIGHUP`：重新读取并应用配置。配置无效或新端口绑定失败时继续使用旧配置。
+- `SIGHUP`：重新读取并应用配置。重载是事务式的：新规则和新增协议监听会先绑定但保持暂停（不接受 TCP、不转发 UDP），连同上游 generation 和 listen backlog 预检全部就绪后才提交并激活；任一失败则整体保留旧配置，候选配置正常释放。配置无效或新端口绑定失败时继续使用旧配置。
 - `SIGINT` / `SIGTERM`：停止监听并优雅退出。现有 TCP 连接最多等待 `shutdownGraceSeconds`。
 
 热加载后，已有 TCP 连接继续使用原上游，新连接使用新上游；上游变化时已有 UDP 映射会被清除并按新配置重建。
@@ -159,7 +159,7 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 
 在具备 eBPF 权限且内核 >= 5.12 的 Linux 上，Curtsy 还可以为 UDP 会话启用 sockmap 内核转发：首个报文仍由用户态建立会话，随后为该客户端创建一个 connect 到其地址的专用 socket，并把客户端 socket 与上游 socket 配对放入 `BPF_MAP_TYPE_SOCKHASH`；`SK_SKB` verdict 程序用 `bpf_sk_redirect_hash` 把两个方向的报文直接转发到对端发送路径，不再经过用户态。每个 I/O 线程持有独立的 sockhash 与 verdict 程序，会话不跨线程迁移。
 
-`performance.udpSockmapAcceleration` 控制该路径（`enabled` / `disabled` / 默认 `auto`）。与 TCP 不同，UDP 的 `auto` 会跳过 loopback 上游：实测 1400 字节回环负载下，UDP sockmap verdict 路径的吞吐更低并出现严重乱序，回环场景应使用用户态 relay；显式 `enabled` 仍会强制尝试（可用于与用户态路径对比），远端上游在 `auto` 下保持启用。权限不足、内核不支持或单会话配对失败时逐层回退到用户态 relay，服务启动不受影响；重定向失败而落入用户态的零星报文由引擎兜底转发。热加载改变此项时，已有 UDP 会话会被清除并按新模式重建。
+`performance.udpSockmapAcceleration` 控制该路径（`enabled` / `disabled` / 默认 `auto`）。UDP `auto` 从稳定的用户态 `recvmmsg`/`sendmmsg` 批量路径启动；只有非 loopback 上游连续 5 个一秒窗口达到每窗口至少 200 个报文、平均报文至少 256 字节时，才会尝试 sockmap。加载失败、连续配对失败或加速后仍持续有大量报文回落用户态时，会关闭 sockmap 并冷却 30 秒后重新观测，因此 loopback、小包和不稳定负载保持用户态路径。`enabled` 强制尽力尝试，`disabled` 始终关闭；sockmap 不承诺报文顺序。权限不足、内核不支持或单会话配对失败时安全回退，不影响服务启动。热加载从 `enabled` 切到 `auto`/`disabled`，或 `auto` 切到 loopback 上游时，会在发布新配置前同步禁止新会话进入 sockmap，再由 I/O 线程按“先解绑会话、后销毁 runtime”的顺序完成切换，并把控制器重置为可重新探测的用户态状态；`auto` 配置不变且仍非 loopback 的重载（例如 tuning 守护进程的限额微调）会保留已加载的 runtime 和自适应状态，不会中断加速。
 
 ## 配置约束
 
@@ -181,6 +181,9 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 
 # 只运行名称包含指定子串的测试
 .toolchain/zig/zig build test -Dtest-filter="socket address formatting"
+
+# 真实加载并运行 eBPF 集成测试；权限或内核能力不足会明确失败
+sudo .toolchain/zig/zig build test-ebpf
 ```
 
-默认测试不要求 eBPF 权限。eBPF loader 相关测试在无权限或内核不支持时会按预期跳过高权限路径。`test-compile` 与 `test` 共用同一个测试二进制（含 `-Dtest-filter` 过滤），区别仅在于是否执行。
+默认测试不要求 eBPF 权限，高权限路径会跳过；`test-ebpf` 是独立入口，会设置严格门禁并在缺少 `CAP_BPF`/`CAP_NET_ADMIN` 或内核支持时失败。`test-compile` 与 `test` 共用同一个测试二进制（含 `-Dtest-filter` 过滤），区别仅在于是否执行。

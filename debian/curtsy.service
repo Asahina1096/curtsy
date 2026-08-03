@@ -1,5 +1,6 @@
 [Unit]
 Description=Curtsy TCP/UDP transparent traffic forwarder
+Documentation=man:curtsy(1)
 After=network-online.target
 Wants=network-online.target
 

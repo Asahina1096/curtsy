@@ -76,14 +76,14 @@ pub const ResolvedConfiguration = struct {
     /// One or two addresses; "*" listens dual-stack wildcard 0.0.0.0 and ::.
     listen_addresses: []SocketAddr,
     upstream_address: SocketAddr,
-    /// Auto sockmap eligibility for multi-upstream rules: true when any
-    /// resolved upstream member of the rule is loopback, so auto skips
+    /// Auto sockmap eligibility for multi-upstream TCP rules: true when any
+    /// resolved upstream member of the rule is loopback, so TCP auto skips
     /// acceleration regardless of which member the selector picks. null (the
     /// default) derives the answer from `upstream_address`, which preserves
     /// the single-upstream behavior for hand-built configurations.
     upstream_has_loopback: ?bool = null,
 
-    fn upstreamLoopback(self: *const ResolvedConfiguration) bool {
+    pub fn upstreamLoopback(self: *const ResolvedConfiguration) bool {
         if (self.upstream_has_loopback) |flag| return flag;
         return self.upstream_address.isLoopback();
     }
@@ -104,14 +104,14 @@ pub const ResolvedConfiguration = struct {
     }
 
     pub fn shouldEnableUDPSockmap(self: *const ResolvedConfiguration) bool {
-        // auto skips loopback upstreams: the measured 1400-byte loopback
-        // workload had lower goodput and severe reordering through the UDP
-        // sockmap verdict path. Explicit enabled still forces an attempt;
-        // remote upstreams stay eligible in auto.
+        // This is only the static startup decision. auto starts on the
+        // userspace batched relay; the UDP engine's runtime policy may later
+        // enable sockmap after sustained eligible traffic. Explicit enabled
+        // forces a best-effort startup attempt; disabled stays off.
         return switch (self.configuration.performance.udp_sockmap_acceleration) {
             .disabled => false,
             .enabled => true,
-            .auto => !self.upstreamLoopback(),
+            .auto => false,
         };
     }
 };
@@ -147,6 +147,7 @@ pub const ResolvedForwarder = struct {
 pub const Listener = struct {
     allocator: Allocator,
     context: *anyopaque,
+    activate_fn: *const fn (context: *anyopaque) void,
     stop_accepting_fn: *const fn (context: *anyopaque) void,
     destroy_fn: *const fn (allocator: Allocator, context: *anyopaque) void,
     update_configuration_fn: *const fn (context: *anyopaque, resolved: ResolvedConfiguration, reset_sessions: bool) void,
@@ -155,6 +156,10 @@ pub const Listener = struct {
     active_count_fn: *const fn (context: *anyopaque) usize,
     buffered_bytes_fn: *const fn (context: *anyopaque) i64,
     associations_fn: *const fn (context: *anyopaque) u64,
+
+    pub fn activate(self: *Listener) void {
+        self.activate_fn(self.context);
+    }
 
     pub fn stopAccepting(self: *Listener) void {
         self.stop_accepting_fn(self.context);
@@ -198,7 +203,7 @@ pub const ProtocolModule = struct {
     protocol: ForwardProtocol,
     /// TCP-style listeners park for connection draining on retire.
     drains_connections: bool,
-    create: *const fn (allocator: Allocator, resolved: ResolvedConfiguration, logger: *log.LogStore, selector: ?upstream.Selector) anyerror!*Listener,
+    create: *const fn (allocator: Allocator, resolved: ResolvedConfiguration, logger: *log.LogStore, selector: ?upstream.Selector, start_paused: bool) anyerror!*Listener,
 };
 
 // ---------------------------------------------------------------------------
@@ -474,6 +479,33 @@ const RuleRuntime = struct {
     started_udp_io_threads: i64,
 };
 
+/// Every fallible change a reload wants to make to one matched rule, staged
+/// during the prepare phase so nothing is published until all rules are ready.
+/// After all preparations succeed the changes are committed in an
+/// allocation-free pass; on any preparation failure `discardPreparation`
+/// releases everything and restores preflighted live-listener backlog changes,
+/// leaving the rule completely untouched.
+const MatchPreparation = struct {
+    rt: *RuleRuntime,
+    candidate_rule: *const ResolvedRule,
+    /// Staged weights for the new pool generation (empty when the pool does
+    /// not change).
+    weights: []u32 = &.{},
+    /// Prepared (unpublished) upstream generation, if the pool changes.
+    generation: ?upstream.PreparedGeneration = null,
+    /// Listeners created for protocols the candidate adds to this rule.
+    added_tcp: ?*Listener = null,
+    added_udp: ?*Listener = null,
+    new_resolved: ResolvedConfiguration = undefined,
+    upstream_changed: bool = false,
+    want_tcp: bool = false,
+    want_udp: bool = false,
+    /// Live listener whose listen backlog was preflighted, plus the value to
+    /// restore it to if a later rule's preparation fails.
+    backlog_listener: ?*Listener = null,
+    backlog_old: i32 = 0,
+};
+
 pub const ForwarderService = struct {
     allocator: Allocator,
     configuration_path: []const u8,
@@ -563,7 +595,7 @@ pub const ForwarderService = struct {
         }
         try self.rules_list.ensureTotalCapacity(self.allocator, self.resolved.rules.len);
         for (self.resolved.rules) |*candidate| {
-            const rt = try self.createRuleRuntime(candidate, self.resolved.rules.len);
+            const rt = try self.createRuleRuntime(candidate, self.resolved.rules.len, false);
             self.rules_list.appendAssumeCapacity(rt);
         }
     }
@@ -611,6 +643,7 @@ pub const ForwarderService = struct {
         self: *ForwarderService,
         candidate: *const ResolvedRule,
         rule_count: usize,
+        start_paused: bool,
     ) Error!*RuleRuntime {
         const effective = adjustedEffective(candidate, rule_count);
         const weights = try self.ruleWeights(candidate.rule);
@@ -635,45 +668,54 @@ pub const ForwarderService = struct {
 
         const protocols = candidate.effectiveProtocols();
         if (net.hasProtocol(protocols, .tcp)) {
-            rt.tcp_listener = try self.createListener(candidate, rt, .tcp);
+            rt.tcp_listener = try self.createListener(candidate, rt, .tcp, start_paused);
         }
         errdefer if (rt.tcp_listener) |listener| listener.destroy();
         if (net.hasProtocol(protocols, .udp)) {
-            rt.udp_listener = try self.createListener(candidate, rt, .udp);
+            rt.udp_listener = try self.createListener(candidate, rt, .udp, start_paused);
         }
 
+        if (!start_paused) self.logRuleRuntimeStarted(rt);
+        return rt;
+    }
+
+    fn logRuleRuntimeStarted(self: *ForwarderService, rt: *const RuleRuntime) void {
         var protocol_buf: [32]u8 = undefined;
         self.logger.info("rule started listen={f} protocols={s} upstreams={d} balance={s}", .{
-            candidate.listen_addresses[0],
-            net.protocolsString(protocols, &protocol_buf),
-            candidate.upstream_addresses.len,
-            candidate.rule.balance.name,
+            rt.resolved.listen_addresses[0],
+            net.protocolsString(rt.resolved.configuration.protocols, &protocol_buf),
+            rt.rule.upstreams.len,
+            rt.balance.name,
         });
-        return rt;
     }
 
     /// Spawn one protocol listener through the protocol module registry. The
     /// pool selector stays attached across reloads so single/multi-upstream
     /// transitions do not require rebinding the listen sockets.
-    fn createListener(self: *ForwarderService, candidate: *const ResolvedRule, rt: *RuleRuntime, protocol: ForwardProtocol) Error!*Listener {
+    fn createListener(self: *ForwarderService, candidate: *const ResolvedRule, rt: *RuleRuntime, protocol: ForwardProtocol, start_paused: bool) Error!*Listener {
         _ = candidate;
         return fw.protocolModule(protocol).create(
             self.allocator,
             rt.resolved,
             &self.logger,
             upstream.poolSelector(&rt.pool),
+            start_paused,
         );
     }
 
-    /// Update a matched rule in place: pool upstream set, protocol toggles,
-    /// effective configuration. Existing TCP connections keep their upstream;
-    /// UDP associations are reset when the upstream set changed.
-    fn updateRule(
+    /// Prepare every fallible change for one matched rule without publishing
+    /// any of it: allocate the new upstream generation (inheriting health by
+    /// address), create listeners for newly added protocols, and preflight the
+    /// listen backlog (recording the old value for rollback). The returned
+    /// `MatchPreparation` is either committed by `commitMatchedRule` or
+    /// released by `discardPreparation`; the live rule is untouched until the
+    /// commit.
+    fn prepareMatchedRule(
         self: *ForwarderService,
         rt: *RuleRuntime,
         candidate: *const ResolvedRule,
         rule_count: usize,
-    ) Error!void {
+    ) Error!MatchPreparation {
         const effective = adjustedEffective(candidate, rule_count);
         const new_resolved = resolvedForRule(effective, candidate);
 
@@ -690,55 +732,86 @@ pub const ForwarderService = struct {
             });
         }
 
-        // Publish upstream and balance changes as one generation. Listener
-        // threads keep selecting without a lock, and matching addresses carry
-        // their health state into the new generation.
         const upstream_changed = !rt.pool.addressesEqual(candidate.upstream_addresses);
         const weights_changed = !ruleWeightsEqual(rt.rule, candidate.rule);
-        if (candidate.rule.balance != rt.balance or upstream_changed or weights_changed) {
-            const weights = try self.ruleWeights(candidate.rule);
-            defer self.allocator.free(weights);
-            try rt.pool.reconfigure(
-                candidate.upstream_addresses,
-                weights,
-                candidate.rule.balance,
-            );
-        }
+        const pool_changed = candidate.rule.balance != rt.balance or upstream_changed or weights_changed;
 
         const protocols = candidate.effectiveProtocols();
         const want_tcp = net.hasProtocol(protocols, .tcp);
         const want_udp = net.hasProtocol(protocols, .udp);
 
-        var added_tcp: ?*Listener = null;
-        var added_udp: ?*Listener = null;
-        errdefer {
-            if (added_tcp) |listener| listener.destroy();
-            if (added_udp) |listener| listener.destroy();
+        var prep = MatchPreparation{
+            .rt = rt,
+            .candidate_rule = candidate,
+            .new_resolved = new_resolved,
+            .upstream_changed = upstream_changed,
+            .want_tcp = want_tcp,
+            .want_udp = want_udp,
+        };
+        // Function-scoped errdefers: an errdefer declared inside a nested block
+        // would only fire for errors raised inside that block, so staged
+        // resources could leak when a later step (e.g. listener creation for a
+        // different protocol) fails. Declared here they run on any error return
+        // and the `if` guards make them no-ops for resources not yet staged.
+        errdefer if (prep.weights.len > 0) self.allocator.free(prep.weights);
+        errdefer if (prep.generation) |generation| generation.discard(&rt.pool);
+        errdefer if (prep.added_tcp) |listener| listener.destroy();
+        errdefer if (prep.added_udp) |listener| listener.destroy();
+
+        if (pool_changed) {
+            prep.weights = try self.ruleWeights(candidate.rule);
+            prep.generation = try rt.pool.prepareGeneration(
+                candidate.upstream_addresses,
+                prep.weights,
+                candidate.rule.balance,
+            );
         }
 
-        if (want_tcp and rt.tcp_listener == null) added_tcp = try self.createListener(candidate, rt, .tcp);
-        if (want_udp and rt.udp_listener == null) added_udp = try self.createListener(candidate, rt, .udp);
+        if (want_tcp and rt.tcp_listener == null) {
+            prep.added_tcp = try self.createListener(candidate, rt, .tcp, true);
+        }
+        if (want_udp and rt.udp_listener == null) {
+            prep.added_udp = try self.createListener(candidate, rt, .udp, true);
+        }
 
         const backlog_changed =
             rt.resolved.configuration.limits.tcp_listen_backlog != new_resolved.configuration.limits.tcp_listen_backlog;
         if (backlog_changed) {
-            const listener = rt.tcp_listener orelse added_tcp;
-            if (listener) |l| try l.updateBacklog(@intCast(new_resolved.configuration.limits.tcp_listen_backlog));
+            const listener = rt.tcp_listener orelse prep.added_tcp;
+            if (listener) |l| {
+                const old_backlog = rt.resolved.configuration.limits.tcp_listen_backlog;
+                try l.updateBacklog(@intCast(new_resolved.configuration.limits.tcp_listen_backlog));
+                if (rt.tcp_listener != null) {
+                    // Only a live listener needs a rollback record; an added
+                    // listener is destroyed with the preparation on failure.
+                    prep.backlog_listener = rt.tcp_listener;
+                    prep.backlog_old = @intCast(old_backlog);
+                }
+            }
         }
+        return prep;
+    }
 
-        if (rt.tcp_listener orelse added_tcp) |listener| listener.updateConfiguration(new_resolved, false);
-        if (rt.udp_listener orelse added_udp) |listener| listener.updateConfiguration(new_resolved, upstream_changed);
+    /// Publish a prepared matched-rule change. No allocation and no failure
+    /// paths: the pool generation is swapped, the effective configuration is
+    /// pushed to the listeners, added protocol listeners are attached, removed
+    /// protocols are retired, and the rule fields advance to the candidate.
+    fn commitMatchedRule(self: *ForwarderService, prep: *MatchPreparation) void {
+        const rt = prep.rt;
+        if (prep.generation) |generation| rt.pool.commitGeneration(generation);
+        if (rt.tcp_listener orelse prep.added_tcp) |listener| listener.updateConfiguration(prep.new_resolved, false);
+        if (rt.udp_listener orelse prep.added_udp) |listener| listener.updateConfiguration(prep.new_resolved, prep.upstream_changed);
 
-        if (added_tcp) |listener| {
+        if (prep.added_tcp) |listener| {
             rt.tcp_listener = listener;
-            added_tcp = null;
+            listener.activate();
         }
-        if (added_udp) |listener| {
+        if (prep.added_udp) |listener| {
             rt.udp_listener = listener;
-            added_udp = null;
+            listener.activate();
         }
 
-        if (!want_tcp) {
+        if (!prep.want_tcp) {
             if (rt.tcp_listener) |listener| {
                 listener.stopAccepting();
                 // The pool stays with the surviving rule; only the listener
@@ -750,16 +823,40 @@ pub const ForwarderService = struct {
                 rt.tcp_listener = null;
             }
         }
-        if (!want_udp) {
+        if (!prep.want_udp) {
             if (rt.udp_listener) |listener| {
                 listener.destroy();
                 rt.udp_listener = null;
             }
         }
 
-        rt.rule = candidate.rule;
-        rt.resolved = new_resolved;
-        rt.balance = candidate.rule.balance;
+        rt.rule = prep.candidate_rule.rule;
+        rt.resolved = prep.new_resolved;
+        rt.balance = prep.candidate_rule.rule.balance;
+
+        // The committed generation copied its weights into its strategy; the
+        // staged slice is no longer owned by anyone else.
+        if (prep.weights.len > 0) self.allocator.free(prep.weights);
+        prep.weights = &.{};
+    }
+
+    /// Release a prepared matched-rule change that will not be committed:
+    /// frees the staged weights, discards the unpublished upstream generation,
+    /// destroys staged listeners, and restores any preflighted live backlog to
+    /// its old value (best effort).
+    fn discardPreparation(self: *ForwarderService, prep: *MatchPreparation) void {
+        if (prep.weights.len > 0) self.allocator.free(prep.weights);
+        prep.weights = &.{};
+        if (prep.generation) |generation| generation.discard(&prep.rt.pool);
+        prep.generation = null;
+        if (prep.added_tcp) |listener| listener.destroy();
+        prep.added_tcp = null;
+        if (prep.added_udp) |listener| listener.destroy();
+        prep.added_udp = null;
+        if (prep.backlog_listener) |listener| {
+            listener.updateBacklog(prep.backlog_old) catch {};
+        }
+        prep.backlog_listener = null;
     }
 
     fn destroyRuleRuntime(self: *ForwarderService, rt: *RuleRuntime) void {
@@ -925,11 +1022,14 @@ pub const ForwarderService = struct {
             return;
         };
 
+        // One slot for the usual success handoff (the previous loaded cycle).
         self.retained_cycles.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.logger.err("configuration reload rejected error={s}", .{@errorName(err)});
             return;
         };
 
+        // apply is transactional: on failure nothing was published and this
+        // candidate cycle is released by the caller's defer.
         self.apply(candidate) catch |err| {
             self.logger.err("configuration reload rejected error={s}", .{@errorName(err)});
             return;
@@ -943,6 +1043,21 @@ pub const ForwarderService = struct {
         self.logger.info("configuration reloaded rules={d}", .{candidate.rules.len});
     }
 
+    /// Apply a candidate resolution to the live service, transactionally.
+    ///
+    /// The reload is all-or-nothing: every fallible operation for every rule —
+    /// brand-new rule creation, upstream generation preparation (health
+    /// inherited by address), listeners for newly added protocols, and listen
+    /// backlog preflight — runs in a prepare phase with nothing published. Only
+    /// after every rule is ready does an allocation-free commit publish the
+    /// prepared upstream generations, attach added listeners, push the new
+    /// effective configuration, retire removed protocols/rules, and swap in the
+    /// new rule list.
+    ///
+    /// On any preparation failure nothing is published: the live rules, pools,
+    /// listeners, `self.resolved`, tuning view and cycle ownership all stay on
+    /// the previous configuration, the candidate cycle is released normally by
+    /// the caller, and preflighted live backlog changes are rolled back.
     fn apply(self: *ForwarderService, candidate: ResolvedForwarder) Error!void {
         const requested_worker_threads = autotune.workerThreads(candidate.configuration.runtime.worker_threads, .system());
         if (requested_worker_threads != self.worker_threads) {
@@ -955,9 +1070,16 @@ pub const ForwarderService = struct {
             self.logger.warning("runtime tuning daemon enablement change requires restart", .{});
         }
 
+        // ------------------------------------------------------------------
+        // Prepare phase: every fallible operation, nothing published yet.
+        // ------------------------------------------------------------------
         var created: std.ArrayList(*RuleRuntime) = .empty;
         defer created.deinit(self.allocator);
         errdefer for (created.items) |rt| self.destroyRuleRuntime(rt);
+
+        var preparations: std.ArrayList(MatchPreparation) = .empty;
+        defer preparations.deinit(self.allocator);
+        errdefer for (preparations.items) |*prep| self.discardPreparation(prep);
 
         var next_rules: std.ArrayList(*RuleRuntime) = .empty;
         errdefer next_rules.deinit(self.allocator);
@@ -968,18 +1090,34 @@ pub const ForwarderService = struct {
 
         try next_rules.ensureTotalCapacity(self.allocator, candidate.rules.len);
         try created.ensureTotalCapacity(self.allocator, candidate.rules.len);
+        try preparations.ensureTotalCapacity(self.allocator, candidate.rules.len);
+
         for (candidate.rules) |*candidate_rule| {
             if (self.findRule(candidate_rule.listen_addresses)) |index| {
                 matched[index] = true;
-                try self.updateRule(self.rules_list.items[index], candidate_rule, candidate.rules.len);
+                const prep = try self.prepareMatchedRule(self.rules_list.items[index], candidate_rule, candidate.rules.len);
+                preparations.appendAssumeCapacity(prep);
                 next_rules.appendAssumeCapacity(self.rules_list.items[index]);
             } else {
-                const rt = try self.createRuleRuntime(candidate_rule, candidate.rules.len);
+                const rt = try self.createRuleRuntime(candidate_rule, candidate.rules.len, true);
                 created.appendAssumeCapacity(rt);
                 next_rules.appendAssumeCapacity(rt);
             }
         }
 
+        // ------------------------------------------------------------------
+        // Commit phase: no allocation, no failure paths.
+        // ------------------------------------------------------------------
+        for (preparations.items) |*prep| {
+            self.commitMatchedRule(prep);
+        }
+        for (created.items) |rt| {
+            if (rt.tcp_listener) |listener| listener.activate();
+            if (rt.udp_listener) |listener| listener.activate();
+            self.logRuleRuntimeStarted(rt);
+        }
+        // Retire unmatched old rules (all candidate bindings were established
+        // during prepare), then publish the new rule list.
         for (self.rules_list.items, 0..) |old, i| {
             if (!matched[i]) self.retireRule(old);
         }
@@ -1525,12 +1663,13 @@ fn loopbackResolver(host: []const u8, port: u16) anyerror!SocketAddr {
     return SocketAddr.parseIp("127.0.0.1", port).?;
 }
 
-test "sockmap auto skips loopback upstreams for tcp and udp" {
+test "sockmap auto: tcp skips loopback upstreams while udp stays userspace" {
     var listen_v4 = [_]SocketAddr{SocketAddr.parseIp("127.0.0.1", 9_000).?};
     var listen_v6 = [_]SocketAddr{SocketAddr.parseIp("::1", 9_000).?};
 
-    // IPv4 127.0.0.0/8 loopback upstream: both TCP and UDP auto skip the
-    // loopback path.
+    // IPv4 127.0.0.0/8 loopback upstream: TCP auto skips the loopback path,
+    // and UDP auto starts on the userspace batched relay before runtime
+    // traffic observation may enable sockmap.
     const ipv4 = ResolvedConfiguration{
         .configuration = makeTestConfiguration("127.42.0.1"),
         .listen_addresses = &listen_v4,
@@ -1539,7 +1678,7 @@ test "sockmap auto skips loopback upstreams for tcp and udp" {
     try testing.expect(!ipv4.shouldEnableTCPSockmap());
     try testing.expect(!ipv4.shouldEnableUDPSockmap());
 
-    // IPv6 ::1 loopback upstream behaves the same.
+    // IPv6 ::1 loopback upstream behaves the same for TCP.
     const ipv6 = ResolvedConfiguration{
         .configuration = makeTestConfiguration("::1"),
         .listen_addresses = &listen_v6,
@@ -1548,16 +1687,18 @@ test "sockmap auto skips loopback upstreams for tcp and udp" {
     try testing.expect(!ipv6.shouldEnableTCPSockmap());
     try testing.expect(!ipv6.shouldEnableUDPSockmap());
 
-    // Remote upstream: both stay enabled in auto.
+    // Remote upstream: TCP auto stays enabled, but UDP auto still prefers the
+    // stable userspace recvmmsg/sendmmsg relay regardless of upstream address.
     const remote = ResolvedConfiguration{
         .configuration = makeTestConfiguration("192.0.2.1"),
         .listen_addresses = &listen_v4,
         .upstream_address = SocketAddr.parseIp("192.0.2.1", 9_001).?,
     };
     try testing.expect(remote.shouldEnableTCPSockmap());
-    try testing.expect(remote.shouldEnableUDPSockmap());
+    try testing.expect(!remote.shouldEnableUDPSockmap());
 
-    // Explicit enabled forces a UDP sockmap attempt even for loopback.
+    // Explicit enabled forces a best-effort UDP sockmap attempt even for
+    // loopback.
     var udp_enabled = makeTestConfiguration("127.0.0.1");
     udp_enabled.performance.udp_sockmap_acceleration = .enabled;
     const udp_enabled_resolved = ResolvedConfiguration{
@@ -1597,13 +1738,14 @@ test "sockmap auto skips loopback upstreams for tcp and udp" {
     try testing.expect(!tcp_disabled_resolved.shouldEnableTCPSockmap());
 }
 
-test "sockmap auto skips when any rule upstream is loopback regardless of ordering" {
+test "sockmap auto: tcp skips rules with any loopback upstream; udp stays userspace" {
     var listen_v4 = [_]SocketAddr{SocketAddr.parseIp("127.0.0.1", 9_000).?};
     const remote = SocketAddr.parseIp("192.0.2.1", 9_001).?;
     const loopback = SocketAddr.parseIp("127.0.0.1", 9_001).?;
 
     // Remote first, loopback second: the selector may pick the loopback
-    // member, so auto must still skip the whole rule.
+    // member, so TCP auto must still skip the whole rule. UDP auto is always
+    // userspace regardless of the members.
     const remote_first = makeTestConfiguration("192.0.2.1");
     const resolved_remote_first = ResolvedConfiguration{
         .configuration = remote_first,
@@ -1639,7 +1781,8 @@ test "sockmap auto skips when any rule upstream is loopback regardless of orderi
     try testing.expect(resolved_enabled.shouldEnableUDPSockmap());
 
     // The null default derives from the single upstream (retained behavior for
-    // hand-built configurations): loopback skips, remote enables.
+    // hand-built configurations): loopback skips, remote enables for TCP;
+    // UDP auto stays on the userspace relay either way.
     const derived_loopback = makeTestConfiguration("127.0.0.1");
     const resolved_derived_loopback = ResolvedConfiguration{
         .configuration = derived_loopback,
@@ -1655,12 +1798,13 @@ test "sockmap auto skips when any rule upstream is loopback regardless of orderi
         .upstream_address = remote,
     };
     try testing.expect(resolved_derived_remote.shouldEnableTCPSockmap());
-    try testing.expect(resolved_derived_remote.shouldEnableUDPSockmap());
+    try testing.expect(!resolved_derived_remote.shouldEnableUDPSockmap());
 }
 
-test "rule resolution flags any loopback upstream for sockmap auto" {
+test "rule resolution flags any loopback upstream for tcp sockmap auto" {
     // Remote first + loopback second: resolvedForRule must mark the rule
-    // loopback-ineligible even though upstreams[0] is remote.
+    // loopback-ineligible even though upstreams[0] is remote, so TCP auto
+    // skips the whole rule. (UDP auto ignores the flag and stays userspace.)
     const remote_first = try resolveYamlForTest(
         \\rules:
         \\  - listen: { host: "127.0.0.1", port: 9000 }
@@ -1697,7 +1841,7 @@ test "rule resolution flags any loopback upstream for sockmap auto" {
     try testing.expectEqual(@as(?bool, true), loopback_first_resolved.upstream_has_loopback);
     try testing.expect(!loopback_first_resolved.shouldEnableTCPSockmap());
 
-    // All-remote rule stays eligible in auto.
+    // An all-remote rule stays eligible for TCP sockmap in auto.
     const all_remote = try resolveYamlForTest(
         \\rules:
         \\  - listen: { host: "127.0.0.1", port: 9000 }
@@ -1782,7 +1926,7 @@ test "config.example.yaml parses with expected values" {
         \\#   maxUDPPendingBytes: auto       # legacy: unused by the batched UDP transport
         \\# performance:
         \\#   tcpSockmapAcceleration: auto   # auto skips loopback upstreams
-        \\#   udpSockmapAcceleration: auto   # auto skips loopback upstreams
+        \\#   udpSockmapAcceleration: auto   # starts in userspace, then adapts to sustained eligible traffic
         \\#   udpSocketBufferBytes: 4194304   # 0 keeps kernel defaults; clamped to
         \\#                                   # net.core.rmem_max/wmem_max without CAP_NET_ADMIN
         \\#   udpIOThreads: auto              # UDP relay threads; auto = worker count
@@ -1804,4 +1948,162 @@ test "config.example.yaml parses with expected values" {
     try testing.expectEqual(9_000, config.listen.port);
     try testing.expectEqualStrings("example.com", config.upstream.host);
     try testing.expectEqual(9_000, config.upstream.port);
+}
+
+fn freeTcpPort() !u16 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+    const fd: posix.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try testing.expect(linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+    var bound = linux.sockaddr.in{ .port = 0, .addr = 0 };
+    var bound_len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
+    try testing.expect(linux.errno(linux.getsockname(fd, @ptrCast(&bound), &bound_len)) == .SUCCESS);
+    return std.mem.bigToNative(u16, bound.port);
+}
+
+/// Binds a plain (non-SO_REUSEPORT) loopback UDP socket on `port` and returns
+/// its fd; a curtsy listener binding the same port with SO_REUSEPORT then
+/// fails with EADDRINUSE, which lets the reload test force a listener-creation
+/// failure deterministically.
+fn holdUdpPort(port: u16) !posix.fd_t {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+    const fd: posix.fd_t = @intCast(rc);
+    var addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return error.TestFailedToBind;
+    }
+    return fd;
+}
+
+test "failed reload is transactional: matched rules stay entirely old" {
+    const port_one = try freeTcpPort();
+    const port_two = try freeTcpPort();
+    const upstream_port = try freeTcpPort();
+
+    // Config lives on disk so the reload path (which reads the file and owns
+    // the candidate cycle) is exercised, not just apply().
+    var path_buf: [129]u8 = undefined;
+    const path_len = (std.fmt.bufPrint(&path_buf, "/tmp/curtsy_reload_{d}_{d}.yaml", .{ std.os.linux.getpid(), @as(u64, @truncate(monotonicNowNs())) }) catch unreachable).len;
+    path_buf[path_len] = 0;
+    const config_path: [:0]const u8 = path_buf[0..path_len :0];
+    defer _ = linux.unlink(config_path);
+
+    // Initial: two TCP-only rules on concrete loopback ports. Critical log
+    // level keeps the running service silent during the test.
+    var initial_buf: [512]u8 = undefined;
+    const initial_yaml = std.fmt.bufPrint(&initial_buf,
+        \\logging: {{ level: critical }}
+        \\rules:
+        \\  - listen: {{ host: "127.0.0.1", port: {d} }}
+        \\    protocols: [tcp]
+        \\    upstreams: [ {{ host: "127.0.0.1", port: {d} }} ]
+        \\  - listen: {{ host: "127.0.0.1", port: {d} }}
+        \\    protocols: [tcp]
+        \\    upstreams: [ {{ host: "127.0.0.1", port: {d} }} ]
+        \\
+    , .{ port_one, upstream_port, port_two, upstream_port + 1 }) catch unreachable;
+    try writeTestConfig(config_path, initial_yaml);
+
+    const initial = try resolveYamlForTest(initial_yaml, null);
+    var service = ForwarderService.init(testing.allocator, config_path, initial.cycle, initial.resolved);
+    service.startInitialRules() catch {
+        service.deinit();
+        return error.TestInitialStartFailed;
+    };
+    defer service.deinit();
+
+    // Hold the UDP port of rule 1 so a candidate that adds a UDP protocol to
+    // that rule fails at listener creation.
+    const held_udp = try holdUdpPort(port_two);
+    defer _ = linux.close(held_udp);
+
+    // Candidate 1: rule 0 adds udp and changes upstream, rule 1 tries to add
+    // udp on the held port and fails. The apply must prepare rule 0's changes
+    // (upstream generation, UDP listener, backlog) but not publish any of them,
+    // so a rejected reload leaves both rules entirely on the old configuration.
+    var cand1_buf: [512]u8 = undefined;
+    const cand1_yaml = std.fmt.bufPrint(&cand1_buf,
+        \\logging: {{ level: critical }}
+        \\rules:
+        \\  - listen: {{ host: "127.0.0.1", port: {d} }}
+        \\    protocols: [tcp, udp]
+        \\    upstreams: [ {{ host: "127.0.0.1", port: {d} }} ]
+        \\  - listen: {{ host: "127.0.0.1", port: {d} }}
+        \\    protocols: [tcp, udp]
+        \\    upstreams: [ {{ host: "127.0.0.1", port: {d} }} ]
+        \\
+    , .{ port_one, upstream_port + 2, port_two, upstream_port + 3 }) catch unreachable;
+    try writeTestConfig(config_path, cand1_yaml);
+    service.reload();
+
+    // Transactional rollback: the rejected candidate was NOT retained and the
+    // previous resolution stays authoritative, so a later valid reload has a
+    // clean cycle-ownership state (retained_cycles only holds cycles the live
+    // service actually borrows from).
+    try testing.expectEqual(@as(usize, 0), service.retained_cycles.items.len);
+    try testing.expectEqualStrings("critical", service.resolved.configuration.logging.level);
+    try testing.expectEqual(@as(usize, 2), service.resolved.rules.len);
+    try testing.expectEqual(@as(u16, upstream_port), service.resolved.rules[0].upstream_addresses[0].port);
+
+    // Rule 0 must remain COMPLETELY old: upstream unchanged, no UDP listener
+    // was attached, and its resolved configuration slices still name the
+    // original upstream. Rule 1 is untouched as well.
+    try testing.expectEqual(@as(usize, 2), service.rules_list.items.len);
+    const rule_zero = service.rules_list.items[0];
+    try testing.expectEqual(@as(u16, upstream_port), rule_zero.resolved.configuration.upstream.port);
+    try testing.expect(rule_zero.udp_listener == null);
+    // The pool generation was never published: picks still serve the old
+    // upstream, so a failed reload did not leak the candidate's upstream set.
+    try testing.expectEqual(@as(u16, upstream_port), rule_zero.pool.pick(null, 0).port);
+    const rule_one = service.rules_list.items[1];
+    try testing.expectEqual(@as(u16, upstream_port + 1), rule_one.resolved.configuration.upstream.port);
+    try testing.expect(rule_one.udp_listener == null);
+
+    // A subsequent, fully valid reload applies cleanly over the unchanged
+    // service, proving the rejected candidate left no residue.
+    var cand2_buf: [512]u8 = undefined;
+    const cand2_yaml = std.fmt.bufPrint(&cand2_buf,
+        \\logging: {{ level: critical }}
+        \\rules:
+        \\  - listen: {{ host: "127.0.0.1", port: {d} }}
+        \\    protocols: [tcp, udp]
+        \\    upstreams: [ {{ host: "127.0.0.1", port: {d} }} ]
+        \\  - listen: {{ host: "127.0.0.1", port: {d} }}
+        \\    protocols: [tcp]
+        \\    upstreams: [ {{ host: "127.0.0.1", port: {d} }} ]
+        \\
+    , .{ port_one, upstream_port + 4, port_two, upstream_port + 5 }) catch unreachable;
+    try writeTestConfig(config_path, cand2_yaml);
+    service.reload();
+
+    // Successful reload: retained_cycles now holds only the previous loaded
+    // cycle handed off by the success path; the service serves the new rules.
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+    try testing.expectEqualStrings("critical", service.resolved.configuration.logging.level);
+    try testing.expectEqual(@as(u16, upstream_port + 4), service.resolved.rules[0].upstream_addresses[0].port);
+    try testing.expectEqual(@as(usize, 2), service.rules_list.items.len);
+    try testing.expectEqual(@as(u16, upstream_port + 4), service.rules_list.items[0].resolved.configuration.upstream.port);
+    try testing.expect(service.rules_list.items[0].udp_listener != null);
+    try testing.expectEqual(@as(u16, upstream_port + 5), service.rules_list.items[1].resolved.configuration.upstream.port);
+}
+
+/// Writes `text` to `path`, truncating any prior content.
+fn writeTestConfig(path: []const u8, text: []const u8) !void {
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+        .CLOEXEC = true,
+    }, 0o644);
+    defer _ = linux.close(fd);
+    var rest = text;
+    while (rest.len > 0) {
+        const written = linux.write(fd, rest.ptr, rest.len);
+        if (linux.errno(written) != .SUCCESS) return error.TestConfigWriteFailed;
+        rest = rest[written..];
+    }
 }

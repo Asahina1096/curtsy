@@ -1,3 +1,45 @@
+curtsy (0.3.2) noble; urgency=medium
+
+  * Refactor the configuration module registry: the comptime module type
+    list is now the single ordering source and drives generated ModuleRef
+    entries with descriptor pointers and conf slot indexes.
+  * Synchronize release metadata across the CLI version string, build.zig
+    package version, man page, and changelog.
+  * Make UDP sockmap acceleration conservative and adaptive: auto starts
+    on the userspace batched relay and only attempts sockmap after stable
+    runtime evidence (no loopback upstream, sustained large-datagram
+    workload over several windows), with hysteresis/cooldown and a safe
+    userspace fallback; loopback and small-packet workloads stay in
+    userspace. Sustained eligible traffic may enable sockmap after five
+    qualifying windows; enabled remains a best-effort forced attempt with no
+    ordering guarantees. TCP auto is unchanged.
+  * Close the enabled-to-auto reload race: a reload that disallows UDP
+    sockmap synchronously blocks new associations from entering sockmap
+    while the async teardown command is pending, and an unchanged eligible
+    auto reload (e.g. a tuning-daemon limits tick) preserves the loaded
+    adaptive runtime and policy instead of tearing acceleration down.
+  * Make hot reload transactional: every fallible change for every rule
+    (new rules, upstream generations, listeners for added protocols,
+    listen backlog preflight) is staged before any matched rule is
+    committed. Prepared listeners bind in a paused state and do not accept
+    TCP or forward UDP until the non-failing commit activates them, so a
+    failed reload leaves the whole previous configuration serving, keeps
+    listeners/pools/cycle ownership on the old state, and releases the
+    rejected candidate cycle normally.
+  * Make loaded configurations self-contained: scalar strings are copied
+    into the cycle arena so file-loaded configs stay valid after the file
+    bytes are released.
+  * Add a dedicated privileged `zig build test-ebpf` entry point that
+    runs the real eBPF integration suite and fails loudly without
+    CAP_BPF/CAP_NET_ADMIN, while the default `zig build test` stays
+    unprivileged and clean.
+  * Packaging: emit a real ELF build id, drop the now-useless
+    libpthread.so.0 NEEDED (glibc >= 2.34 resolves those symbols from
+    libc.so.6), and document the intentional static libbpf/libelf/libz/
+    libzstd embedding with a Lintian override.
+
+ -- Curtsy contributors <maintainers@example.invalid>  Mon, 03 Aug 2026 00:00:00 +0000
+
 curtsy (0.3.1) noble; urgency=medium
 
   * Cut data-plane syscall overhead across the TCP/UDP relays:

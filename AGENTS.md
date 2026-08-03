@@ -8,7 +8,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/
 
 - 语言与工具链：仓库内 `.toolchain` 固定 Zig 0.16.0 和 libbpf/libelf/zlib/zstd 静态依赖；eBPF 内核程序位于 `src/ebpf/*.bpf.c`，由 Zig 发行包内置的 Clang 前端在构建期编译为标准 BPF ELF。正常构建不从 PATH、`/usr/include` 或 `/usr/lib` 解析依赖。用户态代码无条件使用 Linux syscall、epoll、eventfd、signalfd、recvmmsg/sendmmsg 与 eBPF API，不保留其他平台的编译期回退。
 - 关键配置清单：`build.zig`（构建定义）、`config.example.yaml`（配置示例）。
-- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.1）；`debian/` 目录提供 Debian 打包元数据（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。打包统一入口是 `tools/build-deb.sh`，最终产物（`.deb`/`.changes`/`.buildinfo`）落在仓库内 `dist/debian/`。
+- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.2）；`debian/` 目录提供 Debian 打包元数据（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。打包统一入口是 `tools/build-deb.sh`，最终产物（`.deb`/`.changes`/`.buildinfo`）落在仓库内 `dist/debian/`。
 
 ## 构建与测试命令
 
@@ -53,11 +53,11 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/
 
 ## 运行时架构要点
 
-- 热加载（`SIGHUP`）：监听地址变化时先绑新端口再停旧监听；失败则整体回滚到旧配置。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 TCP sockmap 模式时已有 TCP 连接保持原模式；改变 UDP sockmap 模式时已有 UDP 会话被清除并按新模式重建。统一编排器按规则 listen 地址集合 diff（单规则即一条规则的特例）：匹配规则原地更新（pool 健康状态按地址继承），新规则先绑定再退役旧规则，单规则 ↔ 多规则写法切换需重启。
+- 热加载（`SIGHUP`）：监听地址变化时先绑新端口再停旧监听。重载是事务式的：所有可失败操作（新规则绑定、上游 generation 准备、新增协议监听、listen backlog 预检）先全部准备好；新 listener 在准备阶段保持暂停，不接受 TCP 或转发 UDP。任一失败则整体保留旧配置并正常释放候选 cycle；全部就绪后才提交、激活并退役旧规则。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 TCP sockmap 模式时已有 TCP 连接保持原模式；改变 UDP sockmap 模式时已有 UDP 会话被清除并按新模式重建。统一编排器按规则 listen 地址集合 diff（单规则即一条规则的特例）：匹配规则原地更新（pool 健康状态按地址继承），新规则先绑定再退役旧规则，单规则 ↔ 多规则写法切换需重启。
 - 优雅退出：先停止 accept，等待已有 TCP 连接，超时后强制关闭。
 - TCP 性能：`splice(2)` socket→pipe→socket 零拷贝快路径，背压时回退 64..256 KiB 自适应读缓冲、批量 flush 和水位线控制；每次 epoll 唤醒复用单调时间戳。多 worker 时尝试 `SO_ATTACH_REUSEPORT_EBPF`，失败时回退内核原生 `SO_REUSEPORT` hash。
 - UDP 性能：I/O 线程池（默认每 CPU 一个，`performance.udpIOThreads` 可调）经 `SO_REUSEPORT` 共享监听端口；每线程用 epoll 驱动自己的监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发；会话建立是同步的。
-- sockmap 加速：`performance.tcpSockmapAcceleration` / `performance.udpSockmapAcceleration` 支持 `enabled` / `disabled` / `auto`。权限不足、内核不支持或配对失败时自动回退用户态 relay，不影响服务启动。
+- sockmap 加速：`performance.tcpSockmapAcceleration` 的 `auto` 跳过 loopback 上游。UDP `auto` 从用户态批量 relay 启动，仅在非 loopback、连续 5 个一秒窗口达到每窗口 200 报文且平均至少 256 字节后尝试 sockmap；加载、配对或回落异常进入 30 秒冷却并安全退回用户态。`enabled` 强制尽力尝试，`disabled` 始终关闭；不承诺 UDP 报文顺序。
 - 并发约定：跨线程共享状态使用 `std.atomic.Value` 或 `log.Mutex`；worker/engine 私有可变状态只在对应线程上访问。
 
 ## 代码风格约定
@@ -75,7 +75,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/
 - `src/modules/upstream.zig` 覆盖三种选路策略、摘除阈值与冷却恢复、全摘除回退、单上游退化、`rebind` 健康继承与 balancer 注册表。
 - `src/modules/tcp.zig` 使用真实回环网络测试 TCP 回显往返、缓冲预算、UDP 会话隔离与超时重载、多 worker 共享端口与预算、backlog 原地更新、通配符双栈监听等；selector 钩子测试覆盖按连接选路、故障转移与摘除。
 - `src/modules/udp.zig` 使用回环 UDP echo 测试 selector 按会话选路、ICMP 错误上报与摘除后重选。测试绑定 `127.0.0.1` 的 0 号端口，无需 root。
-- 新增功能应附带同风格测试；修改转发逻辑后运行完整 `.toolchain/zig/zig build test`。
+- 新增功能应附带同风格测试；修改转发逻辑后运行完整 `.toolchain/zig/zig build test`。真实 eBPF 集成测试使用 `sudo .toolchain/zig/zig build test-ebpf`，缺少权限或内核支持时必须失败，不能静默跳过。
 
 ## 安全注意事项
 

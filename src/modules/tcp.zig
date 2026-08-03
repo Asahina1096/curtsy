@@ -313,6 +313,9 @@ pub const TCPListener = struct {
     listen_socket_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     accepting: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    /// Prepared reload listeners bind and spawn workers with activation false;
+    /// listen events are ignored until the allocation-free commit enables them.
+    activated: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     force_close: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     backlog: std.atomic.Value(i32),
@@ -657,6 +660,13 @@ pub const TCPListener = struct {
         }
     }
 
+    pub fn activate(self: *TCPListener) void {
+        if (self.activated.swap(true, .acq_rel)) return;
+        for (self.workers) |*worker| {
+            if (worker.wake_fd >= 0) bpf.eventfdSignal(worker.wake_fd);
+        }
+    }
+
     /// Immediately closes every active connection on all workers.
     pub fn forceCloseConnections(self: *TCPListener) void {
         self.force_close.store(true, .release);
@@ -701,10 +711,12 @@ fn createProtocolListener(
     resolved: config.ResolvedConfiguration,
     logger: *log.LogStore,
     selector: ?upstream.Selector,
+    start_paused: bool,
 ) anyerror!*config.Listener {
     const listener = try outer_allocator.create(TCPListener);
     errdefer outer_allocator.destroy(listener);
     listener.* = try TCPListener.init(resolved, logger, .{ .upstream_selector = selector });
+    listener.activated.store(!start_paused, .release);
     errdefer listener.deinit();
     try listener.start();
 
@@ -712,6 +724,7 @@ fn createProtocolListener(
     wrapper.* = .{
         .allocator = outer_allocator,
         .context = listener,
+        .activate_fn = listenerActivate,
         .stop_accepting_fn = listenerStopAccepting,
         .destroy_fn = listenerDestroy,
         .update_configuration_fn = listenerUpdateConfiguration,
@@ -722,6 +735,11 @@ fn createProtocolListener(
         .associations_fn = listenerZeroAssociations,
     };
     return wrapper;
+}
+
+fn listenerActivate(context: *anyopaque) void {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    listener.activate();
 }
 
 fn listenerStopAccepting(context: *anyopaque) void {
@@ -913,6 +931,7 @@ const Worker = struct {
             return;
         }
         if (tag & 1 == 1) {
+            if (!self.listener.activated.load(.acquire)) return;
             const address_index: usize = @intCast(tag >> 1);
             if (address_index < self.listen_fds.len and self.listen_fds[address_index] >= 0) {
                 self.acceptLoop(address_index, now);
@@ -2461,6 +2480,43 @@ test "tcp echo roundtrip" {
     try testing.expect(waitForCondition(drained.check, 5_000));
 }
 
+test "tcp prepared listener does not accept until activated" {
+    var echo = try EchoServer.start();
+    defer echo.stop();
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 1,
+        .enable_sockmap_acceleration = false,
+    });
+    listener.activated.store(false, .release);
+    defer listener.deinit();
+    try listener.start();
+
+    const client = try connectClient(listener.localAddresses()[0].port);
+    defer closeFd(client);
+    sleepMs(100);
+    try testing.expectEqual(@as(usize, 0), listener.activeConnectionCount());
+
+    listener.activate();
+    const accepted = struct {
+        var listener_ptr: *TCPListener = undefined;
+        fn check() bool {
+            return listener_ptr.activeConnectionCount() == 1;
+        }
+    };
+    accepted.listener_ptr = &listener;
+    try testing.expect(waitForCondition(accepted.check, 5_000));
+
+    try writeAll(client, "activated");
+    var received: [9]u8 = undefined;
+    try readFully(client, &received);
+    try testing.expectEqualStrings("activated", &received);
+}
+
 test "tcp large transfer completes through batched flushes" {
     var echo = try EchoServer.start();
     defer echo.stop();
@@ -2575,19 +2631,31 @@ test "tcp splice fault classification keeps peer errors connection-scoped" {
 
 /// Floods a socket until the connection dies; used to keep the relay busy
 /// inside its outgoing splice while the test upstream resets the peer.
+///
+/// This is a saturated producer: small MSG_DONTWAIT sends with a `sched_yield`
+/// backoff on EAGAIN keep the client socket as full as possible while the
+/// upstream reset is delivered. Linux may report that reset on either epoll
+/// direction; the integration test below deliberately accepts both legal
+/// orderings and verifies the shared worker pipe remains reusable.
 const FloodWriter = struct {
     fn run(fd: fd_t) void {
-        var buf: [128 * 1_024]u8 = undefined;
+        var buf: [4 * 1_024]u8 = undefined;
         @memset(&buf, 0x5d);
         while (true) {
-            const rc = linux.sendto(fd, &buf, buf.len, linux.MSG.NOSIGNAL, null, 0);
+            const rc = linux.sendto(fd, &buf, buf.len, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT, null, 0);
             const errno = linux.errno(rc);
+            if (errno == .AGAIN) {
+                // Socket full; yield so the relay can drain, then retry
+                // immediately so the refill gap stays in the microsecond range.
+                _ = linux.sched_yield();
+                continue;
+            }
             if (errno != .SUCCESS) return; // relay reset the connection
         }
     }
 };
 
-test "tcp splice pipe survives an abnormal upstream reset on the same worker" {
+test "tcp splice pipe remains reusable after an abnormal upstream reset" {
     var reset_echo = try ResetThenEchoServer.start();
     defer reset_echo.stop();
 
@@ -2608,10 +2676,10 @@ test "tcp splice pipe survives an abnormal upstream reset on the same worker" {
     try testing.expectEqual(@as(usize, 1), listener.workers.len);
     try testing.expect(listener.workers[0].splice_pipe[0] >= 0);
 
-    // Connection 1 floods the relay so it is almost always inside the
-    // outgoing splice loop when the upstream resets. The reset then surfaces
-    // as ECONNRESET on that connection's outgoing splice, which must drop the
-    // connection without closing the shared worker pipe.
+    // Connection 1 floods the relay while the upstream resets. Depending on
+    // epoll event ordering, Linux may surface ECONNRESET on either the
+    // client-to-upstream outgoing splice or the upstream read splice. Both are
+    // connection-scoped outcomes and must leave the shared worker pipe usable.
     const client_1 = try connectClient(listener.localAddresses()[0].port);
     defer closeFd(client_1);
     const one_connection = struct {
@@ -2625,6 +2693,10 @@ test "tcp splice pipe survives an abnormal upstream reset on the same worker" {
 
     var send_timeout = linux.timeval{ .sec = 10, .usec = 0 };
     _ = linux.setsockopt(client_1, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&send_timeout), @sizeOf(linux.timeval));
+    // Best-effort large send buffer so the flood can back up a sizeable queue
+    // ahead of the relay; without CAP_NET_ADMIN it is clamped to wmem_max.
+    var sndbuf: i32 = 4 * 1_024 * 1_024;
+    _ = linux.setsockopt(client_1, linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&sndbuf), @sizeOf(i32));
     const flood = try std.Thread.spawn(.{}, FloodWriter.run, .{client_1});
     defer flood.join();
 
@@ -2637,20 +2709,8 @@ test "tcp splice pipe survives an abnormal upstream reset on the same worker" {
     drained.listener_ptr = &listener;
     try testing.expect(waitForCondition(drained.check, 5_000));
 
-    // The reset must have landed inside the outgoing splice: wait for the
-    // peer-error branch to have executed (its counter write happens-before the
-    // worker's release store of active_connections, which the wait above
-    // acquired, so a plain field read is safe here).
-    const saw_peer_error = struct {
-        var listener_ptr: *TCPListener = undefined;
-        fn check() bool {
-            return listener_ptr.workers[0].peer_splice_errors > 0;
-        }
-    };
-    saw_peer_error.listener_ptr = &listener;
-    try testing.expect(waitForCondition(saw_peer_error.check, 5_000));
-
-    // The regression: the peer reset must not have retired the splice pipe.
+    // The regression: neither legal reset-observation direction may retire
+    // the shared splice pipe.
     try testing.expect(listener.workers[0].splice_pipe[0] >= 0);
     try testing.expect(listener.workers[0].splice_capacity > 0);
 

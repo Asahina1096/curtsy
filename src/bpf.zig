@@ -1208,30 +1208,46 @@ test "embedded BPF ELF objects open through libbpf" {
     try libbpfStatus(curtsy_libbpf_has_program(observer, "observe_udp_recvmsg"));
 }
 
+/// Loader failures caused by missing privileges are graceful skips in the
+/// default suite but must fail loudly under the dedicated `zig build test-ebpf`
+/// step (which sets CURTSY_REQUIRE_EBPF_TESTS): silently passing without
+/// CAP_BPF/CAP_NET_ADMIN there would hide a broken privileged environment.
+fn ebpfLoaderUnavailable(err: anyerror) bool {
+    if (std.c.getenv("CURTSY_REQUIRE_EBPF_TESTS") != null) return false;
+    return switch (err) {
+        error.PermissionDenied, error.AccessDenied, error.NotSupported => true,
+        else => false,
+    };
+}
+
 test "eBPF loaders (gated: CURTSY_ENABLE_EBPF_TESTS)" {
     if (std.c.getenv("CURTSY_ENABLE_EBPF_TESTS") == null) return;
 
     var verifier_log: [256 * 1024]u8 = undefined;
 
     // Reuseport steering program. When the gate is set but the process
-    // still lacks CAP_BPF/CAP_NET_ADMIN, treat it as a skip: loader
-    // failures must stay graceful everywhere.
-    const reuse_fd = loadReusePortBpf(2, &verifier_log) catch |err| switch (err) {
-        error.PermissionDenied, error.AccessDenied, error.NotSupported => return,
-        else => return err,
+    // still lacks CAP_BPF/CAP_NET_ADMIN, treat it as a skip in the default
+    // suite; under the dedicated `zig build test-ebpf` step missing
+    // privileges are a hard failure, never a silent pass.
+    const reuse_fd = loadReusePortBpf(2, &verifier_log) catch |err| {
+        if (ebpfLoaderUnavailable(err)) return;
+        return err;
     };
     closeFd(reuse_fd);
 
     // TCP sockmap runtime: maps + parser + verdict program.
-    var tcp_runtime = SockmapRuntime.createTcp(1024, &verifier_log) catch |err| switch (err) {
-        error.PermissionDenied, error.AccessDenied, error.NotSupported => return,
-        else => return err,
+    var tcp_runtime = SockmapRuntime.createTcp(1024, &verifier_log) catch |err| {
+        if (ebpfLoaderUnavailable(err)) return;
+        return err;
     };
     tcp_runtime.destroy();
 
     // UDP verdict-only runtime, plus a full pair/idle/unpair cycle on two
     // connected loopback UDP sockets.
-    const udp_runtime = try SockmapRuntime.createUdp(1024, &verifier_log);
+    const udp_runtime = SockmapRuntime.createUdp(1024, &verifier_log) catch |err| {
+        if (ebpfLoaderUnavailable(err)) return;
+        return err;
+    };
     defer {
         var runtime = udp_runtime;
         runtime.destroy();

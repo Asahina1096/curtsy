@@ -21,6 +21,27 @@ override_dh_auto_install:
 	install -D -m 0644 config.example.yaml debian/curtsy/etc/curtsy/config.yaml
 	install -D -m 0644 debian/60-curtsy.conf debian/curtsy/usr/lib/sysctl.d/60-curtsy.conf
 
+# glibc >= 2.34 merged libpthread into libc.so.6, but some pthread references
+# in the binary are versioned GLIBC_2.2.5, which makes the Zig linker emit a
+# now-useless libpthread.so.0 NEEDED (its version-requirement records point at
+# libpthread). After stripping, point those records at libc.so.6, which
+# provides the GLIBC_2.2.5 compat versions, and collapse the resulting
+# duplicate NEEDED. A plain `--remove-needed` would leave the version
+# requirement dangling and the loader aborts, so the smoke tests below are
+# mandatory: they fail the build if the mutation ever breaks startup. Running
+# here (after dh_dwz/dh_strip) also avoids patchelf's section reordering
+# confusing the dwz debug-info compressor.
+override_dh_strip:
+	dh_strip
+	patchelf --replace-needed libpthread.so.0 libc.so.6 debian/curtsy/usr/bin/curtsy
+	patchelf --remove-needed libc.so.6 debian/curtsy/usr/bin/curtsy
+	patchelf --add-needed libc.so.6 debian/curtsy/usr/bin/curtsy
+	@test "$$(readelf -d debian/curtsy/usr/bin/curtsy | grep -c NEEDED)" = "1"
+	debian/curtsy/usr/bin/curtsy --version >/dev/null
+	printf 'listen: { host: "127.0.0.1", port: 9000 }\nupstream: { host: "127.0.0.1", port: 9001 }\n' > debian/curtsy-smoke.yaml
+	debian/curtsy/usr/bin/curtsy --config debian/curtsy-smoke.yaml --check-config >/dev/null
+	rm -f debian/curtsy-smoke.yaml
+
 override_dh_builddeb:
 	mkdir -p $(CURDIR)/dist/debian
 	dh_builddeb --destdir=$(CURDIR)/dist/debian

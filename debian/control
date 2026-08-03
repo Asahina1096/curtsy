@@ -2,7 +2,7 @@ Source: curtsy
 Section: net
 Priority: optional
 Maintainer: Curtsy contributors <maintainers@example.invalid>
-Build-Depends: debhelper-compat (= 13)
+Build-Depends: binutils, debhelper-compat (= 13), patchelf
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
