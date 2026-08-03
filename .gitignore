@@ -1,5 +1,6 @@
 /.build/
 /.zig-cache/
+/dist/
 /zig-out/
 /.toolchain/
 /.perf-test/
@@ -7,6 +8,7 @@
 /debian/.debhelper/
 /debian/curtsy/
 /debian/*.debhelper
+/debian/*.debhelper.log
 /debian/*.substvars
 /debian/debhelper-build-stamp
 /debian/files

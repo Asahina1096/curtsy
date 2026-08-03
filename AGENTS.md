@@ -8,7 +8,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/
 
 - 语言与工具链：仓库内 `.toolchain` 固定 Zig 0.16.0 和 libbpf/libelf/zlib/zstd 静态依赖；eBPF 内核程序位于 `src/ebpf/*.bpf.c`，由 Zig 发行包内置的 Clang 前端在构建期编译为标准 BPF ELF。正常构建不从 PATH、`/usr/include` 或 `/usr/lib` 解析依赖。用户态代码无条件使用 Linux syscall、epoll、eventfd、signalfd、recvmmsg/sendmmsg 与 eBPF API，不保留其他平台的编译期回退。
 - 关键配置清单：`build.zig`（构建定义）、`config.example.yaml`（配置示例）。
-- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.1）；`debian/` 目录提供 Debian 打包（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。
+- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.1）；`debian/` 目录提供 Debian 打包元数据（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。打包统一入口是 `tools/build-deb.sh`，最终产物（`.deb`/`.changes`/`.buildinfo`）落在仓库内 `dist/debian/`。
 
 ## 构建与测试命令
 
@@ -18,6 +18,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/
 .toolchain/zig/zig build test
 .toolchain/zig/zig build run -- --config config.yaml --check-config
 .toolchain/zig/zig build run -- --config config.yaml
+./tools/build-deb.sh                  # Debian 打包，产物在 dist/debian/
 ```
 
 默认按架构基线 CPU 编译（`-mcpu baseline`），保证二进制可移植；本地开发想要本机优化时显式传 `-Dcpu=native`。

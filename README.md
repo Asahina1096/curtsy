@@ -38,16 +38,18 @@ eBPF C 使用 Zig 发行包内置的 Clang 前端，生成带 BTF 和重定位�
 
 ## Debian 打包
 
-仓库包含 debhelper 打包元数据。先运行 bootstrap，再使用 `dpkg-dev` 和
-`debhelper` 构建 `.deb`；编译器和 BPF 相关依赖仍来自 `.toolchain/`：
+仓库包含 debhelper 打包元数据。先运行 bootstrap，再通过统一入口脚本构建
+`.deb`；编译器和 BPF 相关依赖仍来自 `.toolchain/`：
 
 ```bash
-dpkg-buildpackage -us -uc -b
+./tools/build-deb.sh
 ```
 
-构建会执行 `.toolchain/zig/zig build -Doptimize=ReleaseSafe`，并在未设置
-`DEB_BUILD_OPTIONS=nocheck` 时运行本地工具链测试。生成的二进制包位于
-仓库上级目录。
+脚本在仓库内 `dist/debian/` 生成 `.deb`、`.changes` 和 `.buildinfo`。构建会
+执行 `.toolchain/zig/zig build -Doptimize=ReleaseSafe`，并在未设置
+`DEB_BUILD_OPTIONS=nocheck` 时运行本地工具链测试；额外参数（如 `-nc`）会传给
+`dpkg-buildpackage`。打包需要 `dpkg` >= 1.21（脚本使用的 `dpkg-buildpackage`
+显式输出文件选项依赖该版本），版本不足时脚本会提前报错退出。
 
 安装后包含：
 

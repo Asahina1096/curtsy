@@ -5,3 +5,4 @@ tar-ignore = zig-out
 tar-ignore = .toolchain
 tar-ignore = .perf-test
 tar-ignore = *.deb
+tar-ignore = dist
