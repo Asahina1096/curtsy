@@ -76,13 +76,31 @@ pub const ResolvedConfiguration = struct {
     /// One or two addresses; "*" listens dual-stack wildcard 0.0.0.0 and ::.
     listen_addresses: []SocketAddr,
     upstream_address: SocketAddr,
+    /// Auto sockmap eligibility for multi-upstream rules: true when any
+    /// resolved upstream member of the rule is loopback, so auto skips
+    /// acceleration regardless of which member the selector picks. null (the
+    /// default) derives the answer from `upstream_address`, which preserves
+    /// the single-upstream behavior for hand-built configurations.
+    upstream_has_loopback: ?bool = null,
+
+    fn upstreamLoopback(self: *const ResolvedConfiguration) bool {
+        if (self.upstream_has_loopback) |flag| return flag;
+        return self.upstream_address.isLoopback();
+    }
 
     pub fn listenBindingDiffers(self: *const ResolvedConfiguration, other: *const ResolvedConfiguration) bool {
         return !net.addressesEqual(self.listen_addresses, other.listen_addresses);
     }
 
     pub fn shouldEnableTCPSockmap(self: *const ResolvedConfiguration) bool {
-        return self.configuration.performance.tcp_sockmap_acceleration != .disabled;
+        // auto skips loopback upstreams: the measured loopback SK_SKB/sockhash
+        // per-packet cost can exceed the userspace relay. Explicit enabled
+        // still forces an attempt; remote upstreams stay eligible in auto.
+        return switch (self.configuration.performance.tcp_sockmap_acceleration) {
+            .disabled => false,
+            .enabled => true,
+            .auto => !self.upstreamLoopback(),
+        };
     }
 
     pub fn shouldEnableUDPSockmap(self: *const ResolvedConfiguration) bool {
@@ -93,7 +111,7 @@ pub const ResolvedConfiguration = struct {
         return switch (self.configuration.performance.udp_sockmap_acceleration) {
             .disabled => false,
             .enabled => true,
-            .auto => !self.upstream_address.isLoopback(),
+            .auto => !self.upstreamLoopback(),
         };
     }
 };
@@ -1047,6 +1065,7 @@ pub const ForwarderService = struct {
                 .configuration = new_effective,
                 .listen_addresses = rt.resolved.listen_addresses,
                 .upstream_address = rt.resolved.upstream_address,
+                .upstream_has_loopback = rt.resolved.upstream_has_loopback,
             };
             if (rt.tcp_listener) |listener| listener.updateConfiguration(new_resolved, false);
             if (rt.udp_listener) |listener| listener.updateConfiguration(new_resolved, false);
@@ -1095,7 +1114,19 @@ fn resolvedForRule(effective: ForwarderConfiguration, candidate: *const Resolved
         .configuration = effective,
         .listen_addresses = candidate.listen_addresses,
         .upstream_address = candidate.upstream_addresses[0],
+        .upstream_has_loopback = hasLoopbackUpstream(candidate.upstream_addresses),
     };
+}
+
+/// True when any resolved upstream address in the rule is loopback. Auto
+/// sockmap skips acceleration for the whole rule in that case: the selector
+/// may pick any member, so one loopback member must make the entire rule
+/// ineligible regardless of upstream ordering.
+fn hasLoopbackUpstream(addresses: []const SocketAddr) bool {
+    for (addresses) |address| {
+        if (address.isLoopback()) return true;
+    }
+    return false;
 }
 
 /// Global-section snapshot for the tuning daemon; only limits is consumed.
@@ -1495,18 +1526,18 @@ fn loopbackResolver(host: []const u8, port: u16) anyerror!SocketAddr {
     return SocketAddr.parseIp("127.0.0.1", port).?;
 }
 
-test "sockmap auto skips loopback upstreams for udp but not tcp" {
+test "sockmap auto skips loopback upstreams for tcp and udp" {
     var listen_v4 = [_]SocketAddr{SocketAddr.parseIp("127.0.0.1", 9_000).?};
     var listen_v6 = [_]SocketAddr{SocketAddr.parseIp("::1", 9_000).?};
 
-    // IPv4 127.0.0.0/8 loopback upstream: TCP auto stays enabled, UDP auto
-    // skips the loopback path.
+    // IPv4 127.0.0.0/8 loopback upstream: both TCP and UDP auto skip the
+    // loopback path.
     const ipv4 = ResolvedConfiguration{
         .configuration = makeTestConfiguration("127.42.0.1"),
         .listen_addresses = &listen_v4,
         .upstream_address = SocketAddr.parseIp("127.42.0.1", 9_001).?,
     };
-    try testing.expect(ipv4.shouldEnableTCPSockmap());
+    try testing.expect(!ipv4.shouldEnableTCPSockmap());
     try testing.expect(!ipv4.shouldEnableUDPSockmap());
 
     // IPv6 ::1 loopback upstream behaves the same.
@@ -1515,7 +1546,7 @@ test "sockmap auto skips loopback upstreams for udp but not tcp" {
         .listen_addresses = &listen_v6,
         .upstream_address = SocketAddr.parseIp("::1", 9_001).?,
     };
-    try testing.expect(ipv6.shouldEnableTCPSockmap());
+    try testing.expect(!ipv6.shouldEnableTCPSockmap());
     try testing.expect(!ipv6.shouldEnableUDPSockmap());
 
     // Remote upstream: both stay enabled in auto.
@@ -1565,6 +1596,124 @@ test "sockmap auto skips loopback upstreams for udp but not tcp" {
         .upstream_address = SocketAddr.parseIp("192.0.2.1", 9_001).?,
     };
     try testing.expect(!tcp_disabled_resolved.shouldEnableTCPSockmap());
+}
+
+test "sockmap auto skips when any rule upstream is loopback regardless of ordering" {
+    var listen_v4 = [_]SocketAddr{SocketAddr.parseIp("127.0.0.1", 9_000).?};
+    const remote = SocketAddr.parseIp("192.0.2.1", 9_001).?;
+    const loopback = SocketAddr.parseIp("127.0.0.1", 9_001).?;
+
+    // Remote first, loopback second: the selector may pick the loopback
+    // member, so auto must still skip the whole rule.
+    const remote_first = makeTestConfiguration("192.0.2.1");
+    const resolved_remote_first = ResolvedConfiguration{
+        .configuration = remote_first,
+        .listen_addresses = &listen_v4,
+        .upstream_address = remote,
+        .upstream_has_loopback = true,
+    };
+    try testing.expect(!resolved_remote_first.shouldEnableTCPSockmap());
+    try testing.expect(!resolved_remote_first.shouldEnableUDPSockmap());
+
+    // Loopback first, remote second behaves the same.
+    const loopback_first = makeTestConfiguration("127.0.0.1");
+    const resolved_loopback_first = ResolvedConfiguration{
+        .configuration = loopback_first,
+        .listen_addresses = &listen_v4,
+        .upstream_address = loopback,
+        .upstream_has_loopback = true,
+    };
+    try testing.expect(!resolved_loopback_first.shouldEnableTCPSockmap());
+    try testing.expect(!resolved_loopback_first.shouldEnableUDPSockmap());
+
+    // Explicit enabled still forces the attempt for both protocols.
+    var enabled = makeTestConfiguration("192.0.2.1");
+    enabled.performance.tcp_sockmap_acceleration = .enabled;
+    enabled.performance.udp_sockmap_acceleration = .enabled;
+    const resolved_enabled = ResolvedConfiguration{
+        .configuration = enabled,
+        .listen_addresses = &listen_v4,
+        .upstream_address = remote,
+        .upstream_has_loopback = true,
+    };
+    try testing.expect(resolved_enabled.shouldEnableTCPSockmap());
+    try testing.expect(resolved_enabled.shouldEnableUDPSockmap());
+
+    // The null default derives from the single upstream (retained behavior for
+    // hand-built configurations): loopback skips, remote enables.
+    const derived_loopback = makeTestConfiguration("127.0.0.1");
+    const resolved_derived_loopback = ResolvedConfiguration{
+        .configuration = derived_loopback,
+        .listen_addresses = &listen_v4,
+        .upstream_address = loopback,
+    };
+    try testing.expect(!resolved_derived_loopback.shouldEnableTCPSockmap());
+
+    const derived_remote = makeTestConfiguration("192.0.2.1");
+    const resolved_derived_remote = ResolvedConfiguration{
+        .configuration = derived_remote,
+        .listen_addresses = &listen_v4,
+        .upstream_address = remote,
+    };
+    try testing.expect(resolved_derived_remote.shouldEnableTCPSockmap());
+    try testing.expect(resolved_derived_remote.shouldEnableUDPSockmap());
+}
+
+test "rule resolution flags any loopback upstream for sockmap auto" {
+    // Remote first + loopback second: resolvedForRule must mark the rule
+    // loopback-ineligible even though upstreams[0] is remote.
+    const remote_first = try resolveYamlForTest(
+        \\rules:
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    protocols: [tcp]
+        \\    upstreams:
+        \\      - { host: "192.0.2.1", port: 9001 }
+        \\      - { host: "127.0.0.1", port: 9002 }
+        \\
+    , null);
+    var remote_first_cycle = remote_first.cycle;
+    defer remote_first_cycle.deinit();
+    const remote_first_rule = remote_first.resolved.rules[0];
+    try testing.expectEqual(@as(usize, 2), remote_first_rule.upstream_addresses.len);
+    try testing.expect(!remote_first_rule.upstream_addresses[0].isLoopback());
+    try testing.expect(remote_first_rule.upstream_addresses[1].isLoopback());
+    const remote_first_resolved = resolvedForRule(remote_first_rule.effective, &remote_first_rule);
+    try testing.expectEqual(@as(?bool, true), remote_first_resolved.upstream_has_loopback);
+    try testing.expect(!remote_first_resolved.shouldEnableTCPSockmap());
+
+    // Loopback first + remote second flags the same way.
+    const loopback_first = try resolveYamlForTest(
+        \\rules:
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    protocols: [tcp]
+        \\    upstreams:
+        \\      - { host: "127.0.0.1", port: 9002 }
+        \\      - { host: "192.0.2.1", port: 9001 }
+        \\
+    , null);
+    var loopback_first_cycle = loopback_first.cycle;
+    defer loopback_first_cycle.deinit();
+    const loopback_first_rule = loopback_first.resolved.rules[0];
+    const loopback_first_resolved = resolvedForRule(loopback_first_rule.effective, &loopback_first_rule);
+    try testing.expectEqual(@as(?bool, true), loopback_first_resolved.upstream_has_loopback);
+    try testing.expect(!loopback_first_resolved.shouldEnableTCPSockmap());
+
+    // All-remote rule stays eligible in auto.
+    const all_remote = try resolveYamlForTest(
+        \\rules:
+        \\  - listen: { host: "127.0.0.1", port: 9000 }
+        \\    protocols: [tcp]
+        \\    upstreams:
+        \\      - { host: "192.0.2.1", port: 9001 }
+        \\      - { host: "192.0.2.2", port: 9002 }
+        \\
+    , null);
+    var all_remote_cycle = all_remote.cycle;
+    defer all_remote_cycle.deinit();
+    const all_remote_rule = all_remote.resolved.rules[0];
+    const all_remote_resolved = resolvedForRule(all_remote_rule.effective, &all_remote_rule);
+    try testing.expectEqual(@as(?bool, false), all_remote_resolved.upstream_has_loopback);
+    try testing.expect(all_remote_resolved.shouldEnableTCPSockmap());
 }
 
 fn hostBasedResolver(comptime listener_ip: []const u8) Resolver {
@@ -1633,8 +1782,8 @@ test "config.example.yaml parses with expected values" {
         \\#   maxUDPPendingDatagrams: auto   # legacy: unused by the batched UDP transport
         \\#   maxUDPPendingBytes: auto       # legacy: unused by the batched UDP transport
         \\# performance:
-        \\#   tcpSockmapAcceleration: auto
-        \\#   udpSockmapAcceleration: auto
+        \\#   tcpSockmapAcceleration: auto   # auto skips loopback upstreams
+        \\#   udpSockmapAcceleration: auto   # auto skips loopback upstreams
         \\#   udpSocketBufferBytes: 4194304   # 0 keeps kernel defaults; clamped to
         \\#                                   # net.core.rmem_max/wmem_max without CAP_NET_ADMIN
         \\#   udpIOThreads: auto              # UDP relay threads; auto = worker count

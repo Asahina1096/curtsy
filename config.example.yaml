@@ -29,8 +29,8 @@ upstream:
 #   maxUDPPendingDatagrams: auto   # legacy: unused by the batched UDP transport
 #   maxUDPPendingBytes: auto       # legacy: unused by the batched UDP transport
 # performance:
-#   tcpSockmapAcceleration: auto     # loopback/small-packet workloads should
-#                                    # benchmark disabled vs enabled explicitly
+#   tcpSockmapAcceleration: auto     # auto skips loopback upstreams; set
+#                                    # enabled to force the attempt
 #   udpSockmapAcceleration: auto     # auto skips loopback upstreams (UDP
 #                                    # sockmap had lower goodput + reordering
 #                                    # there); set enabled to force the attempt

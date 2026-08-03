@@ -537,9 +537,14 @@ pub fn udpRecvBatch(fd: fd_t, slots: []UdpSlot) Error!usize {
 pub const UdpRecvBatchIo = struct {
     headers: [udp_batch_capacity]linux.mmsghdr = undefined,
     vectors: [udp_batch_capacity]posix.iovec = undefined,
+    /// Number of slots/headers initialized by init(). recv/recvInto reject any
+    /// request that would reach past this count, so uninitialized headers are
+    /// never reset or read back into slots.
+    initialized_count: usize = 0,
 
     pub fn init(self: *UdpRecvBatchIo, slots: []const UdpSlot) void {
         const count = @min(slots.len, udp_batch_capacity);
+        self.initialized_count = count;
         for (slots[0..count], 0..) |*slot, i| {
             self.vectors[i] = .{ .base = slot.data, .len = slot.capacity };
             self.headers[i] = .{
@@ -558,13 +563,33 @@ pub const UdpRecvBatchIo = struct {
     }
 
     pub fn recv(self: *UdpRecvBatchIo, fd: fd_t, slots: []UdpSlot) Error!usize {
-        if (slots.len == 0) return errnoError(.INVAL);
-        const count = @min(slots.len, udp_batch_capacity);
-        for (self.headers[0..count]) |*header| {
+        return self.recvInto(fd, slots, 0);
+    }
+
+    /// Receives into the suffix `slots[offset..]`, appending at most
+    /// `slots.len - offset` datagrams behind previously received ones without
+    /// touching the earlier slots or their headers. `offset` must be within
+    /// the slot array the instance was initialized with; slots beyond the
+    /// array never have their headers reset, so a caller can coalesce several
+    /// nonblocking recvmmsg calls into one 64-slot batch before forwarding.
+    /// Returns the datagram count received by this call (0 on EAGAIN/EINTR).
+    /// Rejects empty slices, slices longer than init() initialized or than the
+    /// 64-slot syscall capacity, and offsets at or past the end, all before
+    /// any header is touched or syscall issued.
+    pub fn recvInto(self: *UdpRecvBatchIo, fd: fd_t, slots: []UdpSlot, offset: usize) Error!usize {
+        if (slots.len == 0 or
+            slots.len > self.initialized_count or
+            slots.len > udp_batch_capacity or
+            offset >= slots.len)
+        {
+            return errnoError(.INVAL);
+        }
+        const count = slots.len - offset;
+        for (self.headers[offset .. offset + count]) |*header| {
             header.hdr.namelen = @sizeOf(posix.sockaddr.storage);
             header.len = 0;
         }
-        const rc = linux.recvmmsg(fd, &self.headers, @intCast(count), linux.MSG.DONTWAIT, null);
+        const rc = linux.recvmmsg(fd, self.headers[offset..].ptr, @intCast(count), linux.MSG.DONTWAIT, null);
         const e = linux.errno(rc);
         switch (e) {
             .SUCCESS => {},
@@ -572,9 +597,9 @@ pub const UdpRecvBatchIo = struct {
             else => return errnoError(e),
         }
         const received: usize = @intCast(rc);
-        for (slots[0..received], 0..) |*slot, i| {
-            slot.length = self.headers[i].len;
-            slot.address_length = self.headers[i].hdr.namelen;
+        for (slots[offset .. offset + received], 0..) |*slot, i| {
+            slot.length = self.headers[offset + i].len;
+            slot.address_length = self.headers[offset + i].hdr.namelen;
         }
         return received;
     }
@@ -888,6 +913,125 @@ test "batched udp send/recv roundtrip between loopback sockets" {
 
     // Both datagrams consumed: next batch reports "would block" as 0.
     try testing.expectEqual(@as(usize, 0), try udpRecvBatch(listen_fd, &recv_slots));
+}
+
+test "udp recv batch io appends into unused slots without overwriting" {
+    const listen_address = loopbackV4Generic(0);
+    var bound: BoundAddress = undefined;
+    const listen_fd = try udpListenSocket(&listen_address, @sizeOf(posix.sockaddr.in), &bound);
+    defer closeFd(listen_fd);
+
+    const bound_in: *const posix.sockaddr.in = @ptrCast(&bound.address);
+    const destination = loopbackV4Generic(std.mem.bigToNative(u16, bound_in.port));
+    const send_fd = try udpUpstreamSocket(&destination, @sizeOf(posix.sockaddr.in));
+    defer closeFd(send_fd);
+
+    var buffers: [8][16]u8 = undefined;
+    var recv_slots: [8]UdpSlot = undefined;
+    for (&recv_slots, 0..) |*slot, i| {
+        slot.* = .{ .data = &buffers[i], .capacity = buffers[i].len };
+    }
+    var io = UdpRecvBatchIo{};
+    io.init(&recv_slots);
+
+    // Wave 1: two datagrams land before the first recvmmsg.
+    var first = "first-a".*;
+    var second = "second-b".*;
+    const wave_one = [_]UdpSlot{
+        .{ .data = &first, .length = first.len },
+        .{ .data = &second, .length = second.len },
+    };
+    try testing.expectEqual(@as(usize, 2), try udpSendBatch(send_fd, null, 0, &wave_one));
+
+    var offset: usize = 0;
+    for (0..100) |_| {
+        const received = try io.recvInto(listen_fd, &recv_slots, offset);
+        offset += received;
+        if (offset == 2) break;
+        if (received == 0) {
+            const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = linux.nanosleep(&delay, null);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), offset);
+
+    // Wave 2: three more datagrams append behind the first two without
+    // touching the earlier slots' lengths.
+    var third = "third-c".*;
+    var fourth = "fourth-d".*;
+    var fifth = "fifth-e".*;
+    const wave_two = [_]UdpSlot{
+        .{ .data = &third, .length = third.len },
+        .{ .data = &fourth, .length = fourth.len },
+        .{ .data = &fifth, .length = fifth.len },
+    };
+    try testing.expectEqual(@as(usize, 3), try udpSendBatch(send_fd, null, 0, &wave_two));
+    while (offset < 5) {
+        const received = try io.recvInto(listen_fd, &recv_slots, offset);
+        if (received == 0) {
+            const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = linux.nanosleep(&delay, null);
+            continue;
+        }
+        offset += received;
+    }
+    try testing.expectEqual(@as(usize, 5), offset);
+
+    try testing.expectEqualStrings("first-a", buffers[0][0..recv_slots[0].length]);
+    try testing.expectEqualStrings("second-b", buffers[1][0..recv_slots[1].length]);
+    try testing.expectEqualStrings("third-c", buffers[2][0..recv_slots[2].length]);
+    try testing.expectEqualStrings("fourth-d", buffers[3][0..recv_slots[3].length]);
+    try testing.expectEqualStrings("fifth-e", buffers[4][0..recv_slots[4].length]);
+}
+
+test "udp recv batch io rejects out-of-range slots and offsets without a syscall" {
+    var buffers: [8][16]u8 = undefined;
+    var recv_slots: [8]UdpSlot = undefined;
+    for (&recv_slots, 0..) |*slot, i| {
+        slot.* = .{ .data = &buffers[i], .capacity = buffers[i].len };
+    }
+    var io = UdpRecvBatchIo{};
+    io.init(&recv_slots);
+
+    // A slice longer than init() recorded is rejected; the invalid fd proves
+    // the check fires before any recvmmsg (and before touching headers).
+    var extra_buffers: [4][16]u8 = undefined;
+    var oversized: [12]UdpSlot = undefined;
+    for (&oversized, 0..) |*slot, i| {
+        slot.* = .{ .data = if (i < 8) &buffers[i] else &extra_buffers[i - 8], .capacity = 16 };
+    }
+    try testing.expectError(error.Invalid, io.recv(-1, &oversized));
+    try testing.expectError(error.Invalid, io.recvInto(-1, &oversized, 0));
+
+    // Empty slices and offsets at or past the end are rejected.
+    const empty: []UdpSlot = &.{};
+    try testing.expectError(error.Invalid, io.recv(-1, empty));
+    try testing.expectError(error.Invalid, io.recvInto(-1, &recv_slots, recv_slots.len));
+    try testing.expectError(error.Invalid, io.recvInto(-1, &recv_slots, recv_slots.len + 1));
+
+    // Over the 64-slot syscall capacity is rejected even though init() clamps
+    // to 64; the uninitialized tail must never be reachable.
+    var huge_buffers: [65][16]u8 = undefined;
+    var over_capacity: [65]UdpSlot = undefined;
+    for (&over_capacity, 0..) |*slot, i| {
+        slot.* = .{ .data = &huge_buffers[i], .capacity = huge_buffers[i].len };
+    }
+    var big_io = UdpRecvBatchIo{};
+    big_io.init(&over_capacity);
+    try testing.expectEqual(@as(usize, 64), big_io.initialized_count);
+    try testing.expectError(error.Invalid, big_io.recv(-1, &over_capacity));
+    try testing.expectError(error.Invalid, big_io.recvInto(-1, &over_capacity, 0));
+
+    // An offset that would reach into the uninitialized tail of a smaller
+    // instance is rejected too.
+    var small: [4]UdpSlot = undefined;
+    for (&small, 0..) |*slot, i| {
+        slot.* = .{ .data = &buffers[i], .capacity = buffers[i].len };
+    }
+    var small_io = UdpRecvBatchIo{};
+    small_io.init(&small);
+    try testing.expectError(error.Invalid, small_io.recvInto(-1, &small, small.len));
+    try testing.expectError(error.Invalid, small_io.recvInto(-1, &small, small.len + 1));
 }
 
 test "udp send batch io reuses storage across addressed, connected and partial sends" {

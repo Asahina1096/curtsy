@@ -224,6 +224,7 @@ pub const UdpListener = struct {
                 .configuration = snapshot.configuration,
                 .listen_addresses = slot.listen_addresses,
                 .upstream_address = snapshot.upstream_address,
+                .upstream_has_loopback = snapshot.upstream_has_loopback,
             });
             runtime_ptr = &slot.runtime;
         }
@@ -255,6 +256,7 @@ pub const UdpListener = struct {
                     .configuration = configuration.configuration,
                     .listen_addresses = slot.listen_addresses,
                     .upstream_address = configuration.upstream_address,
+                    .upstream_has_loopback = configuration.upstream_has_loopback,
                 });
             }
             slot.engine.updateAccelerator();
@@ -407,12 +409,16 @@ pub const UdpRelayEngine = struct {
     const sweep_interval_ms: i32 = 50;
     /// Cap on recvmmsg batches drained per readiness event so one hot socket
     /// cannot starve the other ready fds on this engine.
-    const max_batches_per_drain: usize = 16;
+    pub const max_batches_per_drain: usize = 16;
     /// After a sockmap pairing failure (typically a full map), skip further
     /// acceleration attempts for this long instead of paying the failed
     /// socket+pair cost for every new association.
     const accelerate_failure_cooldown_ms: u64 = 60_000;
     const send_error_log_interval_ms: u64 = 1_000;
+    /// Batch statistics are accumulated per engine and emitted at debug level
+    /// on a fixed cadence; the counters are plain fields confined to the
+    /// engine's I/O thread, so logging costs no per-datagram synchronization.
+    const stats_log_interval_ms: u64 = 10_000;
 
     /// Hashes SocketAddr by its significant bytes only (matching
     /// SocketAddr.eql) instead of field-by-field autoHash.
@@ -485,6 +491,13 @@ pub const UdpRelayEngine = struct {
     /// thread like the rest of the state below; avoids rebuilding the header
     /// set on the stack for every send batch.
     send_io: bpf.UdpSendBatchIo = undefined,
+    /// Debug batch statistics, reset every stats_log_interval_ms. Only the
+    /// engine's I/O thread touches them; nothing per-datagram is shared.
+    recv_calls: u64 = 0,
+    recv_datagrams: u64 = 0,
+    send_calls: u64 = 0,
+    send_datagrams: u64 = 0,
+    last_stats_log_ms: u64 = 0,
 
     pub fn init(
         runtime: *RuntimeConfiguration,
@@ -761,7 +774,34 @@ pub const UdpRelayEngine = struct {
                 self.last_sweep_ms = now_ms;
                 self.sweepExpiredAssociations(now_ms);
             }
+            if (now_ms -% self.last_stats_log_ms >= stats_log_interval_ms) {
+                self.last_stats_log_ms = now_ms;
+                self.logBatchStats();
+            }
         }
+    }
+
+    /// Rate-limited debug view of aggregate batch utilization. Metadata only:
+    /// never logs datagram contents. Averages are the per-syscall batch fill,
+    /// i.e. datagrams divided by syscalls since the previous snapshot. Idle
+    /// windows are skipped so silent engines never emit log lines.
+    fn logBatchStats(self: *UdpRelayEngine) void {
+        const recv_calls = self.recv_calls;
+        const recv_datagrams = self.recv_datagrams;
+        const send_calls = self.send_calls;
+        const send_datagrams = self.send_datagrams;
+        self.recv_calls = 0;
+        self.recv_datagrams = 0;
+        self.send_calls = 0;
+        self.send_datagrams = 0;
+        if (recv_calls == 0 and send_calls == 0) return;
+        if (!self.log.isEnabled(log.Level.debug)) return;
+        const recv_avg: u64 = if (recv_calls > 0) recv_datagrams / recv_calls else 0;
+        const send_avg: u64 = if (send_calls > 0) send_datagrams / send_calls else 0;
+        self.log.debug(
+            "udp batch stats recv_calls={d} recv_datagrams={d} recv_avg={d} send_calls={d} send_datagrams={d} send_avg={d}",
+            .{ recv_calls, recv_datagrams, recv_avg, send_calls, send_datagrams, send_avg },
+        );
     }
 
     fn processCommands(self: *UdpRelayEngine) void {
@@ -864,6 +904,60 @@ pub const UdpRelayEngine = struct {
         }
     }
 
+    const RecvBatchResult = struct {
+        /// Datagrams buffered in slots[0..count]; forward these first.
+        count: usize,
+        /// recvmmsg syscalls consumed by this call, including the EAGAIN or
+        /// failed one; the caller subtracts this from its remaining budget.
+        calls: usize,
+        /// The socket reported EAGAIN (nothing more is queued); drain no
+        /// further.
+        would_block: bool,
+        /// A recvmmsg syscall failed after possibly buffering count
+        /// datagrams; the caller should log the failure and tear the socket
+        /// down after forwarding the partial batch (never drop received data).
+        read_failed: bool,
+    };
+
+    /// Aggregates datagrams from one ready socket: repeatedly receives into
+    /// the unused suffix of the 64-slot array with nonblocking recvmmsg until
+    /// the array is full or the socket reports EAGAIN, counting every syscall
+    /// (including EAGAIN and errors) against the caller's remaining
+    /// `max_batches_per_drain` fairness budget so one hot socket cannot
+    /// starve the other ready fds on this engine. Returns a consolidated
+    /// batch of up to `batch_size` datagrams in slots[0..], the exact syscall
+    /// count consumed, and how the drain ended; the caller forwards each
+    /// returned batch, subtracts `calls`, and continues only while the batch
+    /// filled and budget remains, so a hot source can produce several
+    /// 64-datagram batches per readiness while never exceeding 16 recvmmsg
+    /// calls total.
+    fn drainRecvBatch(
+        self: *UdpRelayEngine,
+        fd: fd_t,
+        recv_slots: *[batch_size]bpf.UdpSlot,
+        recv_io: anytype,
+        remaining_calls: usize,
+    ) RecvBatchResult {
+        var offset: usize = 0;
+        var calls: usize = 0;
+        var would_block = false;
+        while (calls < remaining_calls and offset < batch_size) {
+            const received = recv_io.recvInto(fd, &recv_slots.*, offset) catch {
+                self.recv_calls += 1;
+                return .{ .count = offset, .calls = calls + 1, .would_block = false, .read_failed = true };
+            };
+            calls += 1;
+            self.recv_calls += 1;
+            self.recv_datagrams += received;
+            if (received == 0) { // EAGAIN: the socket has nothing more
+                would_block = true;
+                break;
+            }
+            offset += received;
+        }
+        return .{ .count = offset, .calls = calls, .would_block = would_block, .read_failed = false };
+    }
+
     fn drainListen(
         self: *UdpRelayEngine,
         fd: fd_t,
@@ -872,14 +966,18 @@ pub const UdpRelayEngine = struct {
         recv_io: *bpf.UdpRecvBatchIo,
         now_ms: u64,
     ) void {
-        var batches: usize = 0;
-        while (batches < max_batches_per_drain) : (batches += 1) {
-            const received = recv_io.recv(fd, recv_slots) catch {
+        var remaining = max_batches_per_drain;
+        while (remaining > 0) {
+            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            remaining -= result.calls;
+            if (result.count > 0) {
+                self.forwardClientDatagrams(result.count, fd, recv_slots, send_slots, now_ms);
+            }
+            if (result.read_failed) {
                 self.log.err("udp listener read failed error={s}", .{errnoDescription()});
                 return;
-            };
-            if (received == 0) return;
-            self.forwardClientDatagrams(received, fd, recv_slots, send_slots, now_ms);
+            }
+            if (result.would_block or result.count < batch_size) return;
         }
     }
 
@@ -956,23 +1054,27 @@ pub const UdpRelayEngine = struct {
         now_ms: u64,
     ) void {
         const association = self.associations.getPtr(client) orelse return;
-        var batches: usize = 0;
-        while (batches < max_batches_per_drain) : (batches += 1) {
-            const received = recv_io.recv(fd, recv_slots) catch {
+        var remaining = max_batches_per_drain;
+        while (remaining > 0) {
+            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            remaining -= result.calls;
+            if (result.count > 0) {
+                association.last_activity_ms = now_ms;
+                _ = self.sendAllDatagrams(
+                    association.upstream_fd,
+                    null,
+                    0,
+                    recv_slots[0..result.count],
+                    "direction=client_to_upstream",
+                    now_ms,
+                );
+            }
+            if (result.read_failed) {
                 self.log.err("udp client socket read failed client={f} error={s}", .{ client, errnoDescription() });
                 self.closeAssociation(client);
                 return;
-            };
-            if (received == 0) return;
-            association.last_activity_ms = now_ms;
-            _ = self.sendAllDatagrams(
-                association.upstream_fd,
-                null,
-                0,
-                recv_slots[0..received],
-                "direction=client_to_upstream",
-                now_ms,
-            );
+            }
+            if (result.would_block or result.count < batch_size) return;
         }
     }
 
@@ -985,31 +1087,35 @@ pub const UdpRelayEngine = struct {
         now_ms: u64,
     ) void {
         const association = self.associations.getPtr(client) orelse return;
-        var batches: usize = 0;
-        while (batches < max_batches_per_drain) : (batches += 1) {
-            const received = recv_io.recv(fd, recv_slots) catch {
+        var remaining = max_batches_per_drain;
+        while (remaining > 0) {
+            const result = self.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            remaining -= result.calls;
+            if (result.count > 0) {
+                association.last_activity_ms = now_ms;
+                if (!association.reported_success) {
+                    association.reported_success = true;
+                    if (self.upstream_selector) |selector| selector.reportSuccess(association.upstream_addr);
+                }
+                const address: *const posix.sockaddr = @ptrCast(&association.client_address);
+                _ = self.sendAllDatagrams(
+                    association.listen_fd,
+                    address,
+                    association.client_address_length,
+                    recv_slots[0..result.count],
+                    "direction=upstream_to_client",
+                    now_ms,
+                );
+            }
+            if (result.read_failed) {
                 self.log.err("udp upstream error client={f} error={s}", .{ client, errnoDescription() });
                 if (self.upstream_selector) |selector| {
                     selector.reportFailure(association.upstream_addr, now_ms * std.time.ns_per_ms);
                 }
                 self.closeAssociation(client);
                 return;
-            };
-            if (received == 0) return;
-            association.last_activity_ms = now_ms;
-            if (!association.reported_success) {
-                association.reported_success = true;
-                if (self.upstream_selector) |selector| selector.reportSuccess(association.upstream_addr);
             }
-            const address: *const posix.sockaddr = @ptrCast(&association.client_address);
-            _ = self.sendAllDatagrams(
-                association.listen_fd,
-                address,
-                association.client_address_length,
-                recv_slots[0..received],
-                "direction=upstream_to_client",
-                now_ms,
-            );
+            if (result.would_block or result.count < batch_size) return;
         }
     }
 
@@ -1026,9 +1132,12 @@ pub const UdpRelayEngine = struct {
         var sent_total: usize = 0;
         while (sent_total < slots.len) {
             const sent = self.send_io.send(fd, address, address_length, slots[sent_total..]) catch {
+                self.send_calls += 1;
                 self.noteSendError(slots.len - sent_total, context, errnoDescription(), now_ms);
                 return false;
             };
+            self.send_calls += 1;
+            self.send_datagrams += sent;
             if (sent == 0) {
                 self.noteSendError(slots.len - sent_total, context, "sendmmsg made no progress", now_ms);
                 return false;
@@ -1557,4 +1666,205 @@ test "udp selector reports failures and reroutes after eviction" {
     try testing.expect(got_echo);
 
     try testing.expect(pool.pick(live, monotonicMilliseconds() * std.time.ns_per_ms).eql(live));
+}
+
+/// Never-started engine shell used to drive drainRecvBatch against a real
+/// UDP socket. Only the batch-statistics fields are exercised; no I/O thread
+/// spawns and no listener resources are bound, so destroy() is a pure teardown
+/// of the empty session maps. Allocated so the engine's runtime/budget
+/// pointers stay valid for the harness lifetime.
+const DrainHarness = struct {
+    engine: UdpRelayEngine,
+    runtime: RuntimeConfiguration,
+    budget: UdpAssociationBudget,
+    logger: LogStore,
+    resolved_listen: []SocketAddr,
+    buffer: [bpf.udp_batch_capacity * 16]u8 = undefined,
+    recv_slots: [bpf.udp_batch_capacity]bpf.UdpSlot = undefined,
+    recv_io: bpf.UdpRecvBatchIo = undefined,
+
+    fn init() !*DrainHarness {
+        const self = try testing.allocator.create(DrainHarness);
+        errdefer testing.allocator.destroy(self);
+        const resolved = try makeUdpTestResolved(testing.allocator, 9);
+        errdefer testing.allocator.free(resolved.listen_addresses);
+        self.logger = LogStore.init("critical");
+        self.resolved_listen = resolved.listen_addresses;
+        self.runtime = RuntimeConfiguration.init(resolved);
+        self.engine = UdpRelayEngine.init(&self.runtime, &self.logger, &self.budget, testing.allocator, 1, null, null, false, null);
+        for (&self.recv_slots, 0..) |*slot, i| {
+            slot.* = .{ .data = self.buffer[i * 16 ..][0..16].ptr, .capacity = 16 };
+        }
+        self.recv_io.init(&self.recv_slots);
+        return self;
+    }
+
+    fn deinit(self: *DrainHarness) void {
+        self.engine.destroy();
+        testing.allocator.free(self.resolved_listen);
+        testing.allocator.destroy(self);
+    }
+};
+
+fn loopbackV4Socket(port: u16) posix.sockaddr {
+    const addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    return @bitCast(addr);
+}
+
+test "udp drain budget counts eagain and error recvmmsg syscalls" {
+    const listen_address = loopbackV4Socket(0);
+    var bound: bpf.BoundAddress = undefined;
+    const fd = try bpf.udpListenSocket(&listen_address, @sizeOf(posix.sockaddr.in), &bound);
+    defer closeFd(fd);
+
+    const harness = try DrainHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    const recv_slots = &harness.recv_slots;
+    const recv_io = &harness.recv_io;
+
+    // Empty socket: the single recvmmsg reports EAGAIN and is counted, so a
+    // readiness event that turns out to be spurious still bills its syscall.
+    const eagain = engine.drainRecvBatch(fd, recv_slots, recv_io, UdpRelayEngine.max_batches_per_drain);
+    try testing.expectEqual(@as(usize, 0), eagain.count);
+    try testing.expectEqual(@as(usize, 1), eagain.calls);
+    try testing.expect(eagain.would_block);
+    try testing.expect(!eagain.read_failed);
+    try testing.expectEqual(@as(u64, 1), engine.recv_calls);
+    try testing.expectEqual(@as(u64, 0), engine.recv_datagrams);
+
+    // A non-socket fd makes recvmmsg fail (ENOTSOCK): the failed syscall is
+    // counted exactly once and the drain ends with read_failed so the caller
+    // tears the socket down after forwarding any partial batch.
+    const event_fd = try bpf.eventfdCreate();
+    defer closeFd(event_fd);
+    const failed = engine.drainRecvBatch(event_fd, recv_slots, recv_io, UdpRelayEngine.max_batches_per_drain);
+    try testing.expectEqual(@as(usize, 0), failed.count);
+    try testing.expectEqual(@as(usize, 1), failed.calls);
+    try testing.expect(!failed.would_block);
+    try testing.expect(failed.read_failed);
+    try testing.expectEqual(@as(u64, 2), engine.recv_calls);
+    try testing.expectEqual(@as(u64, 0), engine.recv_datagrams);
+}
+
+test "udp drain budget yields multiple consolidated batches within one readiness" {
+    const listen_address = loopbackV4Socket(0);
+    var bound: bpf.BoundAddress = undefined;
+    const fd = try bpf.udpListenSocket(&listen_address, @sizeOf(posix.sockaddr.in), &bound);
+    defer closeFd(fd);
+
+    const bound_in: *const posix.sockaddr.in = @ptrCast(&bound.address);
+    const destination = loopbackV4Socket(std.mem.bigToNative(u16, bound_in.port));
+    const send_fd = try bpf.udpUpstreamSocket(&destination, @sizeOf(posix.sockaddr.in));
+    defer closeFd(send_fd);
+
+    const harness = try DrainHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    const recv_slots = &harness.recv_slots;
+    const recv_io = &harness.recv_io;
+
+    // Queue 200 datagrams (three full 64-datagram batches plus a trailing 8)
+    // before draining, then let loopback delivery settle.
+    const payload = "drain-budget-datagram";
+    for (0..200) |_| {
+        const rc = linux.sendto(send_fd, payload.ptr, payload.len, linux.MSG.NOSIGNAL, null, 0);
+        try testing.expect(linux.errno(rc) == .SUCCESS);
+    }
+    sleepMs(50);
+
+    // Drive the production readiness loop (mirroring drainListen/drainUpstream):
+    // forward each consolidated batch, subtract its exact syscall count, and
+    // continue only while the batch filled and budget remains. A would_block
+    // ends the round; a fresh readiness event gets a fresh 16-call budget.
+    var total: usize = 0;
+    var full_batches: usize = 0;
+    var max_calls_in_round: usize = 0;
+    var ended_on_eagain = false;
+    while (total < 200) {
+        var remaining = UdpRelayEngine.max_batches_per_drain;
+        var round_calls: usize = 0;
+        var round_full: usize = 0;
+        while (remaining > 0) {
+            const result = engine.drainRecvBatch(fd, recv_slots, recv_io, remaining);
+            remaining -= result.calls;
+            round_calls += result.calls;
+            total += result.count;
+            if (result.count == bpf.udp_batch_capacity) round_full += 1;
+            if (result.read_failed) break;
+            if (result.would_block) {
+                ended_on_eagain = true;
+                break;
+            }
+            if (result.count < bpf.udp_batch_capacity) break; // budget exhausted, not empty
+        }
+        max_calls_in_round = @max(max_calls_in_round, round_calls);
+        full_batches += round_full;
+        if (remaining > 0 and total < 200) sleepMs(1); // wait for the next wake
+    }
+
+    try testing.expectEqual(@as(usize, 200), total);
+    try testing.expectEqual(@as(u64, 200), engine.recv_datagrams);
+    try testing.expect(ended_on_eagain);
+    // A hot source yields multiple 64-datagram forward batches.
+    try testing.expect(full_batches >= 3);
+    // No single readiness event exceeded the 16 recvmmsg fairness cap.
+    try testing.expect(max_calls_in_round <= UdpRelayEngine.max_batches_per_drain);
+    // 200 datagrams need at least ceil(200/64)=4 data syscalls plus at least
+    // one EAGAIN; every attempted recvmmsg was counted, none dropped.
+    try testing.expect(engine.recv_calls >= 5);
+}
+
+const ScriptedRecvResult = union(enum) {
+    datagrams: usize,
+    failed: bpf.Error,
+};
+
+/// Deterministic recvmmsg front-end for drainRecvBatch: drains issue no real
+/// syscalls and replay a fixed outcome script, so a success-then-error drain
+/// is reproducible regardless of kernel scheduling.
+const ScriptedRecvIo = struct {
+    results: []const ScriptedRecvResult,
+    call_index: usize = 0,
+
+    fn recvInto(self: *ScriptedRecvIo, fd: fd_t, slots: []bpf.UdpSlot, offset: usize) bpf.Error!usize {
+        _ = fd;
+        const result = self.results[self.call_index];
+        self.call_index += 1;
+        switch (result) {
+            .datagrams => |count| {
+                for (slots[offset .. offset + count]) |*slot| {
+                    slot.length = 1;
+                    slot.address_length = @sizeOf(posix.sockaddr.in);
+                }
+                return count;
+            },
+            .failed => |e| return e,
+        }
+    }
+};
+
+test "udp drain budget counts success then error without re-adding work" {
+    var harness = try DrainHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    const recv_slots = &harness.recv_slots;
+
+    var script = ScriptedRecvIo{ .results = &.{
+        .{ .datagrams = 1 },
+        .{ .datagrams = 1 },
+        .{ .failed = bpf.Error.Unexpected },
+    } };
+    const result = engine.drainRecvBatch(-1, recv_slots, &script, UdpRelayEngine.max_batches_per_drain);
+    try testing.expectEqual(@as(usize, 2), result.count);
+    try testing.expectEqual(@as(usize, 3), result.calls);
+    try testing.expect(!result.would_block);
+    try testing.expect(result.read_failed);
+    // Two successes plus the failing syscall: exactly three calls.
+    try testing.expectEqual(@as(u64, 3), engine.recv_calls);
+    // Only the two successfully received datagrams are counted.
+    try testing.expectEqual(@as(u64, 2), engine.recv_datagrams);
 }

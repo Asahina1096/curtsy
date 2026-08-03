@@ -12,9 +12,10 @@
 //!   queue exceeds 2 MiB and resumes below 1 MiB;
 //! - a global TCPBufferBudget caps queued userspace bytes across all workers;
 //! - tcp_idle_seconds closes connections with no read/write activity;
-//! - TCP sockmap acceleration (auto/enabled/disabled; auto tries every
-//!   upstream including loopback) with per-connection fallback to the
-//!   userspace relay, idle enforced through the BPF activity timestamps;
+//! - TCP sockmap acceleration (auto/enabled/disabled; auto skips loopback
+//!   upstreams where the SK_SKB/sockhash per-packet cost can exceed the
+//!   userspace relay) with per-connection fallback to the userspace relay,
+//!   idle enforced through the BPF activity timestamps;
 //! - existing connections keep their upstream and acceleration mode across
 //!   configuration reloads.
 //!
@@ -120,6 +121,19 @@ fn spliceNonBlocking(fd_in: fd_t, fd_out: fd_t, len: usize, more: bool) usize {
         len,
         flags,
     );
+}
+
+/// Errnos from a failed outgoing splice that only mean the peer socket died
+/// (closed, reset, or gone). The worker pipe and splice support are intact,
+/// so the residual payload can be drained and only the connection dropped.
+/// Anything else (EINVAL, ENOSYS, EBADF, ...) is a structural failure of the
+/// shared worker pipe and retires it so later connections fall back to the
+/// buffered relay.
+fn isPeerSpliceErrno(errno: linux.E) bool {
+    return switch (errno) {
+        .PIPE, .CONNRESET, .NOTCONN, .SHUTDOWN => true,
+        else => false,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +820,11 @@ const Worker = struct {
     /// budgeted queue before relaySplice returns.
     splice_pipe: [2]fd_t = .{ -1, -1 },
     splice_capacity: usize = 0,
+    /// Worker-local rare-event counter of peer-scoped outgoing splice failures
+    /// (EPIPE/ECONNRESET/ENOTCONN/ESHUTDOWN): the pipe stayed intact and only
+    /// the connection died. Tests assert it grew before accepting that the
+    /// worker splice pipe survived a peer reset.
+    peer_splice_errors: usize = 0,
 
     const wake_tag: u64 = 0;
 
@@ -1425,6 +1444,19 @@ const Worker = struct {
                         .AGAIN => break,
                         .INTR => continue,
                         else => {
+                            // The pipe still holds `remaining` bytes of this
+                            // connection's payload. Peer errors
+                            // (EPIPE/ECONNRESET/...) drain them and kill only
+                            // this connection so later connections keep the
+                            // worker splice pipe; structural failures retire
+                            // the shared pipe for everyone. Neither path lets
+                            // pipe residue leak into the next dispatch.
+                            if (isPeerSpliceErrno(send_errno)) {
+                                self.peer_splice_errors += 1;
+                                self.discardPipeBytes(remaining);
+                                self.killConnection(connection);
+                                return true;
+                            }
                             self.closeSplicePipe();
                             self.killConnection(connection);
                             return true;
@@ -2055,11 +2087,16 @@ const EchoServer = struct {
             _ = self.open_handlers.fetchSub(1, .acq_rel);
         }
         var buf: [64 * 1_024]u8 = undefined;
+        // Poll with a short timeout so a handler can never block forever after
+        // stop() raises the stopping flag; it exits at the next poll deadline.
         while (!self.stopping.load(.acquire)) {
+            var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 50) catch return;
+            if (ready == 0) continue;
             const rc = linux.read(fd, &buf, buf.len);
             const errno = linux.errno(rc);
             if (errno != .SUCCESS) {
-                if (errno == .INTR) continue;
+                if (errno == .INTR or errno == .AGAIN) continue;
                 return;
             }
             const count: usize = @intCast(rc);
@@ -2083,9 +2120,159 @@ const EchoServer = struct {
         _ = linux.shutdown(state.listen_fd, linux.SHUT.RDWR);
         closeFd(state.listen_fd);
         state.thread.join();
-        var attempts: usize = 0;
-        while (state.open_handlers.load(.acquire) > 0 and attempts < 500) : (attempts += 1) {
-            sleepMs(2);
+        // Handlers exit at their next poll deadline once stopping is visible.
+        // Wait for the count to reach zero before freeing State so no detached
+        // handler can ever reference freed memory; no fixed bound is needed
+        // because the poll loop bounds the exit latency.
+        while (state.open_handlers.load(.acquire) > 0) {
+            sleepMs(1);
+        }
+        testing.allocator.destroy(state);
+    }
+};
+
+/// Threaded test upstream that resets its first accepted connection after
+/// reading a first chunk (so the relay is busy splicing when the reset
+/// lands) and echoes every later connection like EchoServer. Used to prove a
+/// connection-scoped splice failure cannot retire the shared worker pipe.
+const ResetThenEchoServer = struct {
+    state: *State,
+    port: u16,
+
+    const State = struct {
+        listen_fd: fd_t,
+        thread: std.Thread = undefined,
+        stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        open_handlers: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    };
+
+    fn start() !ResetThenEchoServer {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try testing.expect(linux.errno(rc) == .SUCCESS);
+        const fd: fd_t = @intCast(rc);
+        errdefer closeFd(fd);
+
+        const yes: i32 = 1;
+        _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(i32));
+
+        var addr = linux.sockaddr.in{
+            .port = 0,
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        };
+        try testing.expect(linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+        try testing.expect(linux.errno(linux.listen(fd, 128)) == .SUCCESS);
+
+        var bound: linux.sockaddr.in = undefined;
+        var bound_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        try testing.expect(linux.errno(linux.getsockname(fd, @ptrCast(&bound), &bound_len)) == .SUCCESS);
+
+        const state = try testing.allocator.create(State);
+        errdefer testing.allocator.destroy(state);
+        state.* = .{ .listen_fd = fd };
+        state.thread = try std.Thread.spawn(.{}, ResetThenEchoServer.acceptLoop, .{state});
+
+        return ResetThenEchoServer{
+            .state = state,
+            .port = std.mem.bigToNative(u16, bound.port),
+        };
+    }
+
+    fn acceptLoop(self: *State) void {
+        while (!self.stopping.load(.acquire)) {
+            const rc = linux.accept(self.listen_fd, null, null);
+            const errno = linux.errno(rc);
+            if (errno != .SUCCESS) {
+                if (errno == .INTR) continue;
+                return; // EBADF after stop() closed the listener
+            }
+            const fd: fd_t = @intCast(rc);
+            const connection_index = self.connections.fetchAdd(1, .acq_rel) + 1;
+            _ = self.open_handlers.fetchAdd(1, .acq_rel);
+            const handler = std.Thread.spawn(.{}, ResetThenEchoServer.connectionLoop, .{ self, fd, connection_index }) catch {
+                closeFd(fd);
+                _ = self.open_handlers.fetchSub(1, .acq_rel);
+                continue;
+            };
+            handler.detach();
+        }
+    }
+
+    fn connectionLoop(self: *State, fd: fd_t, connection_index: usize) void {
+        defer {
+            closeFd(fd);
+            _ = self.open_handlers.fetchSub(1, .acq_rel);
+        }
+        if (connection_index == 1) {
+            ResetThenEchoServer.armResetAfterFirstData(self, fd);
+            return;
+        }
+        ResetThenEchoServer.echoLoop(self, fd);
+    }
+
+    /// Blocks until the first byte arrives (proving the relay is forwarding)
+    /// then arms SO_LINGER 0 so the connection is reset on close. The reset
+    /// surfaces on the relay's outgoing splice as ECONNRESET while it is
+    /// still busy moving the client's flood. Polls with a short timeout so the
+    /// handler also exits promptly when stop() raises the stopping flag.
+    fn armResetAfterFirstData(self: *State, fd: fd_t) void {
+        var buf: [64 * 1_024]u8 = undefined;
+        const deadline = monotonicNowNs() + 5_000_000_000;
+        while (!self.stopping.load(.acquire) and monotonicNowNs() < deadline) {
+            var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 10) catch return;
+            if (ready == 0) continue;
+            const rc = linux.read(fd, &buf, buf.len);
+            const errno = linux.errno(rc);
+            if (errno == .SUCCESS and rc > 0) break;
+            if (errno == .INTR or errno == .AGAIN) continue;
+            return; // the relay closed the connection first
+        }
+        var linger = linux.linger{ .onoff = 1, .linger = 0 };
+        _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.LINGER, std.mem.asBytes(&linger), @sizeOf(linux.linger));
+    }
+
+    fn echoLoop(self: *State, fd: fd_t) void {
+        var buf: [64 * 1_024]u8 = undefined;
+        // Poll with a short timeout so a handler can never block forever after
+        // stop() raises the stopping flag; it exits at the next poll deadline.
+        while (!self.stopping.load(.acquire)) {
+            var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 50) catch return;
+            if (ready == 0) continue;
+            const rc = linux.read(fd, &buf, buf.len);
+            const errno = linux.errno(rc);
+            if (errno != .SUCCESS) {
+                if (errno == .INTR or errno == .AGAIN) continue;
+                return;
+            }
+            const count: usize = @intCast(rc);
+            if (count == 0) return;
+            var written: usize = 0;
+            while (written < count) {
+                const wrc = linux.sendto(fd, buf[written..count].ptr, count - written, linux.MSG.NOSIGNAL, null, 0);
+                const werrno = linux.errno(wrc);
+                if (werrno != .SUCCESS) {
+                    if (werrno == .INTR) continue;
+                    return;
+                }
+                written += @intCast(wrc);
+            }
+        }
+    }
+
+    fn stop(self: *ResetThenEchoServer) void {
+        const state = self.state;
+        state.stopping.store(true, .release);
+        _ = linux.shutdown(state.listen_fd, linux.SHUT.RDWR);
+        closeFd(state.listen_fd);
+        state.thread.join();
+        // Handlers exit at their next poll deadline once stopping is visible.
+        // Wait for the count to reach zero before freeing State so no detached
+        // handler can ever reference freed memory; no fixed bound is needed
+        // because the poll loop bounds the exit latency.
+        while (state.open_handlers.load(.acquire) > 0) {
+            sleepMs(1);
         }
         testing.allocator.destroy(state);
     }
@@ -2370,6 +2557,128 @@ test "tcp splice relay sustains a large transfer" {
     writer.join();
 }
 
+test "tcp splice fault classification keeps peer errors connection-scoped" {
+    try testing.expect(isPeerSpliceErrno(.PIPE));
+    try testing.expect(isPeerSpliceErrno(.CONNRESET));
+    try testing.expect(isPeerSpliceErrno(.NOTCONN));
+    try testing.expect(isPeerSpliceErrno(.SHUTDOWN));
+
+    // Structural pipe/splice failures stay worker-scoped.
+    try testing.expect(!isPeerSpliceErrno(.INVAL));
+    try testing.expect(!isPeerSpliceErrno(.NOSYS));
+    try testing.expect(!isPeerSpliceErrno(.OPNOTSUPP));
+    try testing.expect(!isPeerSpliceErrno(.BADF));
+    try testing.expect(!isPeerSpliceErrno(.AGAIN));
+    try testing.expect(!isPeerSpliceErrno(.INTR));
+    try testing.expect(!isPeerSpliceErrno(.SUCCESS));
+}
+
+/// Floods a socket until the connection dies; used to keep the relay busy
+/// inside its outgoing splice while the test upstream resets the peer.
+const FloodWriter = struct {
+    fn run(fd: fd_t) void {
+        var buf: [128 * 1_024]u8 = undefined;
+        @memset(&buf, 0x5d);
+        while (true) {
+            const rc = linux.sendto(fd, &buf, buf.len, linux.MSG.NOSIGNAL, null, 0);
+            const errno = linux.errno(rc);
+            if (errno != .SUCCESS) return; // relay reset the connection
+        }
+    }
+};
+
+test "tcp splice pipe survives an abnormal upstream reset on the same worker" {
+    var reset_echo = try ResetThenEchoServer.start();
+    defer reset_echo.stop();
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, reset_echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 1,
+        .enable_sockmap_acceleration = false,
+    });
+    defer listener.deinit();
+    try listener.start();
+    defer {
+        listener.stopAccepting();
+        listener.forceCloseConnections();
+    }
+    try testing.expectEqual(@as(usize, 1), listener.workers.len);
+    try testing.expect(listener.workers[0].splice_pipe[0] >= 0);
+
+    // Connection 1 floods the relay so it is almost always inside the
+    // outgoing splice loop when the upstream resets. The reset then surfaces
+    // as ECONNRESET on that connection's outgoing splice, which must drop the
+    // connection without closing the shared worker pipe.
+    const client_1 = try connectClient(listener.localAddresses()[0].port);
+    defer closeFd(client_1);
+    const one_connection = struct {
+        var listener_ptr: *TCPListener = undefined;
+        fn check() bool {
+            return listener_ptr.activeConnectionCount() == 1;
+        }
+    };
+    one_connection.listener_ptr = &listener;
+    try testing.expect(waitForCondition(one_connection.check, 5_000));
+
+    var send_timeout = linux.timeval{ .sec = 10, .usec = 0 };
+    _ = linux.setsockopt(client_1, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&send_timeout), @sizeOf(linux.timeval));
+    const flood = try std.Thread.spawn(.{}, FloodWriter.run, .{client_1});
+    defer flood.join();
+
+    const drained = struct {
+        var listener_ptr: *TCPListener = undefined;
+        fn check() bool {
+            return listener_ptr.activeConnectionCount() == 0;
+        }
+    };
+    drained.listener_ptr = &listener;
+    try testing.expect(waitForCondition(drained.check, 5_000));
+
+    // The reset must have landed inside the outgoing splice: wait for the
+    // peer-error branch to have executed (its counter write happens-before the
+    // worker's release store of active_connections, which the wait above
+    // acquired, so a plain field read is safe here).
+    const saw_peer_error = struct {
+        var listener_ptr: *TCPListener = undefined;
+        fn check() bool {
+            return listener_ptr.workers[0].peer_splice_errors > 0;
+        }
+    };
+    saw_peer_error.listener_ptr = &listener;
+    try testing.expect(waitForCondition(saw_peer_error.check, 5_000));
+
+    // The regression: the peer reset must not have retired the splice pipe.
+    try testing.expect(listener.workers[0].splice_pipe[0] >= 0);
+    try testing.expect(listener.workers[0].splice_capacity > 0);
+
+    // A later connection on the same worker still completes a large transfer
+    // through the intact splice pipe (upstream connection 2 echoes).
+    const client_2 = try connectClient(listener.localAddresses()[0].port);
+    defer closeFd(client_2);
+    _ = linux.setsockopt(client_2, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&send_timeout), @sizeOf(linux.timeval));
+
+    const total: usize = 4 * 1_024 * 1_024;
+    const send_buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(send_buf);
+    @memset(send_buf, 0xa1);
+    const recv_buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(recv_buf);
+
+    const Writer = struct {
+        fn run(fd: fd_t, bytes: []const u8) !void {
+            try writeAll(fd, bytes);
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{ client_2, send_buf });
+    errdefer writer.join();
+    try readFully(client_2, recv_buf);
+    try testing.expect(std.mem.allEqual(u8, recv_buf, 0xa1));
+    writer.join();
+}
+
 test "tcp listener uses resolved sockmap decision and allows test override" {
     var logger = log.LogStore.init("critical");
     const resolved = try makeTestResolved(testing.allocator, 9);
@@ -2385,18 +2694,29 @@ test "tcp listener uses resolved sockmap decision and allows test override" {
     };
     var counting = CountingLoader{};
 
-    // Auto mode attempts to load even for loopback upstreams.
+    // Auto mode skips loopback upstreams: the resolved 127.0.0.1 upstream is
+    // loopback, so no load attempt happens.
     var automatic = try TCPListener.init(resolved, &logger, .{
         .sockmap_loader = CountingLoader.load,
         .sockmap_loader_context = &counting,
     });
     defer automatic.deinit();
-    try testing.expectEqual(@as(usize, 1), counting.count);
+    try testing.expectEqual(@as(usize, 0), counting.count);
 
-    // Failed loads are retried on configuration updates while sockmap stays
-    // requested.
+    // Configuration updates keep skipping loopback while auto stays in effect.
     automatic.updateConfiguration(resolved);
-    try testing.expectEqual(@as(usize, 2), counting.count);
+    try testing.expectEqual(@as(usize, 0), counting.count);
+
+    // Auto still attempts a load for a remote upstream.
+    var remote = try makeTestResolved(testing.allocator, 9);
+    defer testing.allocator.free(remote.listen_addresses);
+    remote.upstream_address = config.SocketAddr.parseIp("192.0.2.1", 9).?;
+    var automatic_remote = try TCPListener.init(remote, &logger, .{
+        .sockmap_loader = CountingLoader.load,
+        .sockmap_loader_context = &counting,
+    });
+    defer automatic_remote.deinit();
+    try testing.expectEqual(@as(usize, 1), counting.count);
 
     // Explicit override forces the decision regardless of configuration.
     var disabled = try TCPListener.init(resolved, &logger, .{
@@ -2405,7 +2725,7 @@ test "tcp listener uses resolved sockmap decision and allows test override" {
         .sockmap_loader_context = &counting,
     });
     defer disabled.deinit();
-    try testing.expectEqual(@as(usize, 2), counting.count);
+    try testing.expectEqual(@as(usize, 1), counting.count);
 
     var enabled = try TCPListener.init(resolved, &logger, .{
         .enable_sockmap_acceleration = true,
@@ -2413,7 +2733,7 @@ test "tcp listener uses resolved sockmap decision and allows test override" {
         .sockmap_loader_context = &counting,
     });
     defer enabled.deinit();
-    try testing.expectEqual(@as(usize, 3), counting.count);
+    try testing.expectEqual(@as(usize, 2), counting.count);
 }
 
 test "tcp listening backlog can be updated in place" {

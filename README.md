@@ -143,7 +143,7 @@ TCP 转发路径使用每 worker 一个 epoll loop：每个 worker 持有 `SO_RE
 
 在具备 eBPF 权限的 Linux 上，Curtsy 还可创建 `BPF_MAP_TYPE_SOCKHASH`，并为每对客户端/上游 TCP socket 挂载 `SK_SKB` stream parser 与 verdict 程序。双向数据通过 `bpf_sk_redirect_hash` 在内核中直接转发，绕过用户态 relay 的 `tcp_recvmsg`、`tcp_sendmsg` 和用户缓冲区复制。BPF 同时记录双向最后活动时间，因此加速连接仍遵守 `tcpIdleSeconds`。
 
-`performance.tcpSockmapAcceleration` 控制该路径：`enabled` 强制尝试启用，`disabled` 始终使用用户态 relay，默认的 `auto` 对所有上游尝试启用。权限不足、内核不支持或单连接 sockhash 配对失败时，Curtsy 会记录日志并自动回退到用户态 relay。
+`performance.tcpSockmapAcceleration` 控制该路径：`enabled` 强制尝试启用，`disabled` 始终使用用户态 relay，默认的 `auto` 跳过 loopback 上游（该场景下 SK_SKB/sockhash 的逐包成本可能高于用户态 relay）。权限不足、内核不支持或单连接 sockhash 配对失败时，Curtsy 会记录日志并自动回退到用户态 relay。
 
 sockmap 是否更快取决于数据路径。跨主机、高 RTT 或 CPU 受限环境通常更可能受益；loopback 和部分小包场景中，SK_SKB/sockhash 的逐包成本可能高于用户态 relay。部署前应使用实际网卡、包大小和 RTT 分别压测 `enabled` 与 `disabled`，不要仅根据本机回环结果选择。
 
@@ -153,7 +153,7 @@ sockmap 是否更快取决于数据路径。跨主机、高 RTT 或 CPU 受限�
 
 ## UDP 性能
 
-UDP 转发由独立 I/O 线程池驱动（默认每 CPU 一个线程，可用 `performance.udpIOThreads` 固定）：每个线程持有一个经 `SO_REUSEPORT` 绑定同一地址的监听 socket，内核按客户端四元组 hash 把流量稳定分流到固定线程；各线程用 epoll 管理自己的监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发，会话在首个报文到达时同步建立。`maxUDPAssociations` 由所有线程共享，仍是全局上限而不是每线程配额。
+UDP 转发由独立 I/O 线程池驱动（默认每 CPU 一个线程，可用 `performance.udpIOThreads` 固定）：每个线程持有一个经 `SO_REUSEPORT` 绑定同一地址的监听 socket，内核按客户端四元组 hash 把流量稳定分流到固定线程——即一个 UDP 五元组会话始终固定到同一个引擎，不跨线程迁移。各线程用 epoll 管理自己的监听与上游 socket，收发均以 64 报文为一批。收到就绪事件后，引擎用非阻塞 `recvmmsg` 连续聚合：把多次 syscall 收到的报文合并成一批（最多 64 报文）再 `sendmmsg` 转发，一次就绪事件内最多执行 16 次 `recvmmsg`（公平配额），因此热 socket 可在单次就绪事件内转发多个 64 报文批，同时不会饿死同引擎其他就绪 socket。会话在首个报文到达时同步建立。`maxUDPAssociations` 由所有线程共享，仍是全局上限而不是每线程配额。
 
 UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触顶的瓶颈。`performance.udpSocketBufferBytes`（默认 4 MiB，设为 `0` 保持内核默认）会应用到监听、上游和每客户端 socket 的收发缓冲；没有 `CAP_NET_ADMIN` 时内核会把请求静默收敛到 `net.core.rmem_max` / `net.core.wmem_max`，因此建议部署时同步调大这两个 sysctl（Debian 包自带 `usr/lib/sysctl.d/60-curtsy.conf`，把两者设为 8 MiB）。
 
@@ -167,7 +167,7 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 - 所有超时单位均为秒，必须大于零，且不能超过 `9223372036` 秒。
 - UDP 会话按客户端 IP 与端口隔离，空闲超过 `udpSessionSeconds` 后回收。
 - 达到 `maxUDPAssociations` 后，新 UDP 客户端会被丢弃，已有会话不受影响；默认上限按系统内存自动计算。
-- UDP 转发由独立 I/O 线程池以 `recvmmsg`/`sendmmsg` 批量收发（64 报文/批），会话在首个报文到达时同步建立，不存在待转发缓冲窗口；`maxUDPPendingDatagrams` 和 `maxUDPPendingBytes` 仅为兼容旧配置保留，当前不再使用。
+- UDP 转发由独立 I/O 线程池以 `recvmmsg`/`sendmmsg` 批量收发（64 报文/批），就绪事件内用非阻塞 `recvmmsg` 合并聚合报文并转发多个 64 报文批，单次就绪最多 16 次接收 syscall；每个客户端五元组会话固定到一个 `SO_REUSEPORT` 引擎，会话在首个报文到达时同步建立，不存在待转发缓冲窗口；`maxUDPPendingDatagrams` 和 `maxUDPPendingBytes` 仅为兼容旧配置保留，当前不再使用。
 - 程序不会终止 TLS、检查流量内容或记录转发数据正文。
 
 ## 测试
