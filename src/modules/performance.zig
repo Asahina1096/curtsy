@@ -34,7 +34,6 @@ pub const Conf = PerformanceConfiguration;
 
 pub const module: fw.Module = .{
     .name = "performance",
-    .index = .performance,
     .directives = &directives,
     .create_conf = createConf,
     .validate = validate,

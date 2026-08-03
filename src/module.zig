@@ -14,8 +14,11 @@
 //! module drives nested dispatch and the core module merges rule confs over
 //! global confs (the merge_conf analogue).
 //!
-//! The registry below is the ngx_modules[] analogue: comptime-fixed, with an
-//! explicit module index per module used to address conf slots in the cycle.
+//! The registry below is the ngx_modules[] analogue: comptime-fixed, derived
+//! from the `module_types` list of module implementation types. Each type
+//! yields a generated ModuleRef carrying its descriptor pointer and conf slot
+//! index, so the module list order is the single source of truth for slot
+//! addressing in the cycle.
 
 const std = @import("std");
 const conf = @import("conf.zig");
@@ -31,9 +34,12 @@ const performance = @import("modules/performance.zig");
 const tcp = @import("modules/tcp.zig");
 const udp = @import("modules/udp.zig");
 
-/// Module conf slot indexes (explicit, like ngx_modules.c ordering).
-pub const Index = enum(usize) {
-    core = 0,
+/// Registry order (single source of truth): one module implementation type
+/// per entry. Adding or reordering a registered module only requires editing
+/// this list; the descriptor array, slot indexes and directive lookup follow
+/// from it automatically.
+pub const module_types = [_]type{
+    core,
     rules,
     timeouts,
     limits,
@@ -42,17 +48,36 @@ pub const Index = enum(usize) {
     performance,
 };
 
-pub const module_count = @typeInfo(Index).@"enum".fields.len;
+pub const module_count = module_types.len;
 
-/// The ngx_modules[] analogue.
-pub const modules: [module_count]Module = .{
-    core.module,
-    rules.module,
-    timeouts.module,
-    limits.module,
-    logging.module,
-    runtime.module,
-    performance.module,
+/// Resolve a registered module type's conf slot index at comptime. Type-safe
+/// `Cycle.conf(M)` / `Cycle.ruleConf(..., M)` call this instead of carrying a
+/// manually maintained per-module index.
+pub fn moduleSlot(comptime M: type) usize {
+    return comptime blk: {
+        for (module_types, 0..) |T, i| {
+            if (T == M) break :blk i;
+        }
+        @compileError("module type " ++ @typeName(M) ++ " is not registered in module_types");
+    };
+}
+
+/// One generated registry entry: the module descriptor plus its conf slot
+/// index. Directive lookup and lifecycle iteration walk this reference array
+/// instead of copying module descriptors.
+pub const ModuleRef = struct {
+    module: *const Module,
+    slot: usize,
+};
+
+/// The ngx_modules[] analogue: one generated reference per registered module
+/// in registry order. `slot` addresses the module's conf slots in a cycle.
+pub const modules: [module_count]ModuleRef = blk: {
+    var refs: [module_count]ModuleRef = undefined;
+    for (module_types, 0..) |M, i| {
+        refs[i] = .{ .module = &M.module, .slot = i };
+    }
+    break :blk refs;
 };
 
 /// Protocol modules registered by the data planes (ngx event module
@@ -83,7 +108,6 @@ pub const Directive = struct {
 /// Module lifecycle (ngx_module_t + ngx core module conf hooks).
 pub const Module = struct {
     name: []const u8,
-    index: Index,
     directives: []const Directive = &.{},
     /// Produce the module's global conf with defaults (create_main_conf).
     create_conf: ?*const fn (cycle: *conf.Cycle) error{OutOfMemory}!*anyopaque = null,
@@ -99,20 +123,20 @@ pub const Module = struct {
 };
 
 pub const Found = struct {
-    module: *const Module,
+    module: *const ModuleRef,
     directive: *const Directive,
 };
 
 /// Find the module directive handling `name` in `context`.
 pub fn findDirective(name: []const u8, context: Context) ?Found {
-    for (&modules) |*m| {
-        for (m.directives) |*d| {
+    for (&modules) |*ref| {
+        for (ref.module.directives) |*d| {
             if (!std.mem.eql(u8, d.name, name)) continue;
             const allowed = switch (context) {
                 .root => d.root,
                 .rule => d.rule,
             };
-            if (allowed) return .{ .module = m, .directive = d };
+            if (allowed) return .{ .module = ref, .directive = d };
         }
     }
     return null;
@@ -129,9 +153,17 @@ test "every directive resolves in its declared context" {
     try std.testing.expect(findDirective("performance", .rule) == null);
 }
 
-test "module indexes match the registry order" {
-    for (&modules, 0..) |*m, i| {
-        try std.testing.expectEqual(i, @intFromEnum(m.index));
+test "generated module references follow registry order" {
+    inline for (module_types, 0..) |M, i| {
+        try std.testing.expectEqual(@as(usize, i), modules[i].slot);
+        try std.testing.expectEqual(&M.module, modules[i].module);
     }
+    try std.testing.expectEqual(@as(usize, module_count), modules.len);
     try std.testing.expectEqual(@as(usize, 2), protocol_modules.len);
+}
+
+test "moduleSlot resolves registered module types" {
+    inline for (module_types, 0..) |M, i| {
+        try std.testing.expectEqual(@as(usize, i), moduleSlot(M));
+    }
 }

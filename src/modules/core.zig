@@ -221,7 +221,6 @@ pub const Conf = struct {
 
 pub const module: fw.Module = .{
     .name = "core",
-    .index = .core,
     .directives = &directives,
     .create_conf = createConf,
     .finalize = finalize,

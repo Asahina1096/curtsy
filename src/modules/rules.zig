@@ -51,7 +51,6 @@ pub const RuleConf = struct {
 
 pub const module: fw.Module = .{
     .name = "rules",
-    .index = .rules,
     .directives = &directives,
     .create_conf = createConf,
     .create_rule_conf = createRuleConf,

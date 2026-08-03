@@ -16,7 +16,6 @@ pub const Conf = RuntimeOptions;
 
 pub const module: fw.Module = .{
     .name = "runtime",
-    .index = .runtime,
     .directives = &directives,
     .create_conf = createConf,
     .validate = validate,

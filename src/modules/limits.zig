@@ -62,7 +62,6 @@ pub fn merge(global: LimitConfiguration, overrides: RuleLimitOverrides) LimitCon
 
 pub const module: fw.Module = .{
     .name = "limits",
-    .index = .limits,
     .directives = &directives,
     .create_conf = createConf,
     .create_rule_conf = createRuleConf,

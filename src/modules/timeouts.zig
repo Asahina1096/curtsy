@@ -40,7 +40,6 @@ pub fn merge(global: TimeoutConfiguration, overrides: RuleTimeoutOverrides) Time
 
 pub const module: fw.Module = .{
     .name = "timeouts",
-    .index = .timeouts,
     .directives = &directives,
     .create_conf = createConf,
     .create_rule_conf = createRuleConf,

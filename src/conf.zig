@@ -50,7 +50,7 @@ pub const Cycle = struct {
     /// Typed access to a module's global conf (module must exist and have
     /// run createConf).
     pub fn conf(self: *Cycle, comptime M: type) *M.Conf {
-        const slot = self.confs[@intFromEnum(M.module.index)] orelse unreachable;
+        const slot = self.confs[module.moduleSlot(M)] orelse unreachable;
         return @ptrCast(@alignCast(slot));
     }
 
@@ -58,7 +58,7 @@ pub const Cycle = struct {
     /// module has no rule context.
     pub fn ruleConf(self: *Cycle, bundle: *const RuleBundle, comptime M: type) ?*M.RuleConf {
         _ = self;
-        const slot = bundle.slots[@intFromEnum(M.module.index)] orelse return null;
+        const slot = bundle.slots[module.moduleSlot(M)] orelse return null;
         return @ptrCast(@alignCast(slot));
     }
 
@@ -102,9 +102,9 @@ pub fn loadYaml(gpa: Allocator, text: []const u8, diag: *Diagnostics) LoadError!
 
     // createConf: every module installs its defaults before any directive
     // runs, so set handlers only touch explicitly configured values.
-    for (&module.modules) |*m| {
-        if (m.create_conf) |create| {
-            cycle.confs[@intFromEnum(m.index)] = try create(&cycle);
+    for (&module.modules) |*ref| {
+        if (ref.module.create_conf) |create| {
+            cycle.confs[ref.slot] = try create(&cycle);
         }
     }
 
@@ -115,11 +115,11 @@ pub fn loadYaml(gpa: Allocator, text: []const u8, diag: *Diagnostics) LoadError!
         return error.InvalidConfiguration;
     }
 
-    for (&module.modules) |*m| {
-        if (m.finalize) |finalize| try finalize(&cycle);
+    for (&module.modules) |*ref| {
+        if (ref.module.finalize) |finalize| try finalize(&cycle);
     }
-    for (&module.modules) |*m| {
-        if (m.validate) |validate| try validate(&cycle);
+    for (&module.modules) |*ref| {
+        if (ref.module.validate) |validate| try validate(&cycle);
     }
     return cycle;
 }
@@ -148,7 +148,7 @@ pub fn dispatchMapping(cycle: *Cycle, mapping: []const yaml.Entry, context: modu
                 // First occurrence wins (legacy mappingGet semantics).
                 if (cycle.seenRoot(entry.key)) break :blk null;
                 try cycle.seen_root.append(arena, entry.key);
-                break :blk cycle.confs[@intFromEnum(found.module.index)].?;
+                break :blk cycle.confs[found.module.slot].?;
             },
             .rule => blk: {
                 const bundle = &cycle.rule_bundles.items[cycle.current_rule.?];
@@ -156,7 +156,7 @@ pub fn dispatchMapping(cycle: *Cycle, mapping: []const yaml.Entry, context: modu
                     if (std.mem.eql(u8, seen, entry.key)) break :blk null;
                 }
                 try bundle.seen.append(arena, entry.key);
-                break :blk bundle.slots[@intFromEnum(found.module.index)].?;
+                break :blk bundle.slots[found.module.slot].?;
             },
         } orelse continue;
 
@@ -172,9 +172,9 @@ pub fn beginRule(cycle: *Cycle, index: usize) error{OutOfMemory}!void {
         .index = index,
         .slots = .{null} ** module.module_count,
     };
-    for (&module.modules) |*m| {
-        if (m.create_rule_conf) |create| {
-            bundle.slots[@intFromEnum(m.index)] = try create(cycle);
+    for (&module.modules) |*ref| {
+        if (ref.module.create_rule_conf) |create| {
+            bundle.slots[ref.slot] = try create(cycle);
         }
     }
     try cycle.rule_bundles.append(cycle.allocator(), bundle);

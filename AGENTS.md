@@ -30,7 +30,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/
 基础设施（src/ 根）：
 
 - `src/main.zig`：命令行入口。一次运行就是一个配置 cycle：`conf.loadFile` 解析并校验 → `core.resolveForwarder` 解析地址 → `core.ForwarderService.run()`。配置错误退出码为 2。
-- `src/module.zig`：`Module`/`Directive` 类型、模块注册表（含显式模块索引，作 conf slot 下标）、指令查找、协议模块注册表。
+- `src/module.zig`：`Module`/`Directive` 类型、模块注册表（comptime 模块类型列表 `module_types` 为唯一排序来源，据此生成每条模块引用 `ModuleRef`，含描述符指针与 conf slot 下标）、指令查找、协议模块注册表。
 - `src/conf.zig`：配置引擎（Cycle）。解析 YAML → 各模块 createConf → 根键按指令表分发（未知键引擎直接拒绝，`rules` 与 `listen`/`upstream` 互斥在此检查）→ finalize → validate。rule 作用域经 `beginRule`/`dispatchMapping`/`endRule` 嵌套分发，每个规则产生一个 RuleBundle（各模块的规则级 conf slot）。
 - `src/yaml.zig`：YAML 子集解析器与标量解码助手（纯机制，不含任何配置语义）。
 - `src/net.zig`：`SocketAddr`、resolver（可注入测试）、listen 地址展开（`*` → 双栈通配对）、协议列表助手。

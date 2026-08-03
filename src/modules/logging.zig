@@ -17,7 +17,6 @@ pub const Conf = LogConfiguration;
 
 pub const module: fw.Module = .{
     .name = "logging",
-    .index = .logging,
     .directives = &directives,
     .create_conf = createConf,
     .validate = validate,
