@@ -13,8 +13,6 @@
 //!   -r, --rule SPEC     Repeatable multi-rule shorthand
 //!       --protocols L   tcp,udp protocol list (single-rule shorthand only)
 //!       --balance NAME  Balancer name (single-rule shorthand only)
-//!       --plugin PATH   Runtime plugin shared library (repeatable)
-//!       --plugin-config KEY=VALUE  Config for the most recent --plugin
 //!
 //! A run is one configuration cycle through the module engine (conf.zig):
 //! every module parses its own directives, the core module resolves addresses
@@ -30,9 +28,6 @@ const cli = @import("modules/cli.zig");
 const conf = @import("conf.zig");
 const core = @import("modules/core.zig");
 const log = @import("log.zig");
-const logging = @import("modules/logging.zig");
-const plugin = @import("plugin.zig");
-const plugins = @import("modules/plugins.zig");
 
 const version = "0.3.2";
 
@@ -60,10 +55,6 @@ const usage =
     \\      --protocols <list>      Comma-separated protocol names (single-rule shorthand)
     \\      --balance <name>        Balancer name: round_robin, source_hash,
     \\                              weighted_round_robin (single-rule shorthand)
-    \\      --plugin <path>         Runtime plugin path (repeatable; normalized
-    \\                              to an absolute path)
-    \\      --plugin-config <k=v>   Private config for the most recent --plugin
-    \\                              (repeatable)
     \\
 ;
 
@@ -113,21 +104,8 @@ pub fn main(init: std.process.Init) u8 {
     var owns_cycle = true;
     defer if (owns_cycle) cycle.deinit();
 
-    // Runtime plugins must be loaded before resolve: dynamic balancer and
-    // protocol names are registered by init and resolved afterward.
-    var bootstrap_logger = log.LogStore.init(cycle.conf(logging).level);
-    var plugin_manager = plugin.Manager.init(gpa, &bootstrap_logger);
-    var owns_plugin_manager = true;
-    defer if (owns_plugin_manager) plugin_manager.deinit();
-    const desired_plugins = plugins.specs(&cycle);
-    var prepared_plugins = plugin_manager.prepare(desired_plugins) catch |err| {
-        writeErr("curtsy: configuration error: unable to load plugins: {s}\n", .{@errorName(err)});
-        return 2;
-    };
-    plugin_manager.commit(&prepared_plugins, desired_plugins);
-
-    // Resolve addresses plus dynamic balancer/protocol names before reporting
-    // success, so --check-config validates the complete runtime.
+    // Resolve addresses plus registered balancer/protocol names before
+    // reporting success, so --check-config validates the complete runtime.
     const resolved = core.resolveForwarder(gpa, cycle.allocator(), &cycle, null, &diag) catch {
         reportConfigError(&diag);
         return 2;
@@ -143,8 +121,6 @@ pub fn main(init: std.process.Init) u8 {
         .cli => |*value| .{ .cli = &value.configuration },
     };
     var service = core.ForwarderService.init(gpa, source, cycle, resolved);
-    service.adoptPluginManager(plugin_manager);
-    owns_plugin_manager = false;
     owns_cycle = false;
     service.run() catch |err| {
         writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});
@@ -177,10 +153,6 @@ fn parseArgs(
     defer rule_specs.deinit(gpa);
     var protocols: ?[]const u8 = null;
     var balance: ?[]const u8 = null;
-    var plugin_paths: std.ArrayList([]const u8) = .empty;
-    defer plugin_paths.deinit(gpa);
-    var plugin_config_arguments: std.ArrayList(cli.PluginConfigArgument) = .empty;
-    defer plugin_config_arguments.deinit(gpa);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -229,36 +201,16 @@ fn parseArgs(
             balance = std.mem.span(args[i]);
         } else if (std.mem.startsWith(u8, arg, "--balance=")) {
             balance = arg["--balance=".len..];
-        } else if (std.mem.eql(u8, arg, "--plugin")) {
-            i += 1;
-            if (i >= args.len) return usageError("missing value for '{s}'", .{arg});
-            try plugin_paths.append(gpa, std.mem.span(args[i]));
-        } else if (std.mem.startsWith(u8, arg, "--plugin=")) {
-            try plugin_paths.append(gpa, arg["--plugin=".len..]);
-        } else if (std.mem.eql(u8, arg, "--plugin-config")) {
-            i += 1;
-            if (i >= args.len) return usageError("missing value for '{s}'", .{arg});
-            if (plugin_paths.items.len == 0) return usageError("'--plugin-config' requires a preceding '--plugin'", .{});
-            try plugin_config_arguments.append(gpa, .{
-                .plugin_index = plugin_paths.items.len - 1,
-                .text = std.mem.span(args[i]),
-            });
-        } else if (std.mem.startsWith(u8, arg, "--plugin-config=")) {
-            if (plugin_paths.items.len == 0) return usageError("'--plugin-config' requires a preceding '--plugin'", .{});
-            try plugin_config_arguments.append(gpa, .{
-                .plugin_index = plugin_paths.items.len - 1,
-                .text = arg["--plugin-config=".len..],
-            });
         } else {
             return usageError("unexpected argument '{s}'", .{arg});
         }
     }
 
     const has_cli = listen != null or upstream != null or rule_specs.items.len > 0 or
-        protocols != null or balance != null or plugin_paths.items.len > 0;
+        protocols != null or balance != null;
 
     if (config_path != null and has_cli) {
-        return usageError("cannot combine '--config' with CLI endpoint/plugin flags", .{});
+        return usageError("cannot combine '--config' with CLI endpoint flags", .{});
     }
 
     if (!has_cli) {
@@ -271,17 +223,13 @@ fn parseArgs(
         if (listen != null or upstream != null or protocols != null or balance != null) {
             return usageError("cannot combine '--rule' with '--listen'/'--upstream'/'--protocols'/'--balance'", .{});
         }
-        var config = (try cli.parseFlags(gpa, null, null, rule_specs.items, null, null, diag)).?;
-        errdefer config.deinit();
-        try cli.setPlugins(&config, plugin_paths.items, plugin_config_arguments.items, gpa, diag);
+        const config = (try cli.parseFlags(gpa, null, null, rule_specs.items, null, null, diag)).?;
         return .{ .cli = .{ .configuration = config, .check_config = check_config } };
     }
 
     if (listen == null) return usageError("missing expected argument '--listen <endpoint>'", .{});
     if (upstream == null) return usageError("missing expected argument '--upstream <endpoint>'", .{});
-    var config = (try cli.parseFlags(gpa, listen, upstream, &.{}, protocols, balance, diag)).?;
-    errdefer config.deinit();
-    try cli.setPlugins(&config, plugin_paths.items, plugin_config_arguments.items, gpa, diag);
+    const config = (try cli.parseFlags(gpa, listen, upstream, &.{}, protocols, balance, diag)).?;
     return .{ .cli = .{ .configuration = config, .check_config = check_config } };
 }
 

@@ -55,83 +55,15 @@ pub const CliRule = struct {
     balance: ?[]const u8 = null,
 };
 
-pub const PluginConfigArgument = struct {
-    plugin_index: usize,
-    text: []const u8,
-};
-
-pub const CliPluginConfigEntry = struct {
-    key: []const u8,
-    value: []const u8,
-};
-
-pub const CliPlugin = struct {
-    path: []const u8,
-    config: []CliPluginConfigEntry = &.{},
-};
-
 /// The parsed CLI configuration: always rules-mode with 1..N rules.
 pub const Configuration = struct {
     rules: []CliRule,
-    plugins: []CliPlugin = &.{},
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Configuration) void {
         self.arena.deinit();
     }
 };
-
-pub fn setPlugins(
-    config: *Configuration,
-    paths: []const []const u8,
-    config_arguments: []const PluginConfigArgument,
-    gpa: Allocator,
-    diag: *conf.Diagnostics,
-) error{ OutOfMemory, InvalidConfiguration }!void {
-    const alloc = config.arena.allocator();
-    for (config_arguments) |argument| {
-        if (argument.plugin_index >= paths.len) {
-            return yaml.fail(gpa, diag, "--plugin-config has no matching --plugin", .{});
-        }
-    }
-    config.plugins = try alloc.alloc(CliPlugin, paths.len);
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse
-        return yaml.fail(gpa, diag, "unable to resolve --plugin paths from the current directory", .{});
-    _ = cwd_ptr;
-    const cwd_len = std.mem.indexOfScalar(u8, &cwd_buf, 0) orelse
-        return yaml.fail(gpa, diag, "current directory path is too long", .{});
-    const cwd = cwd_buf[0..cwd_len];
-    for (paths, 0..) |path, i| {
-        var entry_count: usize = 0;
-        for (config_arguments) |argument| if (argument.plugin_index == i) {
-            entry_count += 1;
-        };
-        const entries = try alloc.alloc(CliPluginConfigEntry, entry_count);
-        var entry_index: usize = 0;
-        for (config_arguments) |argument| {
-            if (argument.plugin_index != i) continue;
-            const separator = std.mem.indexOfScalar(u8, argument.text, '=') orelse
-                return yaml.fail(gpa, diag, "--plugin-config expects key=value, got '{s}'", .{argument.text});
-            const key = std.mem.trim(u8, argument.text[0..separator], " \t\r\n");
-            if (key.len == 0) return yaml.fail(gpa, diag, "--plugin-config key must not be empty", .{});
-            for (entries[0..entry_index]) |previous| {
-                if (std.mem.eql(u8, previous.key, key)) {
-                    return yaml.fail(gpa, diag, "--plugin-config duplicate key '{s}' for plugin {d}", .{ key, i + 1 });
-                }
-            }
-            entries[entry_index] = .{
-                .key = try alloc.dupe(u8, key),
-                .value = try alloc.dupe(u8, argument.text[separator + 1 ..]),
-            };
-            entry_index += 1;
-        }
-        config.plugins[i] = .{
-            .path = try std.fs.path.resolve(alloc, &.{ cwd, path }),
-            .config = entries,
-        };
-    }
-}
 
 /// Register the module in fw.module_types. It declares no directives and no
 /// conf hooks: the module is inert unless the command line actually carries
@@ -208,27 +140,6 @@ pub fn parseFlags(
 /// by `out` and is later copied into the cycle arena by conf.loadYaml, so the
 /// buffer only needs to outlive this call.
 pub fn renderYaml(config: *const Configuration, out: *std.ArrayList(u8), gpa: Allocator) error{OutOfMemory}!void {
-    if (config.plugins.len > 0) {
-        try out.appendSlice(gpa, "plugins:\n");
-        for (config.plugins) |plugin_entry| {
-            if (plugin_entry.config.len == 0) {
-                try out.appendSlice(gpa, "  - ");
-                try appendQuoted(out, gpa, plugin_entry.path);
-                try out.append(gpa, '\n');
-                continue;
-            }
-            try out.appendSlice(gpa, "  - path: ");
-            try appendQuoted(out, gpa, plugin_entry.path);
-            try out.appendSlice(gpa, "\n    config:\n");
-            for (plugin_entry.config) |entry| {
-                try out.appendSlice(gpa, "      ");
-                try appendQuoted(out, gpa, entry.key);
-                try out.appendSlice(gpa, ": ");
-                try appendQuoted(out, gpa, entry.value);
-                try out.append(gpa, '\n');
-            }
-        }
-    }
     try out.appendSlice(gpa, "rules:\n");
     for (config.rules) |rule| {
         try out.appendSlice(gpa, "  - listen: ");
@@ -651,51 +562,6 @@ test "rejects invalid shorthand" {
     };
     for (cases) |case| {
         try expectParseFailure(case.listen, case.upstream, case.specs, case.protocols, case.balance, case.message);
-    }
-}
-
-test "renders runtime plugins and dynamically named protocols" {
-    var config = try parseForTest(":9000", "a", &.{}, "probe_udp", "first_available");
-    defer config.deinit();
-    var diag = conf.Diagnostics{};
-    defer if (diag.message) |message| testing.allocator.free(message);
-    try setPlugins(
-        &config,
-        &.{"/opt/curtsy/probe.so"},
-        &.{.{ .plugin_index = 0, .text = "message=from-cli" }},
-        testing.allocator,
-        &diag,
-    );
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(testing.allocator);
-    try renderYaml(&config, &out, testing.allocator);
-    try testing.expect(std.mem.indexOf(u8, out.items, "plugins:\n  - path: \"/opt/curtsy/probe.so\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"message\": \"from-cli\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "protocols: [probe_udp]") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "balance: \"first_available\"") != null);
-}
-
-test "rejects malformed or duplicate CLI plugin configuration" {
-    const cases = [_]struct {
-        arguments: []const PluginConfigArgument,
-        message: []const u8,
-    }{
-        .{ .arguments = &.{.{ .plugin_index = 0, .text = "missing-separator" }}, .message = "--plugin-config expects key=value, got 'missing-separator'" },
-        .{ .arguments = &.{
-            .{ .plugin_index = 0, .text = "message=one" },
-            .{ .plugin_index = 0, .text = "message=two" },
-        }, .message = "--plugin-config duplicate key 'message' for plugin 1" },
-    };
-    for (cases) |case| {
-        var config = try parseForTest(":9000", "a", &.{}, null, null);
-        defer config.deinit();
-        var diag = conf.Diagnostics{};
-        defer if (diag.message) |message| testing.allocator.free(message);
-        try testing.expectError(
-            error.InvalidConfiguration,
-            setPlugins(&config, &.{"/opt/curtsy/probe.so"}, case.arguments, testing.allocator, &diag),
-        );
-        try testing.expectEqualStrings(case.message, diag.message.?);
     }
 }
 

@@ -69,43 +69,8 @@ pub const Balancer = struct {
 /// The registered balancer modules, in directive-display order.
 pub const balancers: []const Balancer = &.{ round_robin.balancer, source_hash.balancer, weighted_round_robin.balancer };
 
-var dynamic_mutex: log.Mutex = .{};
-var dynamic_balancers: std.ArrayList(*const Balancer) = .empty;
-
-pub fn registerDynamicBalancer(allocator: Allocator, balancer: *const Balancer) !void {
-    dynamic_mutex.lock();
-    defer dynamic_mutex.unlock();
-    for (balancers) |builtin_balancer| {
-        if (std.mem.eql(u8, builtin_balancer.name, balancer.name)) return error.BalancerNameConflict;
-    }
-    for (dynamic_balancers.items) |existing| {
-        if (std.mem.eql(u8, existing.name, balancer.name)) return error.BalancerNameConflict;
-    }
-    try dynamic_balancers.append(allocator, balancer);
-}
-
-pub fn unregisterDynamicBalancer(allocator: Allocator, balancer: *const Balancer) void {
-    dynamic_mutex.lock();
-    defer dynamic_mutex.unlock();
-    for (dynamic_balancers.items, 0..) |existing, i| {
-        if (existing == balancer) {
-            _ = dynamic_balancers.swapRemove(i);
-            if (dynamic_balancers.items.len == 0) {
-                dynamic_balancers.deinit(allocator);
-                dynamic_balancers = .empty;
-            }
-            return;
-        }
-    }
-}
-
 pub fn balancerByName(name: []const u8) ?*const Balancer {
     for (balancers) |*balancer| {
-        if (std.mem.eql(u8, balancer.name, name)) return balancer;
-    }
-    dynamic_mutex.lock();
-    defer dynamic_mutex.unlock();
-    for (dynamic_balancers.items) |balancer| {
         if (std.mem.eql(u8, balancer.name, name)) return balancer;
     }
     return null;
@@ -120,12 +85,6 @@ pub fn balancerNames(buf: []u8) []const u8 {
     var fbs = std.Io.Writer.fixed(buf);
     for (balancers, 0..) |balancer, i| {
         if (i > 0) fbs.print(", ", .{}) catch return buf[0..fbs.end];
-        fbs.print("{s}", .{balancer.name}) catch return buf[0..fbs.end];
-    }
-    dynamic_mutex.lock();
-    defer dynamic_mutex.unlock();
-    for (dynamic_balancers.items) |balancer| {
-        if (fbs.end > 0) fbs.print(", ", .{}) catch return buf[0..fbs.end];
         fbs.print("{s}", .{balancer.name}) catch return buf[0..fbs.end];
     }
     return buf[0..fbs.end];

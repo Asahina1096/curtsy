@@ -553,7 +553,7 @@ pub const UdpListener = struct {
         return initWithSelector(allocator, configuration, log_store, enable_sockmap_acceleration, load_sockmap_runtime, null);
     }
 
-    /// init plus the rules plugin upstream-selection hook.
+    /// init plus the rules module upstream-selection hook.
     pub fn initWithSelector(
         allocator: Allocator,
         configuration: ResolvedConfiguration,
@@ -1907,7 +1907,7 @@ pub const UdpRelayEngine = struct {
         snapshot: *const ResolvedConfiguration,
         now_ms: u64,
     ) Error!fd_t {
-        // The selector (rules plugin) picks the upstream per association;
+        // The selector (rules module) picks the upstream per association;
         // without one the configured upstream is used.
         const upstream_address = if (self.upstream_selector) |selector|
             selector.pick(client, now_ms * std.time.ns_per_ms)

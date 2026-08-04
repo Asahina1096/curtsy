@@ -31,8 +31,8 @@ pub const RuleConfiguration = struct {
     listen: net.EndpointConfiguration,
     upstreams: []UpstreamConfiguration,
     balance: *const upstream.Balancer,
-    /// Preserves the configured name until the resolve phase, after runtime
-    /// plugins have been loaded and registered.
+    /// Preserves the configured name until the resolve phase checks the
+    /// built-in balancer registry.
     balance_name: ?[]const u8 = null,
     /// Copies of the per-rule override confs owned by the timeouts/limits
     /// modules (collected during finalize).
@@ -461,7 +461,7 @@ fn fixedResolver(host: []const u8, port: u16) !net.SocketAddr {
     return net.SocketAddr.parseIp("127.0.0.1", port).?;
 }
 
-test "unknown balancer is rejected during resolve after plugin loading" {
+test "unknown balancer is rejected during resolve" {
     const result = try loadRulesForTest(
         \\rules:
         \\  - listen: { port: 9000 }

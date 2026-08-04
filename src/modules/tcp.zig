@@ -1276,7 +1276,7 @@ const Worker = struct {
         }
 
         // Nonblocking upstream connect with connect_seconds deadline. With a
-        // selector (rules plugin) the upstream is picked per connection and
+        // selector (rules module) the upstream is picked per connection and
         // immediate connect failures fail over to the next pick; without one
         // the loop below runs exactly once with the configured upstream.
         const selector = listener.options.upstream_selector;
@@ -2118,7 +2118,7 @@ const Connection = struct {
     pairing: ?bpf.SockmapRuntime.Pairing = null,
     accelerator: ?*TCPSockmapAccelerator = null, // retained
     upstream_addr: config.SocketAddr,
-    /// Captured for selector re-picks during failover (rules plugin only).
+    /// Captured for selector re-picks during failover (rules module only).
     client_addr: ?config.SocketAddr = null,
     /// Connect timeout per upstream attempt, from the accept-time snapshot.
     connect_ns: u64 = 0,
@@ -3114,7 +3114,7 @@ test "tcp idle timeout closes inactive connections" {
 }
 
 // ---------------------------------------------------------------------------
-// Upstream selector hook tests (rules plugin)
+// Upstream selector hook tests (rules module)
 // ---------------------------------------------------------------------------
 
 const MockSelector = struct {

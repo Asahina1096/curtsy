@@ -456,7 +456,7 @@ pub const TuningDaemon = struct {
 };
 
 /// Renders a metrics delta as a `metrics `-prefixed, `key=value` message
-/// (`tcp_`/`udp_`/`plugin_`-prefixed keys), skipping fields that did not move. The field
+/// (`tcp_`/`udp_`-prefixed keys), skipping fields that did not move. The field
 /// set is derived from the metric types, so the format cannot drift from the
 /// counters it reports.
 fn renderMetrics(metrics: config.MetricsSnapshot, buf: []u8) []const u8 {
@@ -474,13 +474,6 @@ fn renderMetrics(metrics: config.MetricsSnapshot, buf: []u8) []const u8 {
         const value = @field(metrics.udp, field.name);
         if (value != 0) {
             const text = std.fmt.bufPrint(rest, "udp_{s}={d} ", .{ field.name, value }) catch break;
-            rest = rest[text.len..];
-        }
-    }
-    inline for (std.meta.fields(config.PluginMetrics)) |field| {
-        const value = @field(metrics.plugin, field.name);
-        if (value != 0) {
-            const text = std.fmt.bufPrint(rest, "plugin_{s}={d} ", .{ field.name, value }) catch break;
             rest = rest[text.len..];
         }
     }
@@ -822,7 +815,6 @@ test "renderMetrics formats moved fields with protocol prefixes" {
     const delta = config.MetricsSnapshot{
         .tcp = .{ .splice_bytes = 1_024, .splice_calls = 8, .splice_queued_bytes = 512 },
         .udp = .{ .recv_calls = 3, .recv_datagrams = 192 },
-        .plugin = .{ .received_messages = 4, .errors = 1 },
     };
     var buf: [1_024]u8 = undefined;
     const text = renderMetrics(delta, &buf);
@@ -831,8 +823,6 @@ test "renderMetrics formats moved fields with protocol prefixes" {
     try testing.expect(std.mem.indexOf(u8, text, "tcp_splice_queued_bytes=512") != null);
     try testing.expect(std.mem.indexOf(u8, text, "udp_recv_calls=3") != null);
     try testing.expect(std.mem.indexOf(u8, text, "udp_recv_datagrams=192") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "plugin_received_messages=4") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "plugin_errors=1") != null);
     // Unmoved fields are skipped and there is no trailing whitespace.
     try testing.expect(std.mem.indexOf(u8, text, "udp_send_calls=0") == null);
     try testing.expect(text.len > 0 and text[text.len - 1] != ' ');

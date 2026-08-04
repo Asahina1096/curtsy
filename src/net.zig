@@ -18,8 +18,8 @@ pub fn setDiag(gpa: Allocator, diag: *Diagnostics, comptime fmt: []const u8, arg
 }
 
 /// Configuration-facing protocol identity. TCP and UDP keep compact builtin
-/// tags; runtime plugins may add arbitrary validated names without changing
-/// the configuration model or recompiling the host.
+/// tags; additional built-in protocol modules may add validated names through
+/// the comptime registry without changing the configuration model.
 pub const ForwardProtocol = union(enum) {
     tcp,
     udp,

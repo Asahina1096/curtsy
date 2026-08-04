@@ -12,8 +12,6 @@ test {
     _ = @import("module.zig");
     _ = @import("conf.zig");
     _ = @import("modules/core.zig");
-    _ = @import("plugin.zig");
-    _ = @import("modules/plugins.zig");
     _ = @import("log.zig");
     _ = @import("autotune.zig");
     _ = @import("modules/upstream.zig");

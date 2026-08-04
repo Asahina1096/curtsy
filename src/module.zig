@@ -25,7 +25,6 @@ const conf = @import("conf.zig");
 const yaml = @import("yaml.zig");
 
 const core = @import("modules/core.zig");
-const plugins = @import("modules/plugins.zig");
 const rules = @import("modules/rules.zig");
 const timeouts = @import("modules/timeouts.zig");
 const limits = @import("modules/limits.zig");
@@ -42,7 +41,6 @@ const udp = @import("modules/udp.zig");
 /// from it automatically.
 pub const module_types = [_]type{
     core,
-    plugins,
     rules,
     timeouts,
     limits,
@@ -85,12 +83,11 @@ pub const modules: [module_count]ModuleRef = blk: {
 };
 
 /// Protocol modules registered by the data planes (ngx event module
-/// analogue: the core orchestrator combines these built-ins with the runtime
-/// plugin registry and spawns listeners by protocol name).
+/// analogue: the core orchestrator spawns listeners by protocol name. Add
+/// further system-level protocol modules to this comptime registry.
 pub const protocol_modules: []const core.ProtocolModule = &.{ tcp.protocol_module, udp.protocol_module };
 
 pub fn protocolModule(protocol: @import("net.zig").ForwardProtocol) ?core.ProtocolModule {
-    if (core.dynamicProtocolModule(protocol)) |dynamic| return dynamic;
     for (protocol_modules) |*m| {
         if (m.protocol.eql(protocol)) return m.*;
     }

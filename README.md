@@ -1,6 +1,6 @@
 # Curtsy
 
-Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 Linux 透明流量转发器，内置 TCP/UDP 数据面，并允许运行时插件增加协议。它在一个地址和端口上监听所配置的协议，并把流量转发到固定上游。
+Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 Linux 透明流量转发器，内置 TCP/UDP 数据面及规则、上游、CLI 等系统级模块。它在一个地址和端口上监听所配置的协议，并把流量转发到固定上游。
 
 默认只运行一条监听规则和一个上游，不终止 TLS、不检查流量内容、不记录转发数据正文。配置中出现顶层 `rules` 列表时会启用可选的多规则模块：一个进程内运行多条独立的监听规则，每条规则可配置多个上游并做负载均衡。
 
@@ -144,18 +144,12 @@ curtsy --rule "listen=:9001,upstreams=a:9001,b:9001/weight=2" \
 # 检查配置
 curtsy --listen :9000 --upstream example.com --check-config
 
-# CLI 模式加载插件；相对路径会先规范化为绝对路径
-curtsy --plugin ./libcustom.so \
-       --plugin-config mode=production \
-       --rule "listen=:9000,upstreams=a:9000,b:9000,protocols=custom,balance=custom_balance"
 ```
 
 - 端点简写 `[HOST][:PORT]`：`:9000`/`9000` 表示监听全部地址；`[::1]:9000` 为方括号 IPv6 字面量；上游只写主机时端口取该规则监听端口。
 - `--rule` 的值是逗号分隔的 `key=value`，`listen`（必填）与 `upstreams`（必填，`a:9001,b:9001/weight=2` 形式，支持 `/weight=N`）之外可带 `protocols=<names>` 与 `balance=<name>`。
 - `--rule` 与 `--listen`/`--upstream`/`--protocols`/`--balance` 互斥；`--protocols`/`--balance` 只用于单规则简写。
-- `--plugin <path>` 可重复，允许 CLI 规则引用插件协议和动态 balancer；路径会规范化为绝对路径并渲染到 `plugins:`。
-- `--plugin-config key=value` 可重复，并归属于它前面最近的 `--plugin`；键和值会作为字符串渲染到该插件的 `config:`，继续使用插件的事务式 `prepare`/`commit`/`discard`。
-- CLI 模式始终是 rules 模式；由于参数在进程生命周期内固定，SIGHUP 重载会重新校验插件、规则并重新解析监听/上游主机名（DNS 变化生效），参数描述的集合本身不变。
+- CLI 模式始终是 rules 模式；由于参数在进程生命周期内固定，SIGHUP 重载会重新校验规则并重新解析监听/上游主机名（DNS 变化生效），参数描述的集合本身不变。
 - 全局 section（timeouts/limits/logging/runtime/performance）仍是 YAML 专属，命令行简写只覆盖端点类配置。
 
 ## 信号
@@ -165,48 +159,11 @@ curtsy --plugin ./libcustom.so \
 
 热加载后，已有 TCP 连接继续使用原上游，新连接使用新上游；上游变化时已有 UDP 映射会被清除并按新配置重建。
 
-## 运行时插件
+## 内置系统模块
 
-Curtsy 支持通过绝对路径加载 Linux 共享库。插件使用版本化 C ABI，不依赖 Zig ABI：
+Curtsy 当前的 CLI、rules、upstream、balancer、TCP/UDP 协议实现都是系统级内置模块，随主程序一起编译，并通过 `src/module.zig` 中的 comptime 注册表确定模块集合和顺序。新增模块需要修改源码、注册并重新构建 `curtsy`。
 
-```yaml
-plugins:
-  - path: "/usr/lib/curtsy/plugins/libcurtsy_plugin_hello.so"
-    config:
-      message: "production"
-```
-
-ABI 定义位于 `include/curtsy_plugin.h`。插件导出 `curtsy_plugin_entry()`，返回名称、版本以及 `init`/`deinit` 生命周期回调。ABI v1 提供日志、opaque context、可选 balancer、namespaced 配置接口，以及按名称注册协议实现的接口；动态 balancer 可在 `rules[].balance` 中按名字选择。
-
-`plugins[].config` 是插件私有的扁平标量 mapping，键和值通过带长度的 C ABI 传递，不把 Zig/YAML 内部结构暴露给共享库。插件配置采用三阶段事务：`prepare` 构造候选状态，转发配置提交成功后调用 `commit`，候选失败则调用 `discard`。没有注册配置接口的插件如果收到非空 `config` 会拒绝加载；未知键是否有效由插件的 `prepare` 决定。
-
-SIGHUP 会事务式协调插件集合：先加载并初始化新增插件；任一新增插件失败时保留旧配置和旧插件；转发配置成功提交后才调用被移除插件的 `deinit` 并卸载代码。同名插件可通过替换路径升级。路径必须是绝对路径，重复路径会在配置校验阶段拒绝。
-
-仓库包含 `examples/plugins/hello.c` 示例；运行以下命令构建并安装到 `zig-out/lib/`：
-
-```bash
-.toolchain/zig/zig build plugin-example
-```
-
-该示例注册名为 `first_available` 的动态 balancer，可这样使用：
-
-```yaml
-plugins:
-  - path: "/absolute/path/libcurtsy_plugin_hello.so"
-    config: { message: "hello" }
-rules:
-  - listen: { port: 9000 }
-    upstreams: [{ host: "a" }, { host: "b" }]
-    balance: first_available
-```
-
-动态 balancer 由 upstream generation 引用计数保护。配置移除插件时会立即禁止新规则选择该 balancer；如果旧 generation 仍在工作，插件进入 retiring 状态，直到最后一个引用释放后才执行 `dlclose`。因此已有连接或保留 generation 不会调用已卸载代码。
-
-插件可以通过 `curtsy_protocol_api.name` 注册新协议名，也可以使用 `tcp` 或 `udp` 覆盖内置 listener。配置中的 `protocols` 接受由字母、数字、下划线和连字符组成的名称；名称必须在地址解析前由已加载插件注册，否则配置被拒绝。加载后，新建 listener 使用插件实现；SIGHUP 移除插件时，新协议从候选注册表消失（仍引用它的规则会使该候选失败），内置协议覆盖则回退到内置实现。旧 listener 继续持有插件引用，直到连接排空或 listener 销毁后才卸载共享库，候选重载失败会恢复原注册项。
-
-协议配置同时提供主上游和生命周期内有效的 `curtsy_upstream_selector`。插件可按客户端与时间选取上游，并通过 `report_success`/`report_failure` 参与被动健康摘除；pool 地址稳定，因此上游 generation 热更新不需要重新创建 selector。可选的累计 `metrics` 回调会聚合为 `plugin_received_messages`、`plugin_sent_messages`、字节数和错误数并进入 tuning daemon 的 metrics 日志。插件通过 `drains_connections` 声明 listener 在退役时是等待活动连接排空，还是立即销毁。
-
-动态插件拥有与主进程相同的权限，只应加载由管理员控制且不可被非特权用户改写的文件。插件不能新增 YAML 顶层指令；自定义配置必须放在对应 `plugins[].config` 命名空间内。
+SIGHUP 热重载只重新解析配置，并事务式替换规则、监听器和上游 generation；它不会在运行时装载或卸载机器码。项目未来可能支持外部插件，但当前不提供共享库 ABI、`plugins:` 配置项、`--plugin` 参数或外部插件兼容性承诺。
 
 ## TCP 性能
 

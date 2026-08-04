@@ -4,17 +4,9 @@ listen:
 upstream:
   host: "example.com"
 
-# Optional runtime shared-library plugins. Paths must be absolute. Plugins use
-# the versioned C ABI in include/curtsy_plugin.h; SIGHUP loads additions before
-# committing the candidate configuration and unloads removals after commit.
-# ABI v1 plugins may add protocol names or replace built-in TCP/UDP implementations.
-# plugins:
-#   - path: "/usr/lib/curtsy/plugins/libcurtsy_plugin_hello.so"
-#     config: { message: "production" } # plugin-owned flat scalar mapping
-
 # Optional overrides. Omitted values are auto-tuned continuously at runtime.
 # version: 1
-# protocols: [tcp, udp] # loaded plugins may add names, e.g. probe_udp
+# protocols: [tcp, udp] # names registered by built-in protocol modules
 # listen:
 #   host: "*"
 #   port: 9000
@@ -63,8 +55,8 @@ upstream:
 #     upstreams:
 #       - { host: "a.example.com", port: 9000 }            # port defaults to
 #       - { host: "b.example.com", port: 9000, weight: 2 } # the listen port
-#     balance: round_robin   # built-ins: round_robin | source_hash |
-#                            # weighted_round_robin; loaded plugins may add names
+#     balance: round_robin   # round_robin | source_hash |
+#                            # weighted_round_robin
 #     timeouts: { tcpIdleSeconds: 600 }        # optional per-rule overrides
 #     limits: { maxTCPBufferedBytes: 8388608 } # tcpListenBacklog and
 #                                              # maxUDPAssociations too
