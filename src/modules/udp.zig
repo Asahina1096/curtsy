@@ -736,12 +736,14 @@ pub const protocol_module = config.ProtocolModule{
 };
 
 fn createProtocolListener(
+    context: ?*anyopaque,
     outer_allocator: Allocator,
     resolved: ResolvedConfiguration,
     logger: *LogStore,
     selector: ?upstream.Selector,
     start_paused: bool,
 ) anyerror!*config.Listener {
+    _ = context;
     const listener = try outer_allocator.create(UdpListener);
     errdefer outer_allocator.destroy(listener);
     listener.* = UdpListener.initWithSelector(outer_allocator, resolved, logger, null, null, selector);

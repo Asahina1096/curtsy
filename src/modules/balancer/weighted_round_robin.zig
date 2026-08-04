@@ -22,7 +22,8 @@ pub const balancer: upstream.Balancer = .{
     .pick = pick,
 };
 
-fn build(allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque {
+fn build(context: ?*anyopaque, allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque {
+    _ = context;
     var total_weight: usize = 0;
     for (weights) |weight| total_weight += weight;
 
@@ -47,13 +48,15 @@ fn build(allocator: Allocator, addresses: []const net.SocketAddr, weights: []con
     return state;
 }
 
-fn destroy(allocator: Allocator, opaque_state: ?*anyopaque) void {
+fn destroy(context: ?*anyopaque, allocator: Allocator, opaque_state: ?*anyopaque) void {
+    _ = context;
     const state: *State = @ptrCast(@alignCast(opaque_state orelse return));
     allocator.free(state.sequence);
     allocator.destroy(state);
 }
 
-fn pick(opaque_state: ?*anyopaque, upstreams: []const upstream.UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize {
+fn pick(context: ?*anyopaque, opaque_state: ?*anyopaque, upstreams: []const upstream.UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize {
+    _ = context;
     _ = client;
     const state: *State = @ptrCast(@alignCast(opaque_state.?));
     return upstream.pickSequential(state.sequence, upstreams, cursor, now_ns);
@@ -70,8 +73,8 @@ test "weights interleave round by round" {
         net.SocketAddr.parseIp("127.0.0.1", 9000).?,
         net.SocketAddr.parseIp("127.0.0.1", 9001).?,
     };
-    const state = try build(testing.allocator, &addresses, &.{ 2, 3 });
-    defer destroy(testing.allocator, state);
+    const state = try build(null, testing.allocator, &addresses, &.{ 2, 3 });
+    defer destroy(null, testing.allocator, state);
     const s: *State = @ptrCast(@alignCast(state.?));
     try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1, 1 }, s.sequence);
 }

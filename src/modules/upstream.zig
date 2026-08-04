@@ -20,6 +20,7 @@
 //! eligible again and real traffic decides.
 
 const std = @import("std");
+const log = @import("../log.zig");
 const net = @import("../net.zig");
 
 const round_robin = @import("balancer/round_robin.zig");
@@ -52,21 +53,59 @@ pub const UpstreamState = struct {
 
 pub const Balancer = struct {
     name: []const u8,
+    context: ?*anyopaque = null,
+    retain: ?*const fn (?*anyopaque) void = null,
+    release: ?*const fn (?*anyopaque) void = null,
     /// Build per-generation strategy state (e.g. an expanded pick sequence).
     /// Stateless strategies return null.
-    build: *const fn (allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque,
-    destroy: *const fn (allocator: Allocator, state: ?*anyopaque) void,
+    build: *const fn (context: ?*anyopaque, allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque,
+    destroy: *const fn (context: ?*anyopaque, allocator: Allocator, state: ?*anyopaque) void,
     /// Choose an upstream index. Sequential strategies rotate through the
     /// shared `cursor`; all strategies skip ineligible upstreams and fall
     /// back to serving anyway when everything is evicted.
-    pick: *const fn (state: ?*anyopaque, upstreams: []const UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize,
+    pick: *const fn (context: ?*anyopaque, state: ?*anyopaque, upstreams: []const UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize,
 };
 
 /// The registered balancer modules, in directive-display order.
 pub const balancers: []const Balancer = &.{ round_robin.balancer, source_hash.balancer, weighted_round_robin.balancer };
 
+var dynamic_mutex: log.Mutex = .{};
+var dynamic_balancers: std.ArrayList(*const Balancer) = .empty;
+
+pub fn registerDynamicBalancer(allocator: Allocator, balancer: *const Balancer) !void {
+    dynamic_mutex.lock();
+    defer dynamic_mutex.unlock();
+    for (balancers) |builtin_balancer| {
+        if (std.mem.eql(u8, builtin_balancer.name, balancer.name)) return error.BalancerNameConflict;
+    }
+    for (dynamic_balancers.items) |existing| {
+        if (std.mem.eql(u8, existing.name, balancer.name)) return error.BalancerNameConflict;
+    }
+    try dynamic_balancers.append(allocator, balancer);
+}
+
+pub fn unregisterDynamicBalancer(allocator: Allocator, balancer: *const Balancer) void {
+    dynamic_mutex.lock();
+    defer dynamic_mutex.unlock();
+    for (dynamic_balancers.items, 0..) |existing, i| {
+        if (existing == balancer) {
+            _ = dynamic_balancers.swapRemove(i);
+            if (dynamic_balancers.items.len == 0) {
+                dynamic_balancers.deinit(allocator);
+                dynamic_balancers = .empty;
+            }
+            return;
+        }
+    }
+}
+
 pub fn balancerByName(name: []const u8) ?*const Balancer {
     for (balancers) |*balancer| {
+        if (std.mem.eql(u8, balancer.name, name)) return balancer;
+    }
+    dynamic_mutex.lock();
+    defer dynamic_mutex.unlock();
+    for (dynamic_balancers.items) |balancer| {
         if (std.mem.eql(u8, balancer.name, name)) return balancer;
     }
     return null;
@@ -81,6 +120,12 @@ pub fn balancerNames(buf: []u8) []const u8 {
     var fbs = std.Io.Writer.fixed(buf);
     for (balancers, 0..) |balancer, i| {
         if (i > 0) fbs.print(", ", .{}) catch return buf[0..fbs.end];
+        fbs.print("{s}", .{balancer.name}) catch return buf[0..fbs.end];
+    }
+    dynamic_mutex.lock();
+    defer dynamic_mutex.unlock();
+    for (dynamic_balancers.items) |balancer| {
+        if (fbs.end > 0) fbs.print(", ", .{}) catch return buf[0..fbs.end];
         fbs.print("{s}", .{balancer.name}) catch return buf[0..fbs.end];
     }
     return buf[0..fbs.end];
@@ -227,7 +272,7 @@ pub const UpstreamPool = struct {
     pub fn pick(self: *UpstreamPool, client: ?net.SocketAddr, now_ns: u64) net.SocketAddr {
         const generation = self.generation.load(.acquire);
         if (generation.upstreams.len == 1) return generation.upstreams[0].address;
-        const index = generation.balancer.pick(generation.strategy, generation.upstreams, &self.cursor, client, now_ns);
+        const index = generation.balancer.pick(generation.balancer.context, generation.strategy, generation.upstreams, &self.cursor, client, now_ns);
         return generation.upstreams[index].address;
     }
 
@@ -363,8 +408,10 @@ fn buildGeneration(
         }
     }
 
-    const strategy = try balancer.build(allocator, addresses, weights);
-    errdefer balancer.destroy(allocator, strategy);
+    if (balancer.retain) |retain| retain(balancer.context);
+    errdefer if (balancer.release) |release| release(balancer.context);
+    const strategy = try balancer.build(balancer.context, allocator, addresses, weights);
+    errdefer balancer.destroy(balancer.context, allocator, strategy);
 
     const generation = try allocator.create(Generation);
     generation.* = .{ .upstreams = upstreams, .balancer = balancer, .strategy = strategy };
@@ -372,7 +419,8 @@ fn buildGeneration(
 }
 
 fn destroyGeneration(allocator: Allocator, generation: *Generation) void {
-    generation.balancer.destroy(allocator, generation.strategy);
+    generation.balancer.destroy(generation.balancer.context, allocator, generation.strategy);
+    if (generation.balancer.release) |release| release(generation.balancer.context);
     allocator.free(generation.upstreams);
     allocator.destroy(generation);
 }

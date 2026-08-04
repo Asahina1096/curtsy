@@ -31,6 +31,9 @@ pub const RuleConfiguration = struct {
     listen: net.EndpointConfiguration,
     upstreams: []UpstreamConfiguration,
     balance: *const upstream.Balancer,
+    /// Preserves the configured name until the resolve phase, after runtime
+    /// plugins have been loaded and registered.
+    balance_name: ?[]const u8 = null,
     /// Copies of the per-rule override confs owned by the timeouts/limits
     /// modules (collected during finalize).
     timeouts: timeouts.RuleTimeoutOverrides = .{},
@@ -47,6 +50,7 @@ pub const RuleConf = struct {
     upstreams_node: ?*yaml.Value = null,
     protocols: ?[]net.ForwardProtocol = null,
     balance: ?*const upstream.Balancer = null,
+    balance_name: ?[]const u8 = null,
 };
 
 pub const module: fw.Module = .{
@@ -71,7 +75,7 @@ pub fn rulesList(cycle: *conf.Cycle) []RuleConfiguration {
     return cycle.conf(@This()).rules;
 }
 
-/// Shared protocols sequence decoder ("tcp"/"udp" items); used by the core
+/// Shared protocols sequence decoder; used by the core
 /// module for the root directive and by this module for rule overrides.
 pub fn decodeProtocols(cycle: *conf.Cycle, value: *yaml.Value) yaml.LoadError![]net.ForwardProtocol {
     if (value.* != .sequence) {
@@ -80,16 +84,16 @@ pub fn decodeProtocols(cycle: *conf.Cycle, value: *yaml.Value) yaml.LoadError![]
     var protocols: std.ArrayList(net.ForwardProtocol) = .empty;
     for (value.sequence) |item| {
         if (item.* != .scalar) {
-            return yaml.fail(cycle.gpa, cycle.diag, "protocols: expected a sequence of tcp/udp", .{});
+            return yaml.fail(cycle.gpa, cycle.diag, "protocols: expected a sequence of names", .{});
         }
         const text = item.scalar.text;
-        if (std.mem.eql(u8, text, "tcp")) {
-            try protocols.append(cycle.allocator(), .tcp);
-        } else if (std.mem.eql(u8, text, "udp")) {
-            try protocols.append(cycle.allocator(), .udp);
-        } else {
-            return yaml.fail(cycle.gpa, cycle.diag, "protocols: unknown protocol '{s}'", .{text});
-        }
+        if (!net.validProtocolName(text)) return yaml.fail(
+            cycle.gpa,
+            cycle.diag,
+            "protocols: invalid protocol name '{s}'",
+            .{text},
+        );
+        try protocols.append(cycle.allocator(), net.ForwardProtocol.fromName(text));
     }
     return protocols.toOwnedSlice(cycle.allocator());
 }
@@ -138,10 +142,8 @@ fn setRuleBalance(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path
     var path_buf: [80]u8 = undefined;
     const balance_path = std.fmt.bufPrint(&path_buf, "{s}.balance", .{path}) catch "rules.balance";
     const text = try yaml.decodeString(cycle.gpa, cycle.diag, value, balance_path);
-    c.balance = upstream.balancerByName(text) orelse {
-        var names_buf: [128]u8 = undefined;
-        return yaml.fail(cycle.gpa, cycle.diag, "{s}: expected one of {s}", .{ balance_path, upstream.balancerNames(&names_buf) });
-    };
+    c.balance_name = text;
+    c.balance = upstream.balancerByName(text);
 }
 
 fn finalize(cycle: *conf.Cycle) yaml.LoadError!void {
@@ -182,6 +184,7 @@ fn decodeRule(cycle: *conf.Cycle, item: *yaml.Value, index: usize) yaml.LoadErro
         .listen = listen,
         .upstreams = upstreams,
         .balance = rule_conf.balance orelse upstream.defaultBalancer(),
+        .balance_name = rule_conf.balance_name,
         .timeouts = cycle.ruleConf(bundle, timeouts).?.*,
         .limits = cycle.ruleConf(bundle, limits).?.*,
     };
@@ -334,6 +337,21 @@ test "loads rules with defaults and inheritance" {
     try testing.expectEqual(@as(usize, 1), second.upstreams.len);
 }
 
+test "preserves dynamically named protocols for runtime resolution" {
+    const result = try loadRulesForTest(
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    protocols: [probe_udp]
+        \\    upstreams: [ { host: "127.0.0.1" } ]
+        \\
+    );
+    var cycle = result.cycle;
+    defer cycle.deinit();
+    const protocols = result.rules[0].protocols.?;
+    try testing.expectEqual(@as(usize, 1), protocols.len);
+    try testing.expectEqualStrings("probe_udp", protocols[0].name());
+}
+
 test "loads rule overrides and global sections" {
     const result = try loadRulesForTest(
         \\protocols: [tcp]
@@ -424,7 +442,6 @@ test "rejects invalid rules values" {
         .{ .yaml_text = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\", port: 0 } ]\n", .message = "rules[0].upstreams[0].port must be between 1 and 65535" },
         .{ .yaml_text = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\", weight: 0 } ]\n", .message = "rules[0].upstreams[0].weight must be between 1 and 65535" },
         .{ .yaml_text = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\", weight: 65536 } ]\n", .message = "rules[0].upstreams[0].weight must be between 1 and 65535" },
-        .{ .yaml_text = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    balance: nearest\n", .message = "rules[0].balance: expected one of round_robin, source_hash, weighted_round_robin" },
         .{ .yaml_text = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    protocols: []\n", .message = "rules[0].protocols must not be empty" },
         .{ .yaml_text = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    protocols: [tcp, tcp]\n", .message = "rules[0].protocols must not contain duplicates" },
         .{ .yaml_text = "rules:\n  - listen: { port: 9000 }\n    upstreams: [ { host: \"a\" } ]\n    timeouts: { tcpIdleSeconds: 0 }\n", .message = "rules[0].timeouts.tcpIdleSeconds must be positive" },
@@ -437,6 +454,27 @@ test "rejects invalid rules values" {
     for (cases) |case| {
         try conf.expectLoadFailure(case.yaml_text, case.message);
     }
+}
+
+fn fixedResolver(host: []const u8, port: u16) !net.SocketAddr {
+    _ = host;
+    return net.SocketAddr.parseIp("127.0.0.1", port).?;
+}
+
+test "unknown balancer is rejected during resolve after plugin loading" {
+    const result = try loadRulesForTest(
+        \\rules:
+        \\  - listen: { port: 9000 }
+        \\    upstreams: [ { host: "a" } ]
+        \\    balance: nearest
+        \\
+    );
+    var cycle = result.cycle;
+    defer cycle.deinit();
+    var diag = conf.Diagnostics{};
+    defer if (diag.message) |message| testing.allocator.free(message);
+    try testing.expectError(error.ResolutionFailed, core.resolveForwarder(testing.allocator, cycle.allocator(), &cycle, fixedResolver, &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.message.?, "rules[0].balance: expected one of "));
 }
 
 test "effective configuration merges rule overrides" {

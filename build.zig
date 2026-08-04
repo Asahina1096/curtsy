@@ -62,6 +62,45 @@ pub fn build(b: *std.Build) void {
     exe.build_id = .sha1;
     b.installArtifact(exe);
 
+    // Reference implementation of the versioned C plugin ABI. Production
+    // deployments may install independently built libraries and list their
+    // absolute paths in `plugins:`; this artifact also drives the integration
+    // probe below.
+    const sample_plugin_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sample_plugin_mod.addIncludePath(b.path("include"));
+    sample_plugin_mod.addCSourceFile(.{
+        .file = b.path("examples/plugins/hello.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Werror" },
+    });
+    const sample_plugin = b.addLibrary(.{
+        .name = "curtsy_plugin_hello",
+        .root_module = sample_plugin_mod,
+        .linkage = .dynamic,
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+    });
+    const install_sample_plugin = b.addInstallArtifact(sample_plugin, .{});
+    const protocol_probe_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    protocol_probe_mod.addIncludePath(b.path("include"));
+    protocol_probe_mod.addCSourceFile(.{
+        .file = b.path("examples/plugins/protocol_probe.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Werror" },
+    });
+    const protocol_probe = b.addLibrary(.{
+        .name = "curtsy_plugin_protocol_probe",
+        .root_module = protocol_probe_mod,
+        .linkage = .dynamic,
+    });
+    const plugin_step = b.step("plugin-example", "Build and install the example runtime plugin");
+    plugin_step.dependOn(&install_sample_plugin.step);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run curtsy");
@@ -79,8 +118,26 @@ pub fn build(b: *std.Build) void {
     test_compile_step.dependOn(&unit_tests.step);
 
     const run_tests = b.addRunArtifact(unit_tests);
+    const plugin_probe_mod = runtimeModule(b, b.path("src/plugin_integration.zig"), target, optimize, bpf_programs_module, dependencies);
+    const plugin_probe = b.addExecutable(.{ .name = "plugin-integration", .root_module = plugin_probe_mod });
+    const run_plugin_probe = b.addRunArtifact(plugin_probe);
+    run_plugin_probe.addFileArg(sample_plugin.getEmittedBin());
+    run_plugin_probe.addFileArg(protocol_probe.getEmittedBin());
+    const run_cli_plugin_probe = b.addRunArtifact(exe);
+    run_cli_plugin_probe.addArg("--check-config");
+    run_cli_plugin_probe.addArg("--plugin");
+    run_cli_plugin_probe.addFileArg(sample_plugin.getEmittedBin());
+    run_cli_plugin_probe.addArgs(&.{ "--plugin-config", "message=cli-integration" });
+    run_cli_plugin_probe.addArg("--plugin");
+    run_cli_plugin_probe.addFileArg(protocol_probe.getEmittedBin());
+    run_cli_plugin_probe.addArgs(&.{
+        "--rule",
+        "listen=127.0.0.1:9000,upstreams=127.0.0.1:9001,127.0.0.1:9002,protocols=probe_udp,balance=first_available",
+    });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_plugin_probe.step);
+    test_step.dependOn(&run_cli_plugin_probe.step);
 
     // Privileged eBPF integration suite: a separate test root run with the
     // eBPF gates enabled and REQUIRED, so missing CAP_BPF/CAP_NET_ADMIN (or an

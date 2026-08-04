@@ -816,12 +816,14 @@ pub const protocol_module = config.ProtocolModule{
 };
 
 fn createProtocolListener(
+    context: ?*anyopaque,
     outer_allocator: Allocator,
     resolved: config.ResolvedConfiguration,
     logger: *log.LogStore,
     selector: ?upstream.Selector,
     start_paused: bool,
 ) anyerror!*config.Listener {
+    _ = context;
     const listener = try outer_allocator.create(TCPListener);
     errdefer outer_allocator.destroy(listener);
     listener.* = try TCPListener.init(resolved, logger, .{ .upstream_selector = selector });

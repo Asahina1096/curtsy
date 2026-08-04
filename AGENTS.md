@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/UDP 透明流量转发器，仅支持 Linux。它在固定地址和端口上监听 TCP、UDP 或两种协议，并把流量转发到固定上游。默认只运行一条监听规则和一个上游；配置出现顶层 `rules` 列表时启用可选的多规则模块（多监听规则 + 规则内多上游负载均衡）。不终止 TLS、不检查流量内容、不记录转发数据正文。
+Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透明流量转发器，仅支持 Linux。内置 TCP/UDP 数据面，运行时插件可按名称增加协议或覆盖内置实现。它在固定地址和端口上监听配置的协议，并把流量转发到固定上游。默认只运行一条监听规则和一个上游；配置出现顶层 `rules` 列表时启用可选的多规则模块（多监听规则 + 规则内多上游负载均衡）。不终止 TLS、不检查流量内容、不记录转发数据正文。
 
 - 语言与工具链：仓库内 `.toolchain` 固定 Zig 0.16.0 和 libbpf/libelf/zlib/zstd 静态依赖；eBPF 内核程序位于 `src/ebpf/*.bpf.c`，由 Zig 发行包内置的 Clang 前端在构建期编译为标准 BPF ELF。正常构建不从 PATH、`/usr/include` 或 `/usr/lib` 解析依赖。用户态代码无条件使用 Linux syscall、epoll、eventfd、signalfd、recvmmsg/sendmmsg 与 eBPF API，不保留其他平台的编译期回退。
 - 关键配置清单：`build.zig`（构建定义）、`config.example.yaml`（配置示例）。
@@ -44,6 +44,8 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的 TCP/
 
 - `src/modules/core.zig`：核心模块（`ngx_core_module` 对应物）。拥有 `version`/`protocols`/`listen`/`upstream` 根指令（单规则语法糖，resolve 时合成为一条规则）、组合配置模型（`ForwarderConfiguration`/`ResolvedConfiguration`/`ResolvedForwarder`）、地址解析与跨规则监听冲突检测、协议模块接口（`Listener` vtable + `ProtocolModule`）、统一编排器 `ForwarderService`（单 cycle 驱动 1..N 条规则；SIGHUP 跑新 cycle 后按规则 listen 地址集合 diff，匹配规则原地更新、新规则先绑定再退役旧规则；auto 线程数按规则数均分；tuning daemon 聚合各规则用量）。
 - `src/modules/rules.zig`：`rules` 根指令与规则内 `listen`/`upstreams`/`protocols`/`balance` 指令、规则模型与校验。
+- `src/modules/cli.zig`：命令行运行模式模块（可选、默认关闭）。解析 `--listen`/`--upstream`（单规则简写）、可重复的 `--rule`/`--plugin`，以及归属最近插件的 `--plugin-config key=value`，把简写渲染成含可选 `plugins:` 与 `rules:` 的 YAML 文档后走 `conf.loadYaml`，因此 CLI 规则复用插件配置事务、rules 解码/校验/默认值与 core 编排器的 SIGHUP 热重载；命令行简写早校验端口/weight 和名字语法，动态协议/balancer 的存在性在插件加载后的 resolve 阶段校验。`src/main.zig` 在同时给出 `--config` 与 CLI 端点/plugin flag 时报错退出（互斥）。
+- `src/plugin.zig` / `src/modules/plugins.zig`：运行时共享库插件管理器与 `plugins` 配置模块。插件使用 `include/curtsy_plugin.h` 的版本化 C ABI；候选重载先初始化新增插件，转发配置提交后再退役被移除插件。ABI v1 支持生命周期、日志、opaque context、动态 balancer、按名称增加协议或覆盖内置 TCP/UDP，以及 `plugins[].config` 扁平标量 mapping 的 `prepare`/`commit`/`discard` 事务；upstream generation 和动态 listener 对插件持引用，引用归零后才 `deinit`/`dlclose`。协议插件获得稳定 selector（选路及健康上报）和可选累计 metrics 回调。
 - `src/modules/timeouts.zig` / `limits.zig` / `logging.zig` / `runtime.zig` / `performance.zig`：各配置 section 模块。timeouts/limits 同时有 root 和 rule 上下文（规则级为覆盖项，`merge()` 应用到全局值上并清掉对应 auto 标记）。
 - `src/modules/upstream.zig`：上游框架（`ngx_upstream` 对应物）。`UpstreamPool`（peer 状态：被动健康摘除，连续失败 3 次摘除 10 秒，指数回退上限 5 分钟，冷却自动恢复；热加载经 `rebind` 按地址继承健康；pool 对象地址稳定）、注入数据面的 `Selector` 钩子、balancer 注册表。
 - `src/modules/balancer/round_robin.zig` / `source_hash.zig` / `weighted_round_robin.zig`：可插拔负载均衡模块，`balance:` 按名字经注册表选择。

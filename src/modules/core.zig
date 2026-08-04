@@ -20,6 +20,7 @@ const posix = std.posix;
 
 const autotune = @import("../autotune.zig");
 const bpf = @import("../bpf.zig");
+const cli = @import("cli.zig");
 const conf = @import("../conf.zig");
 const fw = @import("../module.zig");
 const limits = @import("limits.zig");
@@ -27,6 +28,8 @@ const log = @import("../log.zig");
 const logging = @import("logging.zig");
 const net = @import("../net.zig");
 const performance = @import("performance.zig");
+const plugin = @import("../plugin.zig");
+const plugins = @import("plugins.zig");
 const rules = @import("rules.zig");
 const runtime = @import("runtime.zig");
 const timeouts = @import("timeouts.zig");
@@ -56,6 +59,25 @@ pub const RuntimeOptions = runtime.RuntimeOptions;
 pub const PerformanceConfiguration = performance.PerformanceConfiguration;
 pub const SockmapAccelerationMode = performance.SockmapAccelerationMode;
 pub const RuleConfiguration = rules.RuleConfiguration;
+
+/// Where a running service loads its configuration cycle from. `file` is the
+/// classic YAML path (re-read on SIGHUP); `cli` re-renders the parsed CLI
+/// shorthand through cli.loadCycle, so CLI rules hot-reload through the same
+/// transactional machinery (re-validating and re-resolving hostnames; the
+/// process-fixed argument list means the rules themselves do not change).
+pub const ConfigSource = union(enum) {
+    file: []const u8,
+    cli: *const cli.Configuration,
+};
+
+/// Load a fresh configuration cycle from the source, mirroring how the main
+/// entry point bootstraps the first cycle.
+fn loadConfigCycle(gpa: Allocator, source: ConfigSource, diag: *conf.Diagnostics) conf.LoadError!conf.Cycle {
+    return switch (source) {
+        .file => |path| conf.loadFile(gpa, path, diag),
+        .cli => |config| cli.loadCycle(gpa, config, diag),
+    };
+}
 
 /// Composed configuration: global sections from the section modules plus
 /// the endpoint view. Used as the global view and (merged with rule
@@ -205,6 +227,17 @@ pub const UdpMetrics = struct {
     sockmap_pass_bytes: u64 = 0,
 };
 
+/// Protocol-neutral counters exported by runtime protocol plugins. They are
+/// aggregated across plugin listeners; protocol-specific detail remains the
+/// plugin's responsibility.
+pub const PluginMetrics = struct {
+    received_messages: u64 = 0,
+    sent_messages: u64 = 0,
+    received_bytes: u64 = 0,
+    sent_bytes: u64 = 0,
+    errors: u64 = 0,
+};
+
 /// Protocol-neutral data-path accounting surfaced through the Listener vtable
 /// and aggregated across every listener of every live rule by the service
 /// layer. Each protocol adapter fills only its protocol half; the other half
@@ -218,12 +251,15 @@ pub const UdpMetrics = struct {
 pub const MetricsSnapshot = struct {
     tcp: TcpMetrics = .{},
     udp: UdpMetrics = .{},
+    plugin: PluginMetrics = .{},
 
-    pub const zero: MetricsSnapshot = .{ .tcp = .{}, .udp = .{} };
+    pub const zero: MetricsSnapshot = .{ .tcp = .{}, .udp = .{}, .plugin = .{} };
 
     /// True when every field is zero (used to skip idle metric log lines).
     pub fn isZero(self: MetricsSnapshot) bool {
-        return isZeroFields(TcpMetrics, self.tcp) and isZeroFields(UdpMetrics, self.udp);
+        return isZeroFields(TcpMetrics, self.tcp) and
+            isZeroFields(UdpMetrics, self.udp) and
+            isZeroFields(PluginMetrics, self.plugin);
     }
 
     /// Element-wise sum; aggregates per-listener snapshots into a
@@ -232,6 +268,7 @@ pub const MetricsSnapshot = struct {
         return .{
             .tcp = bpf.counters.add(TcpMetrics, a.tcp, b.tcp),
             .udp = bpf.counters.add(UdpMetrics, a.udp, b.udp),
+            .plugin = bpf.counters.add(PluginMetrics, a.plugin, b.plugin),
         };
     }
 
@@ -242,6 +279,7 @@ pub const MetricsSnapshot = struct {
         return .{
             .tcp = bpf.counters.delta(TcpMetrics, current.tcp, previous.tcp),
             .udp = bpf.counters.delta(UdpMetrics, current.udp, previous.udp),
+            .plugin = bpf.counters.delta(PluginMetrics, current.plugin, previous.plugin),
         };
     }
 
@@ -272,6 +310,9 @@ pub const Listener = struct {
     buffered_bytes_fn: *const fn (context: *anyopaque) i64,
     associations_fn: *const fn (context: *anyopaque) u64,
     metrics_fn: *const fn (context: *anyopaque) MetricsSnapshot,
+    drains_connections: bool = false,
+    owner_context: ?*anyopaque = null,
+    owner_release_fn: ?*const fn (context: ?*anyopaque) void = null,
 
     pub fn activate(self: *Listener) void {
         self.activate_fn(self.context);
@@ -283,6 +324,7 @@ pub const Listener = struct {
 
     pub fn destroy(self: *Listener) void {
         self.destroy_fn(self.allocator, self.context);
+        if (self.owner_release_fn) |release| release(self.owner_context);
         self.allocator.destroy(self);
     }
 
@@ -326,8 +368,239 @@ pub const ProtocolModule = struct {
     protocol: ForwardProtocol,
     /// TCP-style listeners park for connection draining on retire.
     drains_connections: bool,
-    create: *const fn (allocator: Allocator, resolved: ResolvedConfiguration, logger: *log.LogStore, selector: ?upstream.Selector, start_paused: bool) anyerror!*Listener,
+    context: ?*anyopaque = null,
+    retain: ?*const fn (context: ?*anyopaque) void = null,
+    release: ?*const fn (context: ?*anyopaque) void = null,
+    create: *const fn (context: ?*anyopaque, allocator: Allocator, resolved: ResolvedConfiguration, logger: *log.LogStore, selector: ?upstream.Selector, start_paused: bool) anyerror!*Listener,
 };
+
+/// Build the core-facing adapter for an active plugin replacement. The
+/// compile-time registry falls back to a built-in module for TCP/UDP when this
+/// returns null; other names must be supplied by a loaded plugin.
+pub fn dynamicProtocolModule(protocol: ForwardProtocol) ?ProtocolModule {
+    const binding = plugin.protocolBinding(protocol.name()) orelse return null;
+    return .{
+        .name = binding.name,
+        .protocol = protocol,
+        .drains_connections = binding.api.drains_connections != 0,
+        .context = binding,
+        .retain = dynamicProtocolRetain,
+        .release = dynamicProtocolRelease,
+        .create = dynamicProtocolCreate,
+    };
+}
+
+const DynamicProtocolListener = struct {
+    binding: *plugin.ProtocolBinding,
+    listener_context: ?*anyopaque,
+    selector: ?upstream.Selector,
+};
+
+fn dynamicProtocolRetain(context: ?*anyopaque) void {
+    const binding: *plugin.ProtocolBinding = @ptrCast(@alignCast(context.?));
+    binding.retain();
+}
+
+fn dynamicProtocolRelease(context: ?*anyopaque) void {
+    const binding: *plugin.ProtocolBinding = @ptrCast(@alignCast(context.?));
+    binding.release();
+}
+
+fn dynamicProtocolCreate(
+    context: ?*anyopaque,
+    allocator: Allocator,
+    resolved: ResolvedConfiguration,
+    logger: *log.LogStore,
+    selector: ?upstream.Selector,
+    start_paused: bool,
+) anyerror!*Listener {
+    _ = logger;
+    const binding: *plugin.ProtocolBinding = @ptrCast(@alignCast(context.?));
+    const adapter = try allocator.create(DynamicProtocolListener);
+    errdefer allocator.destroy(adapter);
+    adapter.* = .{ .binding = binding, .listener_context = null, .selector = selector };
+    var addresses: [2]plugin.CSocketAddress = undefined;
+    std.debug.assert(resolved.listen_addresses.len <= addresses.len);
+    for (resolved.listen_addresses, 0..) |address, i| addresses[i] = cSocketAddress(address);
+    var protocol_configuration = dynamicProtocolConfiguration(adapter, resolved, addresses[0..resolved.listen_addresses.len], start_paused);
+    var listener_context: ?*anyopaque = null;
+    if (binding.api.create.?(binding.plugin_context, &protocol_configuration, &listener_context) != 0) {
+        return error.PluginProtocolCreateFailed;
+    }
+    adapter.listener_context = listener_context;
+    errdefer binding.api.destroy.?(listener_context);
+    const wrapper = try allocator.create(Listener);
+    wrapper.* = .{
+        .allocator = allocator,
+        .context = adapter,
+        .activate_fn = dynamicListenerActivate,
+        .stop_accepting_fn = dynamicListenerStopAccepting,
+        .destroy_fn = dynamicListenerDestroy,
+        .update_configuration_fn = dynamicListenerUpdateConfiguration,
+        .update_backlog_fn = if (binding.api.update_backlog != null) dynamicListenerUpdateBacklog else null,
+        .force_close_fn = dynamicListenerForceClose,
+        .active_count_fn = dynamicListenerActiveCount,
+        .buffered_bytes_fn = dynamicListenerBufferedBytes,
+        .associations_fn = dynamicListenerAssociations,
+        .metrics_fn = dynamicListenerMetrics,
+    };
+    return wrapper;
+}
+
+fn cSocketAddress(address: SocketAddr) plugin.CSocketAddress {
+    return .{
+        .family = switch (address.family) {
+            .v4 => 4,
+            .v6 => 6,
+        },
+        .address = address.addr,
+        .port = address.port,
+        .scope_id = address.scope_id,
+    };
+}
+
+fn dynamicProtocolConfiguration(
+    adapter: *DynamicProtocolListener,
+    resolved: ResolvedConfiguration,
+    addresses: []const plugin.CSocketAddress,
+    start_paused: bool,
+) plugin.ProtocolConfiguration {
+    return .{
+        .struct_size = @sizeOf(plugin.ProtocolConfiguration),
+        .protocol_name = adapter.binding.name.ptr,
+        .protocol_name_len = adapter.binding.name.len,
+        .listen_addresses = addresses.ptr,
+        .listen_address_count = addresses.len,
+        .upstream_address = cSocketAddress(resolved.upstream_address),
+        .upstream_selector = .{
+            .context = adapter,
+            .is_multi = dynamicSelectorIsMulti,
+            .pick = dynamicSelectorPick,
+            .report_success = dynamicSelectorReportSuccess,
+            .report_failure = dynamicSelectorReportFailure,
+        },
+        .connect_seconds = resolved.configuration.timeouts.connect_seconds,
+        .tcp_idle_seconds = resolved.configuration.timeouts.tcp_idle_seconds,
+        .udp_session_seconds = resolved.configuration.timeouts.udp_session_seconds,
+        .tcp_listen_backlog = resolved.configuration.limits.tcp_listen_backlog,
+        .max_tcp_buffered_bytes = resolved.configuration.limits.max_tcp_buffered_bytes,
+        .max_udp_associations = resolved.configuration.limits.max_udp_associations,
+        .worker_threads = resolved.configuration.runtime.worker_threads,
+        .udp_io_threads = resolved.configuration.performance.udp_io_threads,
+        .start_paused = @intFromBool(start_paused),
+    };
+}
+
+fn dynamicAdapter(context: *anyopaque) *DynamicProtocolListener {
+    return @ptrCast(@alignCast(context));
+}
+
+fn dynamicSelector(context: ?*anyopaque) ?upstream.Selector {
+    const adapter: *DynamicProtocolListener = @ptrCast(@alignCast(context orelse return null));
+    return adapter.selector;
+}
+
+fn dynamicSelectorIsMulti(context: ?*anyopaque) callconv(.c) u8 {
+    const selector = dynamicSelector(context) orelse return 0;
+    return @intFromBool(selector.isMulti());
+}
+
+fn dynamicSelectorPick(context: ?*anyopaque, client: ?*const plugin.CSocketAddress, now_ns: u64, selected: *plugin.CSocketAddress) callconv(.c) u8 {
+    const selector = dynamicSelector(context) orelse return 0;
+    const client_address = if (client) |address| socketAddressFromC(address.*) orelse return 0 else null;
+    selected.* = cSocketAddress(selector.pick(client_address, now_ns));
+    return 1;
+}
+
+fn dynamicSelectorReportSuccess(context: ?*anyopaque, address: *const plugin.CSocketAddress) callconv(.c) void {
+    const selector = dynamicSelector(context) orelse return;
+    selector.reportSuccess(socketAddressFromC(address.*) orelse return);
+}
+
+fn dynamicSelectorReportFailure(context: ?*anyopaque, address: *const plugin.CSocketAddress, now_ns: u64) callconv(.c) void {
+    const selector = dynamicSelector(context) orelse return;
+    selector.reportFailure(socketAddressFromC(address.*) orelse return, now_ns);
+}
+
+fn socketAddressFromC(address: plugin.CSocketAddress) ?SocketAddr {
+    return switch (address.family) {
+        4 => SocketAddr.initV4(address.address[0..4].*, address.port),
+        6 => blk: {
+            var result = SocketAddr.initV6(address.address, address.port);
+            result.scope_id = address.scope_id;
+            break :blk result;
+        },
+        else => null,
+    };
+}
+
+fn dynamicListenerActivate(context: *anyopaque) void {
+    const adapter = dynamicAdapter(context);
+    adapter.binding.api.activate.?(adapter.listener_context);
+}
+
+fn dynamicListenerStopAccepting(context: *anyopaque) void {
+    const adapter = dynamicAdapter(context);
+    adapter.binding.api.stop_accepting.?(adapter.listener_context);
+}
+
+fn dynamicListenerDestroy(allocator: Allocator, context: *anyopaque) void {
+    const adapter = dynamicAdapter(context);
+    adapter.binding.api.destroy.?(adapter.listener_context);
+    allocator.destroy(adapter);
+}
+
+fn dynamicListenerUpdateConfiguration(context: *anyopaque, resolved: ResolvedConfiguration, reset_sessions: bool) void {
+    const adapter = dynamicAdapter(context);
+    var addresses: [2]plugin.CSocketAddress = undefined;
+    std.debug.assert(resolved.listen_addresses.len <= addresses.len);
+    for (resolved.listen_addresses, 0..) |address, i| addresses[i] = cSocketAddress(address);
+    var protocol_configuration = dynamicProtocolConfiguration(adapter, resolved, addresses[0..resolved.listen_addresses.len], false);
+    adapter.binding.api.update_configuration.?(adapter.listener_context, &protocol_configuration, @intFromBool(reset_sessions));
+}
+
+fn dynamicListenerUpdateBacklog(context: *anyopaque, backlog: i32) anyerror!void {
+    const adapter = dynamicAdapter(context);
+    if (adapter.binding.api.update_backlog.?(adapter.listener_context, backlog) != 0) {
+        return error.PluginProtocolUpdateRejected;
+    }
+}
+
+fn dynamicListenerForceClose(context: *anyopaque) void {
+    const adapter = dynamicAdapter(context);
+    adapter.binding.api.force_close.?(adapter.listener_context);
+}
+
+fn dynamicListenerActiveCount(context: *anyopaque) usize {
+    const adapter = dynamicAdapter(context);
+    return adapter.binding.api.active_count.?(adapter.listener_context);
+}
+
+fn dynamicListenerBufferedBytes(context: *anyopaque) i64 {
+    const adapter = dynamicAdapter(context);
+    return adapter.binding.api.buffered_bytes.?(adapter.listener_context);
+}
+
+fn dynamicListenerAssociations(context: *anyopaque) u64 {
+    const adapter = dynamicAdapter(context);
+    return adapter.binding.api.association_count.?(adapter.listener_context);
+}
+
+fn dynamicListenerMetrics(context: *anyopaque) MetricsSnapshot {
+    const adapter = dynamicAdapter(context);
+    if (adapter.binding.api.struct_size < @sizeOf(plugin.ProtocolApi) or adapter.binding.api.metrics == null) {
+        return .zero;
+    }
+    var metrics = plugin.CProtocolMetrics{};
+    adapter.binding.api.metrics.?(adapter.listener_context, &metrics);
+    return .{ .plugin = .{
+        .received_messages = metrics.received_messages,
+        .sent_messages = metrics.sent_messages,
+        .received_bytes = metrics.received_bytes,
+        .sent_bytes = metrics.sent_bytes,
+        .errors = metrics.errors,
+    } };
+}
 
 // ---------------------------------------------------------------------------
 // Module declaration: version / protocols / listen / upstream (root sugar)
@@ -524,6 +797,14 @@ pub fn resolveForwarder(
 
     const resolved_rules = try alloc.alloc(ResolvedRule, definitions.len);
     for (definitions, 0..) |definition, i| {
+        var resolved_definition = definition;
+        if (definition.balance_name) |name| {
+            resolved_definition.balance = upstream.balancerByName(name) orelse {
+                var names_buf: [256]u8 = undefined;
+                net.setDiag(gpa, diag, "rules[{d}].balance: expected one of {s}", .{ i, upstream.balancerNames(&names_buf) });
+                return error.ResolutionFailed;
+            };
+        }
         const listen_port: u16 = @intCast(definition.listen.port);
         const listen_addresses = net.resolveListenAddresses(resolve, alloc, definition.listen.host, listen_port, gpa, diag) catch
             return error.ResolutionFailed;
@@ -536,17 +817,23 @@ pub fn resolveForwarder(
         }
 
         resolved_rules[i] = .{
-            .rule = definition,
-            .effective = effectiveConfiguration(globals, definition),
+            .rule = resolved_definition,
+            .effective = effectiveConfiguration(globals, resolved_definition),
             .listen_addresses = listen_addresses,
             .upstream_addresses = upstream_addresses,
         };
+        for (resolved_rules[i].effectiveProtocols()) |protocol| {
+            if (fw.protocolModule(protocol) == null) {
+                net.setDiag(gpa, diag, "rules[{d}].protocols: protocol '{s}' is not registered", .{ i, protocol.name() });
+                return error.ResolutionFailed;
+            }
+        }
     }
 
     for (resolved_rules, 0..) |*a, i| {
         for (resolved_rules[i + 1 ..], i + 1..) |*b, j| {
             if (rulesConflict(a, b)) |protocol| {
-                net.setDiag(gpa, diag, "rules {d} and {d} listen on the same address for protocol {s}", .{ i, j, @tagName(protocol) });
+                net.setDiag(gpa, diag, "rules {d} and {d} listen on the same address for protocol {s}", .{ i, j, protocol.name() });
                 return error.ResolutionFailed;
             }
         }
@@ -566,7 +853,7 @@ fn rulesConflict(a: *const ResolvedRule, b: *const ResolvedRule) ?ForwardProtoco
     for (a.effectiveProtocols()) |protocol| {
         var shared_protocol = false;
         for (b.effectiveProtocols()) |other| {
-            if (protocol == other) {
+            if (protocol.eql(other)) {
                 shared_protocol = true;
                 break;
             }
@@ -582,7 +869,7 @@ fn rulesConflict(a: *const ResolvedRule, b: *const ResolvedRule) ?ForwardProtoco
 }
 
 // ---------------------------------------------------------------------------
-// RuleRuntime: one rule's pool plus its listener pair
+// RuleRuntime: one rule's pool plus its builtin and dynamically named listeners
 // ---------------------------------------------------------------------------
 
 /// Heap-allocated and never moved: selector contexts captured by the
@@ -597,10 +884,37 @@ const RuleRuntime = struct {
     balance: *const upstream.Balancer,
     tcp_listener: ?*Listener = null,
     udp_listener: ?*Listener = null,
+    custom_listeners: std.ArrayList(ProtocolListenerSlot) = .empty,
     /// Thread counts the listeners were started with (change needs restart).
     started_worker_threads: i64,
     started_udp_io_threads: i64,
 };
+
+const ProtocolListenerSlot = struct {
+    protocol: ForwardProtocol,
+    listener: *Listener,
+};
+
+fn customListenerSlot(rt: *RuleRuntime, protocol: ForwardProtocol) ?*ProtocolListenerSlot {
+    for (rt.custom_listeners.items) |*slot| {
+        if (slot.protocol.eql(protocol)) return slot;
+    }
+    return null;
+}
+
+fn preparedCustomSlot(prep: *const MatchPreparation, protocol: ForwardProtocol) ?*const ProtocolListenerSlot {
+    for (prep.added_custom.items) |*slot| {
+        if (slot.protocol.eql(protocol)) return slot;
+    }
+    return null;
+}
+
+fn ruleRuntimeActiveConnectionCount(rt: *const RuleRuntime) usize {
+    var count: usize = 0;
+    if (rt.tcp_listener) |listener| count += listener.activeConnectionCount();
+    for (rt.custom_listeners.items) |slot| count += slot.listener.activeConnectionCount();
+    return count;
+}
 
 /// Every fallible change a reload wants to make to one matched rule, staged
 /// during the prepare phase so nothing is published until all rules are ready.
@@ -619,6 +933,12 @@ const MatchPreparation = struct {
     /// Listeners created for protocols the candidate adds to this rule.
     added_tcp: ?*Listener = null,
     added_udp: ?*Listener = null,
+    added_custom: std.ArrayList(ProtocolListenerSlot) = .empty,
+    /// The protocol remains enabled but its runtime implementation changed
+    /// (dynamic plugin added/removed/replaced), so the staged listener swaps
+    /// in for an existing one at commit.
+    replace_tcp: bool = false,
+    replace_udp: bool = false,
     new_resolved: ResolvedConfiguration = undefined,
     upstream_changed: bool = false,
     want_tcp: bool = false,
@@ -631,10 +951,11 @@ const MatchPreparation = struct {
 
 pub const ForwarderService = struct {
     allocator: Allocator,
-    configuration_path: []const u8,
+    config_source: ConfigSource,
     loaded: conf.Cycle,
     resolved: ResolvedForwarder,
     logger: log.LogStore,
+    plugin_manager: ?plugin.Manager = null,
     worker_threads: i64,
     /// Global-section view for the tuning daemon (which only reads limits).
     tuning_view: ResolvedConfiguration,
@@ -642,22 +963,22 @@ pub const ForwarderService = struct {
     mutex: log.Mutex = .{},
     rules_list: std.ArrayList(*RuleRuntime) = .empty,
     retired_rules: std.ArrayList(*RuleRuntime) = .empty,
-    /// TCP listeners parked for draining after their protocol was removed
+    /// Connection-oriented listeners parked for draining after their protocol was removed
     /// from a surviving rule (the pool stays with the rule).
-    retired_tcp_listeners: std.ArrayList(*Listener) = .empty,
+    retired_draining_listeners: std.ArrayList(*Listener) = .empty,
     retained_cycles: std.ArrayList(conf.Cycle) = .empty,
     tuning_daemon: ?tuning.TuningDaemon = null,
     shutting_down: bool = false,
 
     pub fn init(
         allocator: Allocator,
-        configuration_path: []const u8,
+        config_source: ConfigSource,
         loaded: conf.Cycle,
         resolved: ResolvedForwarder,
     ) ForwarderService {
         return .{
             .allocator = allocator,
-            .configuration_path = configuration_path,
+            .config_source = config_source,
             .loaded = loaded,
             .resolved = resolved,
             .logger = log.LogStore.init(resolved.configuration.logging.level),
@@ -672,10 +993,17 @@ pub const ForwarderService = struct {
         self.rules_list.deinit(self.allocator);
         self.reapRetiredRules(true);
         self.retired_rules.deinit(self.allocator);
-        self.retired_tcp_listeners.deinit(self.allocator);
+        self.retired_draining_listeners.deinit(self.allocator);
         for (self.retained_cycles.items) |*old| old.deinit();
         self.retained_cycles.deinit(self.allocator);
+        if (self.plugin_manager) |*manager_value| manager_value.deinit();
         self.loaded.deinit();
+    }
+
+    pub fn adoptPluginManager(self: *ForwarderService, manager_value: plugin.Manager) void {
+        std.debug.assert(self.plugin_manager == null);
+        self.plugin_manager = manager_value;
+        self.plugin_manager.?.rebindLogger(&self.logger);
     }
 
     pub fn run(self: *ForwarderService) Error!void {
@@ -695,6 +1023,7 @@ pub const ForwarderService = struct {
             },
         );
 
+        try self.loadInitialPlugins();
         try self.startInitialRules();
         self.startTuningDaemonIfNeeded();
         self.logger.info("forwarder started rules={d}", .{self.rules_list.items.len});
@@ -702,16 +1031,35 @@ pub const ForwarderService = struct {
         while (!self.shutting_down) {
             self.pollSignals(signal_fd);
             self.reapRetiredRules(false);
+            if (self.plugin_manager) |*manager_value| manager_value.reap();
         }
 
         self.shutdownRules();
+    }
+
+    fn manager(self: *ForwarderService) *plugin.Manager {
+        if (self.plugin_manager == null) {
+            self.plugin_manager = plugin.Manager.init(self.allocator, &self.logger);
+        }
+        return &self.plugin_manager.?;
+    }
+
+    fn loadInitialPlugins(self: *ForwarderService) !void {
+        if (self.plugin_manager != null) return;
+        const desired = plugins.specs(&self.loaded);
+        var prepared = try self.manager().prepare(desired);
+        errdefer prepared.discard(self.allocator, &self.logger);
+        self.manager().commit(&prepared, desired);
     }
 
     // ------------------------------------------------------------------
     // Startup and shutdown
     // ------------------------------------------------------------------
 
-    fn startInitialRules(self: *ForwarderService) Error!void {
+    /// Starts already-resolved rules without entering the signal loop. Public
+    /// so the shared-library ABI integration probe can exercise dynamic
+    /// protocol listener ownership end to end.
+    pub fn startInitialRules(self: *ForwarderService) Error!void {
         errdefer {
             for (self.rules_list.items) |rt| self.destroyRuleRuntime(rt);
             self.rules_list.clearRetainingCapacity();
@@ -734,6 +1082,17 @@ pub const ForwarderService = struct {
                 listener.destroy();
                 rt.udp_listener = null;
             }
+            var custom_index: usize = 0;
+            while (custom_index < rt.custom_listeners.items.len) {
+                const listener = rt.custom_listeners.items[custom_index].listener;
+                if (listener.drains_connections) {
+                    listener.stopAccepting();
+                    custom_index += 1;
+                } else {
+                    listener.destroy();
+                    _ = rt.custom_listeners.swapRemove(custom_index);
+                }
+            }
             self.retired_rules.append(self.allocator, rt) catch {
                 self.destroyRuleRuntime(rt);
             };
@@ -748,11 +1107,12 @@ pub const ForwarderService = struct {
 
         const remaining = self.retiredConnectionCount();
         if (remaining > 0) {
-            self.logger.warning("forcing tcp connections closed count={d}", .{remaining});
+            self.logger.warning("forcing draining connections closed count={d}", .{remaining});
             for (self.retired_rules.items) |rt| {
                 if (rt.tcp_listener) |listener| listener.forceCloseConnections();
+                for (rt.custom_listeners.items) |slot| slot.listener.forceCloseConnections();
             }
-            for (self.retired_tcp_listeners.items) |listener| listener.forceCloseConnections();
+            for (self.retired_draining_listeners.items) |listener| listener.forceCloseConnections();
         }
         self.reapRetiredRules(true);
         self.logger.info("forwarder stopped", .{});
@@ -790,13 +1150,25 @@ pub const ForwarderService = struct {
         errdefer rt.pool.deinit();
 
         const protocols = candidate.effectiveProtocols();
-        if (net.hasProtocol(protocols, .tcp)) {
-            rt.tcp_listener = try self.createListener(candidate, rt, .tcp, start_paused);
-        }
+        var custom_count: usize = 0;
+        for (protocols) |protocol| switch (protocol) {
+            .tcp, .udp => {},
+            .dynamic => custom_count += 1,
+        };
+        try rt.custom_listeners.ensureTotalCapacity(self.allocator, custom_count);
+        errdefer rt.custom_listeners.deinit(self.allocator);
+        errdefer for (rt.custom_listeners.items) |slot| slot.listener.destroy();
+        if (net.hasProtocol(protocols, .tcp)) rt.tcp_listener = try self.createListener(candidate, rt, .tcp, start_paused);
         errdefer if (rt.tcp_listener) |listener| listener.destroy();
-        if (net.hasProtocol(protocols, .udp)) {
-            rt.udp_listener = try self.createListener(candidate, rt, .udp, start_paused);
-        }
+        if (net.hasProtocol(protocols, .udp)) rt.udp_listener = try self.createListener(candidate, rt, .udp, start_paused);
+        errdefer if (rt.udp_listener) |listener| listener.destroy();
+        for (protocols) |protocol| switch (protocol) {
+            .tcp, .udp => {},
+            .dynamic => {
+                const listener = try self.createListener(candidate, rt, protocol, start_paused);
+                rt.custom_listeners.appendAssumeCapacity(.{ .protocol = protocol, .listener = listener });
+            },
+        };
 
         if (!start_paused) self.logRuleRuntimeStarted(rt);
         return rt;
@@ -817,13 +1189,21 @@ pub const ForwarderService = struct {
     /// transitions do not require rebinding the listen sockets.
     fn createListener(self: *ForwarderService, candidate: *const ResolvedRule, rt: *RuleRuntime, protocol: ForwardProtocol, start_paused: bool) Error!*Listener {
         _ = candidate;
-        return fw.protocolModule(protocol).create(
+        const protocol_module = fw.protocolModule(protocol) orelse return error.ProtocolNotRegistered;
+        if (protocol_module.retain) |retain| retain(protocol_module.context);
+        errdefer if (protocol_module.release) |release| release(protocol_module.context);
+        const listener = try protocol_module.create(
+            protocol_module.context,
             self.allocator,
             rt.resolved,
             &self.logger,
             upstream.poolSelector(&rt.pool),
             start_paused,
         );
+        listener.owner_context = protocol_module.context;
+        listener.owner_release_fn = protocol_module.release;
+        listener.drains_connections = protocol_module.drains_connections;
+        return listener;
     }
 
     /// Prepare every fallible change for one matched rule without publishing
@@ -880,6 +1260,10 @@ pub const ForwarderService = struct {
         errdefer if (prep.generation) |generation| generation.discard(&rt.pool);
         errdefer if (prep.added_tcp) |listener| listener.destroy();
         errdefer if (prep.added_udp) |listener| listener.destroy();
+        errdefer {
+            for (prep.added_custom.items) |slot| slot.listener.destroy();
+            prep.added_custom.deinit(self.allocator);
+        }
 
         if (pool_changed) {
             prep.weights = try self.ruleWeights(candidate.rule);
@@ -890,21 +1274,54 @@ pub const ForwarderService = struct {
             );
         }
 
-        if (want_tcp and rt.tcp_listener == null) {
-            prep.added_tcp = try self.createListener(candidate, rt, .tcp, true);
+        if (want_tcp) {
+            const desired_module = fw.protocolModule(.tcp).?;
+            if (rt.tcp_listener == null or rt.tcp_listener.?.owner_context != desired_module.context) {
+                prep.replace_tcp = rt.tcp_listener != null;
+                prep.added_tcp = try self.createListener(candidate, rt, .tcp, true);
+            }
         }
-        if (want_udp and rt.udp_listener == null) {
-            prep.added_udp = try self.createListener(candidate, rt, .udp, true);
+        if (want_udp) {
+            const desired_module = fw.protocolModule(.udp).?;
+            if (rt.udp_listener == null or rt.udp_listener.?.owner_context != desired_module.context) {
+                prep.replace_udp = rt.udp_listener != null;
+                prep.added_udp = try self.createListener(candidate, rt, .udp, true);
+            }
         }
+
+        var custom_addition_count: usize = 0;
+        for (protocols) |protocol| switch (protocol) {
+            .tcp, .udp => {},
+            .dynamic => {
+                const desired_module = fw.protocolModule(protocol) orelse return error.ProtocolNotRegistered;
+                const current = customListenerSlot(rt, protocol);
+                if (current == null or current.?.listener.owner_context != desired_module.context) {
+                    custom_addition_count += 1;
+                }
+            },
+        };
+        try prep.added_custom.ensureTotalCapacity(self.allocator, custom_addition_count);
+        try rt.custom_listeners.ensureUnusedCapacity(self.allocator, custom_addition_count);
+        for (protocols) |protocol| switch (protocol) {
+            .tcp, .udp => {},
+            .dynamic => {
+                const desired_module = fw.protocolModule(protocol) orelse return error.ProtocolNotRegistered;
+                const current = customListenerSlot(rt, protocol);
+                if (current == null or current.?.listener.owner_context != desired_module.context) {
+                    const listener = try self.createListener(candidate, rt, protocol, true);
+                    prep.added_custom.appendAssumeCapacity(.{ .protocol = protocol, .listener = listener });
+                }
+            },
+        };
 
         const backlog_changed =
             rt.resolved.configuration.limits.tcp_listen_backlog != new_resolved.configuration.limits.tcp_listen_backlog;
         if (backlog_changed) {
-            const listener = rt.tcp_listener orelse prep.added_tcp;
+            const listener = prep.added_tcp orelse rt.tcp_listener;
             if (listener) |l| {
                 const old_backlog = rt.resolved.configuration.limits.tcp_listen_backlog;
                 try l.updateBacklog(@intCast(new_resolved.configuration.limits.tcp_listen_backlog));
-                if (rt.tcp_listener != null) {
+                if (prep.added_tcp == null and rt.tcp_listener != null) {
                     // Only a live listener needs a rollback record; an added
                     // listener is destroyed with the preparation on failure.
                     prep.backlog_listener = rt.tcp_listener;
@@ -922,24 +1339,53 @@ pub const ForwarderService = struct {
     fn commitMatchedRule(self: *ForwarderService, prep: *MatchPreparation) void {
         const rt = prep.rt;
         if (prep.generation) |generation| rt.pool.commitGeneration(generation);
-        if (rt.tcp_listener orelse prep.added_tcp) |listener| listener.updateConfiguration(prep.new_resolved, false);
-        if (rt.udp_listener orelse prep.added_udp) |listener| listener.updateConfiguration(prep.new_resolved, prep.upstream_changed);
+        if (prep.added_tcp orelse rt.tcp_listener) |listener| listener.updateConfiguration(prep.new_resolved, false);
+        if (prep.added_udp orelse rt.udp_listener) |listener| listener.updateConfiguration(prep.new_resolved, prep.upstream_changed);
 
         if (prep.added_tcp) |listener| {
+            if (prep.replace_tcp) {
+                const previous = rt.tcp_listener.?;
+                previous.stopAccepting();
+                self.retired_draining_listeners.append(self.allocator, previous) catch {
+                    previous.forceCloseConnections();
+                    previous.destroy();
+                };
+            }
             rt.tcp_listener = listener;
             listener.activate();
         }
         if (prep.added_udp) |listener| {
+            if (prep.replace_udp) rt.udp_listener.?.destroy();
             rt.udp_listener = listener;
             listener.activate();
         }
+        var custom_index: usize = 0;
+        while (custom_index < rt.custom_listeners.items.len) {
+            const slot = rt.custom_listeners.items[custom_index];
+            if (!net.hasProtocol(prep.candidate_rule.effectiveProtocols(), slot.protocol) or
+                preparedCustomSlot(prep, slot.protocol) != null)
+            {
+                self.retireDetachedListener(slot.listener);
+                _ = rt.custom_listeners.swapRemove(custom_index);
+                continue;
+            }
+            slot.listener.updateConfiguration(prep.new_resolved, prep.upstream_changed);
+            custom_index += 1;
+        }
+        for (prep.added_custom.items) |slot| {
+            slot.listener.updateConfiguration(prep.new_resolved, prep.upstream_changed);
+            slot.listener.activate();
+            rt.custom_listeners.appendAssumeCapacity(slot);
+        }
+        prep.added_custom.clearRetainingCapacity();
+        prep.added_custom.deinit(self.allocator);
 
         if (!prep.want_tcp) {
             if (rt.tcp_listener) |listener| {
                 listener.stopAccepting();
                 // The pool stays with the surviving rule; only the listener
                 // is parked for draining.
-                self.retired_tcp_listeners.append(self.allocator, listener) catch {
+                self.retired_draining_listeners.append(self.allocator, listener) catch {
                     listener.forceCloseConnections();
                     listener.destroy();
                 };
@@ -976,6 +1422,9 @@ pub const ForwarderService = struct {
         prep.added_tcp = null;
         if (prep.added_udp) |listener| listener.destroy();
         prep.added_udp = null;
+        for (prep.added_custom.items) |slot| slot.listener.destroy();
+        prep.added_custom.deinit(self.allocator);
+        prep.added_custom = .empty;
         if (prep.backlog_listener) |listener| {
             listener.updateBacklog(prep.backlog_old) catch {};
         }
@@ -991,6 +1440,8 @@ pub const ForwarderService = struct {
             listener.destroy();
             rt.udp_listener = null;
         }
+        for (rt.custom_listeners.items) |slot| slot.listener.destroy();
+        rt.custom_listeners.deinit(self.allocator);
         rt.pool.deinit();
         self.allocator.destroy(rt);
     }
@@ -1003,12 +1454,24 @@ pub const ForwarderService = struct {
             listener.destroy();
             rt.udp_listener = null;
         }
-        if (rt.tcp_listener == null) {
+        var custom_index: usize = 0;
+        while (custom_index < rt.custom_listeners.items.len) {
+            const listener = rt.custom_listeners.items[custom_index].listener;
+            if (listener.drains_connections) {
+                listener.stopAccepting();
+                custom_index += 1;
+            } else {
+                listener.destroy();
+                _ = rt.custom_listeners.swapRemove(custom_index);
+            }
+        }
+        if (rt.tcp_listener == null and rt.custom_listeners.items.len == 0) {
             self.destroyRuleRuntime(rt);
             return;
         }
         self.retired_rules.append(self.allocator, rt) catch {
             if (rt.tcp_listener) |listener| listener.forceCloseConnections();
+            for (rt.custom_listeners.items) |slot| slot.listener.forceCloseConnections();
             self.destroyRuleRuntime(rt);
         };
     }
@@ -1017,9 +1480,7 @@ pub const ForwarderService = struct {
         var i: usize = 0;
         while (i < self.retired_rules.items.len) {
             const rt = self.retired_rules.items[i];
-            if (!force and rt.tcp_listener != null and
-                rt.tcp_listener.?.activeConnectionCount() != 0)
-            {
+            if (!force and ruleRuntimeActiveConnectionCount(rt) != 0) {
                 i += 1;
                 continue;
             }
@@ -1027,14 +1488,14 @@ pub const ForwarderService = struct {
             _ = self.retired_rules.swapRemove(i);
         }
         var j: usize = 0;
-        while (j < self.retired_tcp_listeners.items.len) {
-            const listener = self.retired_tcp_listeners.items[j];
+        while (j < self.retired_draining_listeners.items.len) {
+            const listener = self.retired_draining_listeners.items[j];
             if (!force and listener.activeConnectionCount() != 0) {
                 j += 1;
                 continue;
             }
             listener.destroy();
-            _ = self.retired_tcp_listeners.swapRemove(j);
+            _ = self.retired_draining_listeners.swapRemove(j);
         }
     }
 
@@ -1042,11 +1503,24 @@ pub const ForwarderService = struct {
         var count: usize = 0;
         for (self.retired_rules.items) |rt| {
             if (rt.tcp_listener) |listener| count += listener.activeConnectionCount();
+            for (rt.custom_listeners.items) |slot| count += slot.listener.activeConnectionCount();
         }
-        for (self.retired_tcp_listeners.items) |listener| {
+        for (self.retired_draining_listeners.items) |listener| {
             count += listener.activeConnectionCount();
         }
         return count;
+    }
+
+    fn retireDetachedListener(self: *ForwarderService, listener: *Listener) void {
+        if (!listener.drains_connections) {
+            listener.destroy();
+            return;
+        }
+        listener.stopAccepting();
+        self.retired_draining_listeners.append(self.allocator, listener) catch {
+            listener.forceCloseConnections();
+            listener.destroy();
+        };
     }
 
     fn findRule(self: *ForwarderService, listen_addresses: []const SocketAddr) ?usize {
@@ -1108,14 +1582,19 @@ pub const ForwarderService = struct {
         defer self.mutex.unlock();
         if (self.shutting_down) return;
 
-        self.logger.info("reloading configuration path={s}", .{self.configuration_path});
+        switch (self.config_source) {
+            .file => |path| self.logger.info("reloading configuration path={s}", .{path}),
+            .cli => |config| self.logger.info("reloading cli configuration rules={d}", .{config.rules.len}),
+        }
 
         var diag = conf.Diagnostics{};
         defer if (diag.message) |message| self.allocator.free(message);
 
         // A reload runs a fresh configuration cycle through the module
-        // engine, then diffs it against the live one.
-        var cycle = conf.loadFile(self.allocator, self.configuration_path, &diag) catch |err| {
+        // engine, then diffs it against the live one. In CLI mode the cycle
+        // is re-rendered from the stored shorthand (re-validated and the
+        // listen/upstream hostnames re-resolved).
+        var cycle = loadConfigCycle(self.allocator, self.config_source, &diag) catch |err| {
             self.logger.err("configuration reload rejected error={s} reason={s}", .{
                 @errorName(err),
                 diag.message orelse "unknown error",
@@ -1133,6 +1612,17 @@ pub const ForwarderService = struct {
             }
             return;
         }
+
+        // Candidate plugin additions register their balancers/protocol
+        // replacements before resolve and listener preparation; discard
+        // restores the old registry if any later stage fails.
+        const desired_plugins = plugins.specs(&cycle);
+        var prepared_plugins = self.manager().prepare(desired_plugins) catch |err| {
+            self.logger.err("configuration reload rejected error={s} stage=plugins", .{@errorName(err)});
+            return;
+        };
+        var owns_prepared_plugins = true;
+        defer if (owns_prepared_plugins) prepared_plugins.discard(self.allocator, &self.logger);
 
         const candidate = resolveForwarder(
             self.allocator,
@@ -1165,6 +1655,8 @@ pub const ForwarderService = struct {
         self.loaded = cycle;
         owns_cycle = false;
         self.resolved = candidate;
+        self.manager().commit(&prepared_plugins, desired_plugins);
+        owns_prepared_plugins = false;
         self.logger.update(candidate.configuration.logging.level);
         self.logger.info("configuration reloaded rules={d}", .{candidate.rules.len});
     }
@@ -1184,7 +1676,7 @@ pub const ForwarderService = struct {
     /// listeners, `self.resolved`, tuning view and cycle ownership all stay on
     /// the previous configuration, the candidate cycle is released normally by
     /// the caller, and preflighted live backlog changes are rolled back.
-    fn apply(self: *ForwarderService, candidate: ResolvedForwarder) Error!void {
+    pub fn apply(self: *ForwarderService, candidate: ResolvedForwarder) Error!void {
         const requested_worker_threads = autotune.workerThreads(candidate.configuration.runtime.worker_threads, .system());
         if (requested_worker_threads != self.worker_threads) {
             self.logger.warning("runtime worker thread change requires restart current={d} requested={d}", .{
@@ -1240,6 +1732,7 @@ pub const ForwarderService = struct {
         for (created.items) |rt| {
             if (rt.tcp_listener) |listener| listener.activate();
             if (rt.udp_listener) |listener| listener.activate();
+            for (rt.custom_listeners.items) |slot| slot.listener.activate();
             self.logRuleRuntimeStarted(rt);
         }
         // Retire unmatched old rules (all candidate bindings were established
@@ -1282,7 +1775,7 @@ pub const ForwarderService = struct {
         self.tuning_daemon = null;
     }
 
-    fn snapshot(self: *ForwarderService) ?tuning.TuningSnapshot {
+    pub fn snapshot(self: *ForwarderService) ?tuning.TuningSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.shutting_down) return null;
@@ -1297,6 +1790,11 @@ pub const ForwarderService = struct {
             if (rt.udp_listener) |listener| {
                 udp_associations += listener.associationCount();
                 metrics = MetricsSnapshot.add(metrics, listener.metrics());
+            }
+            for (rt.custom_listeners.items) |slot| {
+                tcp_buffered += slot.listener.bufferedBytesUsed();
+                udp_associations += slot.listener.associationCount();
+                metrics = MetricsSnapshot.add(metrics, slot.listener.metrics());
             }
         }
         return .{
@@ -1340,6 +1838,7 @@ pub const ForwarderService = struct {
             };
             if (rt.tcp_listener) |listener| listener.updateConfiguration(new_resolved, false);
             if (rt.udp_listener) |listener| listener.updateConfiguration(new_resolved, false);
+            for (rt.custom_listeners.items) |slot| slot.listener.updateConfiguration(new_resolved, false);
             rt.resolved = new_resolved;
         }
     }
@@ -1497,6 +1996,23 @@ test "loads defaults" {
     try testing.expectEqual(PerformanceConfiguration.default_udp_socket_buffer_bytes, config.performance.udp_socket_buffer_bytes);
     try testing.expectEqual(PerformanceConfiguration.default_udp_datagram_buffer_bytes, config.performance.udp_datagram_buffer_bytes);
     try testing.expectEqual(0, config.performance.udp_io_threads);
+}
+
+test "resolve rejects a dynamically named protocol until a plugin registers it" {
+    var cycle = try loadForTest(
+        \\protocols: [not_loaded]
+        \\listen: { host: "127.0.0.1", port: 9000 }
+        \\upstream: { host: "127.0.0.1", port: 9001 }
+        \\
+    );
+    defer cycle.deinit();
+    var diag = conf.Diagnostics{};
+    defer if (diag.message) |message| testing.allocator.free(message);
+    try testing.expectError(
+        error.ResolutionFailed,
+        resolveForwarder(testing.allocator, cycle.allocator(), &cycle, null, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "not_loaded") != null);
 }
 
 test "loads overrides" {
@@ -2143,7 +2659,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, config_path, initial.cycle, initial.resolved);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2225,6 +2741,47 @@ test "failed reload is transactional: matched rules stay entirely old" {
     try testing.expectEqual(@as(u16, upstream_port + 5), service.rules_list.items[1].resolved.configuration.upstream.port);
 }
 
+test "cli source starts and reloads through the config source" {
+    const port = try freeTcpPort();
+    const upstream_port = try freeTcpPort();
+
+    var diag = conf.Diagnostics{};
+    defer if (diag.message) |message| testing.allocator.free(message);
+    var spec_buf: [160]u8 = undefined;
+    const spec = std.fmt.bufPrint(&spec_buf, "listen=127.0.0.1:{d},upstreams=127.0.0.1:{d}", .{ port, upstream_port }) catch unreachable;
+    var config = (try cli.parseFlags(testing.allocator, null, null, &.{spec}, null, null, &diag)).?;
+    defer config.deinit();
+
+    // The service owns the cycle: cli.loadCycle renders the shorthand into a
+    // rules document and the engine resolves the loopback endpoints.
+    var cycle = try cli.loadCycle(testing.allocator, &config, &diag);
+    var resolve_diag = conf.Diagnostics{};
+    defer if (resolve_diag.message) |message| testing.allocator.free(message);
+    const resolved = resolveForwarder(testing.allocator, cycle.allocator(), &cycle, null, &resolve_diag) catch {
+        cycle.deinit();
+        return error.TestResolveFailed;
+    };
+
+    var service = ForwarderService.init(testing.allocator, .{ .cli = &config }, cycle, resolved);
+    service.startInitialRules() catch {
+        service.deinit();
+        return error.TestInitialStartFailed;
+    };
+    defer service.deinit();
+
+    try testing.expectEqual(@as(usize, 1), service.rules_list.items.len);
+    try testing.expect(service.rules_list.items[0].tcp_listener != null);
+
+    // A SIGHUP reload re-renders the stored CLI shorthand and re-resolves the
+    // same rule; the diff is a no-op and the previous cycle is retained.
+    service.reload();
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), service.resolved.rules.len);
+    try testing.expectEqual(@as(u16, upstream_port), service.resolved.rules[0].upstream_addresses[0].port);
+    try testing.expectEqual(@as(usize, 1), service.rules_list.items.len);
+    try testing.expectEqual(@as(u16, upstream_port), service.rules_list.items[0].resolved.configuration.upstream.port);
+}
+
 /// Writes `text` to `path`, truncating any prior content.
 fn writeTestConfig(path: []const u8, text: []const u8) !void {
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
@@ -2255,28 +2812,36 @@ test "metrics snapshot zero add delta and isZero" {
     const a = MetricsSnapshot{
         .tcp = .{ .splice_bytes = 10, .splice_calls = 2 },
         .udp = .{ .recv_calls = 5 },
+        .plugin = .{ .received_messages = 4, .received_bytes = 40 },
     };
     const b = MetricsSnapshot{
         .tcp = .{ .splice_bytes = 3 },
         .udp = .{ .recv_calls = 7, .recv_datagrams = 4 },
+        .plugin = .{ .received_messages = 3, .errors = 1 },
     };
     const sum = MetricsSnapshot.add(a, b);
     try testing.expectEqual(@as(u64, 13), sum.tcp.splice_bytes);
     try testing.expectEqual(@as(u64, 2), sum.tcp.splice_calls);
     try testing.expectEqual(@as(u64, 12), sum.udp.recv_calls);
     try testing.expectEqual(@as(u64, 4), sum.udp.recv_datagrams);
+    try testing.expectEqual(@as(u64, 7), sum.plugin.received_messages);
+    try testing.expectEqual(@as(u64, 40), sum.plugin.received_bytes);
+    try testing.expectEqual(@as(u64, 1), sum.plugin.errors);
 
     // delta reports only the growth since the previous snapshot; a field that
     // shrank (wrap or external reset) saturates to zero.
     const grown = MetricsSnapshot{
         .tcp = .{ .splice_bytes = 17 },
         .udp = .{ .recv_datagrams = 10 },
+        .plugin = .{ .received_messages = 9, .sent_messages = 2 },
     };
     const d = MetricsSnapshot.delta(grown, a);
     try testing.expectEqual(@as(u64, 7), d.tcp.splice_bytes);
     try testing.expectEqual(@as(u64, 0), d.tcp.splice_calls);
     try testing.expectEqual(@as(u64, 0), d.udp.recv_calls);
     try testing.expectEqual(@as(u64, 10), d.udp.recv_datagrams);
+    try testing.expectEqual(@as(u64, 5), d.plugin.received_messages);
+    try testing.expectEqual(@as(u64, 2), d.plugin.sent_messages);
     try testing.expect(!d.isZero());
 
     // A listener replaced by a fresh generation starts at zero: the delta
@@ -2376,7 +2941,7 @@ test "snapshot aggregates listener metrics across rules" {
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.2", port: 9001 }
     , null);
-    var service = ForwarderService.init(testing.allocator, "metrics-test.yaml", result.cycle, result.resolved);
+    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved);
     defer service.deinit();
 
     // Rule 0: one TCP listener. Rule 1: TCP + UDP. The service-level snapshot
@@ -2411,7 +2976,7 @@ test "snapshot metrics stay all-zero when a service has no listeners" {
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.2", port: 9001 }
     , null);
-    var service = ForwarderService.init(testing.allocator, "metrics-test.yaml", result.cycle, result.resolved);
+    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved);
     defer service.deinit();
     const snap = service.snapshot().?;
     try testing.expect(snap.metrics.isZero());

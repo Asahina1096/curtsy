@@ -17,19 +17,22 @@ pub const balancer: upstream.Balancer = .{
     .pick = pick,
 };
 
-fn build(allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque {
+fn build(context: ?*anyopaque, allocator: Allocator, addresses: []const net.SocketAddr, weights: []const u32) error{OutOfMemory}!?*anyopaque {
+    _ = context;
     _ = allocator;
     _ = addresses;
     _ = weights;
     return null;
 }
 
-fn destroy(allocator: Allocator, state: ?*anyopaque) void {
+fn destroy(context: ?*anyopaque, allocator: Allocator, state: ?*anyopaque) void {
+    _ = context;
     _ = allocator;
     _ = state;
 }
 
-fn pick(state: ?*anyopaque, upstreams: []const upstream.UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize {
+fn pick(context: ?*anyopaque, state: ?*anyopaque, upstreams: []const upstream.UpstreamState, cursor: *std.atomic.Value(u32), client: ?net.SocketAddr, now_ns: u64) usize {
+    _ = context;
     _ = state;
     const start: usize = if (client) |address| hashClient(address) % upstreams.len else blk: {
         break :blk cursor.fetchAdd(1, .monotonic) % @as(u32, @intCast(upstreams.len));

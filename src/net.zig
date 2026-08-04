@@ -17,7 +17,32 @@ pub fn setDiag(gpa: Allocator, diag: *Diagnostics, comptime fmt: []const u8, arg
     diag.message = std.fmt.allocPrint(gpa, fmt, args) catch "out of memory while reporting error";
 }
 
-pub const ForwardProtocol = enum { tcp, udp };
+/// Configuration-facing protocol identity. TCP and UDP keep compact builtin
+/// tags; runtime plugins may add arbitrary validated names without changing
+/// the configuration model or recompiling the host.
+pub const ForwardProtocol = union(enum) {
+    tcp,
+    udp,
+    dynamic: []const u8,
+
+    pub fn fromName(name_value: []const u8) ForwardProtocol {
+        if (std.mem.eql(u8, name_value, "tcp")) return .tcp;
+        if (std.mem.eql(u8, name_value, "udp")) return .udp;
+        return .{ .dynamic = name_value };
+    }
+
+    pub fn name(self: ForwardProtocol) []const u8 {
+        return switch (self) {
+            .tcp => "tcp",
+            .udp => "udp",
+            .dynamic => |value| value,
+        };
+    }
+
+    pub fn eql(self: ForwardProtocol, other: ForwardProtocol) bool {
+        return std.mem.eql(u8, self.name(), other.name());
+    }
+};
 
 pub const EndpointConfiguration = struct {
     host: []const u8,
@@ -235,7 +260,7 @@ pub fn defaultResolver(host: []const u8, port: u16) anyerror!SocketAddr {
 
 pub fn hasProtocol(protocols: []const ForwardProtocol, protocol: ForwardProtocol) bool {
     for (protocols) |candidate| {
-        if (candidate == protocol) return true;
+        if (candidate.eql(protocol)) return true;
     }
     return false;
 }
@@ -244,7 +269,7 @@ pub fn protocolsString(protocols: []const ForwardProtocol, buf: []u8) []const u8
     var fbs = std.Io.Writer.fixed(buf);
     for (protocols, 0..) |protocol, i| {
         if (i > 0) fbs.print(",", .{}) catch return buf[0..fbs.end];
-        fbs.print("{s}", .{@tagName(protocol)}) catch return buf[0..fbs.end];
+        fbs.print("{s}", .{protocol.name()}) catch return buf[0..fbs.end];
     }
     return buf[0..fbs.end];
 }
@@ -268,12 +293,21 @@ pub fn validateProtocols(gpa: Allocator, diag: *Diagnostics, protocols: []const 
     }
     for (protocols, 0..) |protocol, i| {
         for (protocols[i + 1 ..]) |other| {
-            if (protocol == other) {
+            if (protocol.eql(other)) {
                 setDiag(gpa, diag, "{s} must not contain duplicates", .{prefix});
                 return error.InvalidConfiguration;
             }
         }
     }
+}
+
+pub fn validProtocolName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 63) return false;
+    for (name, 0..) |char, i| {
+        const valid = std.ascii.isAlphanumeric(char) or char == '_' or char == '-';
+        if (!valid or (i == 0 and std.ascii.isDigit(char))) return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

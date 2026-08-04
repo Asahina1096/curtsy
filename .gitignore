@@ -4,6 +4,7 @@
 /zig-out/
 /.toolchain/
 /.perf-test/
+/.alintcache
 /*.deb
 /debian/.debhelper/
 /debian/curtsy/
