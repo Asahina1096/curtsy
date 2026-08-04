@@ -126,8 +126,11 @@ pub const ResolvedRule = struct {
     /// One resolved address per rule.upstreams entry, same order.
     upstream_addresses: []SocketAddr,
 
+    /// The effective view's protocols: `effectiveConfiguration` already merged
+    /// the rule override over the global list when it built `effective`, so the
+    /// global fallback lives in exactly one place.
     pub fn effectiveProtocols(self: *const ResolvedRule) []ForwardProtocol {
-        return self.rule.protocols orelse self.effective.protocols;
+        return self.effective.protocols;
     }
 };
 
@@ -943,11 +946,14 @@ pub const ForwarderService = struct {
             .events = linux.POLL.IN,
             .revents = 0,
         }};
-        const ready = posix.poll(&fds, reap_interval_ms) catch |err| {
+        _ = posix.poll(&fds, reap_interval_ms) catch |err| {
             self.logger.err("signal poll failed error={s}", .{@errorName(err)});
             return;
         };
-        if (ready == 0 or (fds[0].revents & linux.POLL.IN) == 0) return;
+        // A poll timeout reports zero ready fds, which is already covered here:
+        // on timeout every revents field is zero, so only the IN bit check is
+        // needed to distinguish "nothing happened" from "signal readable".
+        if ((fds[0].revents & linux.POLL.IN) == 0) return;
 
         while (true) {
             var info: linux.signalfd_siginfo = undefined;

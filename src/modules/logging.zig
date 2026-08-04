@@ -4,9 +4,9 @@
 //! validates the configured level, like an nginx module owning its
 //! error_log directive.
 
-const std = @import("std");
 const conf = @import("../conf.zig");
 const fw = @import("../module.zig");
+const log = @import("../log.zig");
 const yaml = @import("../yaml.zig");
 
 pub const LogConfiguration = struct {
@@ -43,19 +43,10 @@ fn setLogging(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []
 }
 
 fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
-    if (!isValidLogLevel(cycle.conf(@This()).level)) {
+    // The level vocabulary lives in log.Level; fromString is the single
+    // case-insensitive parser for it.
+    if (log.Level.fromString(cycle.conf(@This()).level) == null) {
         yaml.setDiag(cycle.gpa, cycle.diag, "logging.level is invalid", .{});
         return error.InvalidConfiguration;
     }
-}
-
-pub fn isValidLogLevel(level: []const u8) bool {
-    var buf: [16]u8 = undefined;
-    if (level.len > buf.len) return false;
-    const lower = std.ascii.lowerString(&buf, level);
-    const valid = [_][]const u8{ "trace", "debug", "info", "notice", "warning", "error", "critical" };
-    for (valid) |name| {
-        if (std.mem.eql(u8, name, lower)) return true;
-    }
-    return false;
 }

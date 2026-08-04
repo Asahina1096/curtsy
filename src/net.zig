@@ -176,8 +176,7 @@ pub fn resolveListenAddresses(
         pair[1] = SocketAddr.initV6(@splat(0), port);
         return pair;
     }
-    const address = resolverAddress(resolve, host, port, gpa, diag) catch
-        return error.ResolutionFailed;
+    const address = try resolverAddress(resolve, host, port, gpa, diag);
     const single = try alloc.alloc(SocketAddr, 1);
     single[0] = address;
     return single;

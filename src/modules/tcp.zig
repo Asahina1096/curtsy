@@ -153,7 +153,6 @@ pub const TCPBufferBudget = struct {
     }
 
     pub fn tryAcquire(self: *TCPBufferBudget, byte_count: usize) bool {
-        if (byte_count == 0) return true;
         const count: i64 = @intCast(byte_count);
         while (true) {
             const current = self.used_bytes.load(.monotonic);
@@ -166,7 +165,6 @@ pub const TCPBufferBudget = struct {
     }
 
     pub fn release(self: *TCPBufferBudget, byte_count: usize) void {
-        if (byte_count == 0) return;
         const count: i64 = @intCast(byte_count);
         const previous = self.used_bytes.fetchSub(count, .monotonic);
         std.debug.assert(previous >= count); // released more than acquired
@@ -838,12 +836,6 @@ const Worker = struct {
     /// budgeted queue before relaySplice returns.
     splice_pipe: [2]fd_t = .{ -1, -1 },
     splice_capacity: usize = 0,
-    /// Worker-local rare-event counter of peer-scoped outgoing splice failures
-    /// (EPIPE/ECONNRESET/ENOTCONN/ESHUTDOWN): the pipe stayed intact and only
-    /// the connection died. Tests assert it grew before accepting that the
-    /// worker splice pipe survived a peer reset.
-    peer_splice_errors: usize = 0,
-
     const wake_tag: u64 = 0;
 
     fn initSplicePipe(self: *Worker) void {
@@ -933,7 +925,7 @@ const Worker = struct {
         if (tag & 1 == 1) {
             if (!self.listener.activated.load(.acquire)) return;
             const address_index: usize = @intCast(tag >> 1);
-            if (address_index < self.listen_fds.len and self.listen_fds[address_index] >= 0) {
+            if (self.listen_fds[address_index] >= 0) {
                 self.acceptLoop(address_index, now);
             }
             return;
@@ -1291,36 +1283,36 @@ const Worker = struct {
         const listener = self.listener;
         if (listener.options.upstream_selector) |s| s.reportSuccess(connection.upstream_addr);
         self.deadline_cache_dirty = true; // deadline basis changes with the mode
-        if (connection.accelerator) |accelerator_ref| {
-            if (accelerator_ref.pair(connection.client.fd, connection.upstream.fd)) |pairing| {
-                connection.pairing = pairing;
-                connection.mode = .sockmap;
-                connection.sockmap_next_check_ns = now + connection.idle_ns;
-                connection.client.read_wanted = true;
-                connection.upstream.read_wanted = true;
-                connection.upstream.want_write = false;
-                self.updateMask(&connection.client);
-                self.updateMask(&connection.upstream);
-                listener.logger.debug("tcp connected mode=sockmap client={s} upstream={f}", .{
-                    connection.clientText(), connection.upstream_addr,
-                });
-                return;
-            } else |err| {
-                listener.logger.debug("tcp sockmap pairing failed; using userspace relay client={s} error={s} errno={s}", .{
-                    connection.clientText(), @errorName(err), @tagName(bpf.lastErrno),
-                });
+        const paired = blk: {
+            if (connection.accelerator) |accelerator_ref| {
+                if (accelerator_ref.pair(connection.client.fd, connection.upstream.fd)) |pairing| {
+                    connection.pairing = pairing;
+                    connection.mode = .sockmap;
+                    connection.sockmap_next_check_ns = now + connection.idle_ns;
+                    listener.logger.debug("tcp connected mode=sockmap client={s} upstream={f}", .{
+                        connection.clientText(), connection.upstream_addr,
+                    });
+                    break :blk true;
+                } else |err| {
+                    listener.logger.debug("tcp sockmap pairing failed; using userspace relay client={s} error={s} errno={s}", .{
+                        connection.clientText(), @errorName(err), @tagName(bpf.lastErrno),
+                    });
+                }
             }
+            break :blk false;
+        };
+        if (!paired) {
+            connection.mode = .userspace;
+            connection.last_activity_ns = now;
+            listener.logger.debug("tcp connected mode=userspace client={s} upstream={f}", .{
+                connection.clientText(), connection.upstream_addr,
+            });
         }
-        connection.mode = .userspace;
-        connection.last_activity_ns = now;
         connection.client.read_wanted = true;
         connection.upstream.read_wanted = true;
         connection.upstream.want_write = false;
         self.updateMask(&connection.client);
         self.updateMask(&connection.upstream);
-        listener.logger.debug("tcp connected mode=userspace client={s} upstream={f}", .{
-            connection.clientText(), connection.upstream_addr,
-        });
     }
 
     // ------------------------------------------------------------------
@@ -1370,10 +1362,9 @@ const Worker = struct {
         const rc = linux.getsockopt(connection.upstream.fd, linux.SOL.SOCKET, linux.SO.ERROR, std.mem.asBytes(&socket_error).ptr, &length);
         const errno = linux.errno(rc);
         if (errno != .SUCCESS or socket_error != 0) {
-            const tag = if (errno != .SUCCESS) errno else linux.E.SUCCESS;
             self.listener.logger.err("tcp connect failed client={s} upstream={f} errno={d}", .{
-                connection.clientText(),                                    connection.upstream_addr,
-                if (errno != .SUCCESS) @intFromEnum(tag) else socket_error,
+                connection.clientText(),                                      connection.upstream_addr,
+                if (errno != .SUCCESS) @intFromEnum(errno) else socket_error,
             });
             if (self.retryUpstream(connection, now)) return;
             self.killConnection(connection);
@@ -1471,7 +1462,6 @@ const Worker = struct {
                             // the shared pipe for everyone. Neither path lets
                             // pipe residue leak into the next dispatch.
                             if (isPeerSpliceErrno(send_errno)) {
-                                self.peer_splice_errors += 1;
                                 self.discardPipeBytes(remaining);
                                 self.killConnection(connection);
                                 return true;
@@ -1787,12 +1777,11 @@ const Worker = struct {
     }
 
     fn checkFullyClosed(self: *Worker, connection: *Connection) void {
-        _ = self;
         if (connection.dead) return;
         if (!connection.client.read_open and !connection.upstream.read_open and
             connection.client.pendingLen() == 0 and connection.upstream.pendingLen() == 0)
         {
-            connection.worker.killConnection(connection);
+            self.killConnection(connection);
         }
     }
 
@@ -1881,14 +1870,12 @@ const Worker = struct {
                 endpoint.registered = false;
             }
         }
-        if (connection.pairing) |pairing| {
-            if (connection.accelerator) |accelerator_ref| {
+        if (connection.accelerator) |accelerator_ref| {
+            if (connection.pairing) |pairing| {
                 accelerator_ref.unpair(pairing);
             }
-            connection.pairing = null;
-        }
-        if (connection.accelerator) |accelerator_ref| {
             accelerator_ref.release();
+            connection.pairing = null;
             connection.accelerator = null;
         }
 

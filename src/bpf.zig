@@ -127,7 +127,6 @@ fn openBpfObject(bytes: []const u8, verifier_log: ?[]u8) Error!*LibbpfObject {
         }
     }
     return curtsy_libbpf_open(bytes.ptr, bytes.len, log_pointer, log_size, &error_code) orelse {
-        if (error_code >= 0) error_code = -@as(c_int, @intFromEnum(linux.E.INVAL));
         return libbpfError(error_code);
     };
 }
@@ -350,9 +349,7 @@ pub const SockmapRuntime = struct {
         const client_fd_value: u32 = @intCast(client_fd);
         const upstream_fd_value: u32 = @intCast(upstream_fd);
 
-        mapUpdate(self.sockhash_fd, &client_cookie, &client_fd_value) catch |err| {
-            return err;
-        };
+        try mapUpdate(self.sockhash_fd, &client_cookie, &client_fd_value);
         mapUpdate(self.sockhash_fd, &upstream_cookie, &upstream_fd_value) catch |err| {
             self.unpair(client_cookie, upstream_cookie);
             return err;
@@ -472,7 +469,6 @@ pub const BpfObserver = struct {
                         }
                     }
                 }
-                if (attach_error >= 0) attach_error = -@as(c_int, @intFromEnum(linux.E.INVAL));
                 return libbpfError(attach_error);
             };
         }

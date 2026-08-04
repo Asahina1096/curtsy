@@ -239,8 +239,6 @@ pub const UdpSockmapPolicy = struct {
     pub const State = enum(u8) {
         /// sockmap off; collecting userspace evidence (auto only).
         probing,
-        /// stable evidence observed; the runtime may be loaded now.
-        armed,
         /// runtime loaded and steering new associations.
         active,
         /// after a failure/regression; no steering until the cooldown elapses.
@@ -325,25 +323,28 @@ pub const UdpSockmapPolicy = struct {
     }
 
     /// The engine loaded the runtime after `.load`; the controller becomes
-    /// active and clears its failure history.
+    /// active and clears its failure history. Only the auto load path (a
+    /// `.load` action from `observeAuto`) can reach this, so no mode check
+    /// is needed.
     pub fn noteLoaded(self: *UdpSockmapPolicy) void {
-        if (self.mode != .auto) return;
         self.state = .active;
         self.pairing_failures = 0;
         self.stable_windows = 0;
     }
 
-    /// The engine failed to load the runtime; enter the cooldown.
+    /// The engine failed to load the runtime; enter the cooldown. Only the
+    /// auto load path can reach this.
     pub fn noteLoadFailure(self: *UdpSockmapPolicy, now_ms: u64) void {
-        if (self.mode != .auto) return;
         self.state = .cooling_down;
         self.cooldown_until_ms = now_ms + fallback_cooldown_ms;
         self.pairing_failures = 0;
     }
 
     /// A pairing succeeded; steering works, so clear the failure streak.
+    /// Steering under auto implies the controller is active (`steerAllowed`),
+    /// so only the enabled-mode no-op guard is needed.
     pub fn notePairingSuccess(self: *UdpSockmapPolicy) void {
-        if (self.mode != .auto or self.state != .active) return;
+        if (self.mode != .auto) return;
         self.pairing_failures = 0;
     }
 
@@ -352,7 +353,7 @@ pub const UdpSockmapPolicy = struct {
     /// falls back to the userspace relay instead of paying the pair cost for
     /// every new association.
     pub fn notePairingFailure(self: *UdpSockmapPolicy, now_ms: u64) void {
-        if (self.mode != .auto or self.state != .active) return;
+        if (self.mode != .auto) return;
         self.pairing_failures += 1;
         if (self.pairing_failures >= pairing_failure_threshold) {
             self.state = .cooling_down;
@@ -363,25 +364,16 @@ pub const UdpSockmapPolicy = struct {
 
     fn observeAuto(self: *UdpSockmapPolicy, now_ms: u64, sample: WindowSample) Action {
         switch (self.state) {
+            // The engine loads the runtime synchronously when `.load` is
+            // returned, transitioning straight to active or cooling_down, so
+            // no separate armed state with re-verification is needed.
             .probing => {
                 if (sample.eligible and qualifies(sample)) {
                     self.stable_windows += 1;
-                    if (self.stable_windows >= probe_stable_windows) {
-                        self.state = .armed;
-                        return .load;
-                    }
+                    if (self.stable_windows >= probe_stable_windows) return .load;
                 } else {
                     self.stable_windows = 0;
                 }
-                return .stay_off;
-            },
-            .armed => {
-                // The load is attempted synchronously by the engine, so this
-                // state is transient; still re-verify the evidence so a stale
-                // arm cannot steer after a long quiet period.
-                if (sample.eligible and qualifies(sample)) return .load;
-                self.state = .probing;
-                self.stable_windows = 0;
                 return .stay_off;
             },
             .active => {
@@ -496,10 +488,10 @@ pub const UdpListener = struct {
 
     pub fn start(self: *UdpListener) Error!void {
         const snapshot = self.runtime.current();
-        const thread_count: u32 = @intCast(@max(1, autotune.workerThreads(
+        const thread_count: u32 = @intCast(autotune.workerThreads(
             snapshot.configuration.performance.udp_io_threads,
             .system(),
-        )));
+        ));
         errdefer self.stop();
 
         // The first engine binds the configured addresses; the rest bind the
@@ -564,8 +556,8 @@ pub const UdpListener = struct {
         // process the teardown command on their next I/O wake, so without
         // this guard a datagram arriving in that window could still be
         // steered under a configuration that now disallows it.
-        const old_mode = modeFromOverrideOrConfig(self.enable_sockmap_override, &self.runtime.current());
-        const new_mode = modeFromOverrideOrConfig(self.enable_sockmap_override, &configuration);
+        const old_mode = sockmapMode(self.enable_sockmap_override, &self.runtime.current());
+        const new_mode = sockmapMode(self.enable_sockmap_override, &configuration);
         const blocks_steering = new_mode == .disabled or
             (new_mode == .auto and (old_mode == .enabled or configuration.upstreamLoopback()));
 
@@ -956,7 +948,7 @@ pub const UdpRelayEngine = struct {
         self.sockmap_eligible = !snapshot.upstreamLoopback();
         const now_ms = monotonicMilliseconds();
         self.last_policy_tick_ms = now_ms;
-        const mode = self.effectiveMode(&snapshot);
+        const mode = sockmapMode(self.enable_sockmap_override, &snapshot);
         self.policy.reset(mode);
         switch (mode) {
             .enabled => {
@@ -1272,13 +1264,6 @@ pub const UdpRelayEngine = struct {
         return true;
     }
 
-    /// The mode the engine must honour: the test override wins when set,
-    /// otherwise the resolved configuration decides.
-    fn effectiveMode(self: *const UdpRelayEngine, snapshot: *const ResolvedConfiguration) config.SockmapAccelerationMode {
-        if (self.enable_sockmap_override) |forced| return if (forced) .enabled else .disabled;
-        return snapshot.configuration.performance.udp_sockmap_acceleration;
-    }
-
     /// One policy tick: feed the userspace totals accumulated over the window
     /// to the adaptive controller and act on its decision. Runs on the engine's
     /// I/O thread; the counter reset keeps every window's evidence disjoint.
@@ -1357,7 +1342,7 @@ pub const UdpRelayEngine = struct {
     fn reloadAccelerator(self: *UdpRelayEngine) void {
         const applied_gate = self.steering_gate.load(.acquire);
         const snapshot = self.runtime.current();
-        const mode = self.effectiveMode(&snapshot);
+        const mode = sockmapMode(self.enable_sockmap_override, &snapshot);
         self.sockmap_eligible = !snapshot.upstreamLoopback();
 
         switch (mode) {
@@ -1650,7 +1635,6 @@ pub const UdpRelayEngine = struct {
         comptime context: []const u8,
         now_ms: u64,
     ) bool {
-        if (slots.len == 0) return true;
         var sent_total: usize = 0;
         while (sent_total < slots.len) {
             const sent = self.send_io.send(fd, address, address_length, slots[sent_total..]) catch {
@@ -1816,7 +1800,8 @@ pub const UdpRelayEngine = struct {
         const fd = try bpf.udpConnectedClientSocket(bind_address, bind_length, peer_address, client_address_length);
         errdefer _ = linux.close(fd);
         self.applySocketBuffers(fd, "direction=client", .{}, false);
-        if (self.sockmap_runtime == null) return error.NotSupported;
+        // The sole caller only invokes this under `sockmap_runtime != null`,
+        // and the runtime is never destroyed on this I/O thread meanwhile.
         const runtime = &self.sockmap_runtime.?;
         const pairing = try runtime.pair(fd, upstream_fd);
         errdefer runtime.unpair(pairing.client_cookie, pairing.upstream_cookie);
@@ -1904,7 +1889,7 @@ fn monotonicMilliseconds() u64 {
 
 /// The sockmap mode for a resolved configuration, honoring the listener/engine
 /// test override when set.
-fn modeFromOverrideOrConfig(override: ?bool, resolved: *const ResolvedConfiguration) config.SockmapAccelerationMode {
+fn sockmapMode(override: ?bool, resolved: *const ResolvedConfiguration) config.SockmapAccelerationMode {
     if (override) |forced| return if (forced) .enabled else .disabled;
     return resolved.configuration.performance.udp_sockmap_acceleration;
 }
