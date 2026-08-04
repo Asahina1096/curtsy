@@ -89,6 +89,10 @@ pub const LogStore = struct {
     threshold: std.atomic.Value(u8),
     mutex: Mutex = .{},
     emit_override: ?EmitOverride = null,
+    /// Optional instance identifier; when set, every emitted line is prefixed
+    /// with `instance=<name> ` so multi-instance output is distinguishable.
+    /// The slice is borrowed and must outlive the store.
+    instance_name: ?[]const u8 = null,
 
     /// Unknown level names fall back to .info.
     pub fn init(level_name: []const u8) LogStore {
@@ -99,6 +103,11 @@ pub const LogStore = struct {
     pub fn update(self: *LogStore, level_name: []const u8) void {
         const level = Level.fromString(level_name) orelse .info;
         self.threshold.store(@intFromEnum(level), .release);
+    }
+
+    /// Set (or clear with null) the instance prefix applied to every line.
+    pub fn setInstance(self: *LogStore, name: ?[]const u8) void {
+        self.instance_name = name;
     }
 
     pub fn isEnabled(self: *const LogStore, level: Level) bool {
@@ -156,10 +165,40 @@ pub const LogStore = struct {
     }
 
     /// Single write including the trailing newline, so the critical section
-    /// is one syscall. scratch must be the buffer backing message.
+    /// is one syscall. scratch must be the buffer backing message. When an
+    /// instance name is set the line is `instance=<name> <message>`, composed
+    /// into a dedicated buffer so it still lands in one write syscall.
     fn emit(self: *LogStore, message: []const u8, scratch: *[max_message_bytes]u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (self.instance_name) |name| {
+            // Compose the prefixed line in a dedicated buffer so it still
+            // lands in one write syscall. Only reached with an instance name.
+            var line: [max_message_bytes]u8 = undefined;
+            var rest = message;
+            const prefix_len = name.len + "instance=".len + 1;
+            if (rest.len + prefix_len + 1 > line.len) {
+                rest = rest[0 .. line.len - prefix_len - 1];
+            }
+            const prefixed = std.fmt.bufPrint(&line, "instance={s} {s}", .{ name, rest }) catch unreachable;
+
+            if (self.emit_override) |override| {
+                // The override sees the prefixed message without a trailing
+                // newline (its historical contract).
+                override.fn_ptr(override.context, prefixed);
+                return;
+            }
+            if (prefixed.len < max_message_bytes) {
+                line[prefixed.len] = '\n';
+                writeAllFd(std.posix.STDERR_FILENO, line[0 .. prefixed.len + 1]);
+            } else {
+                writeAllFd(std.posix.STDERR_FILENO, prefixed);
+                writeAllFd(std.posix.STDERR_FILENO, "\n");
+            }
+            return;
+        }
+
         if (self.emit_override) |override| {
             override.fn_ptr(override.context, message);
             return;
@@ -261,4 +300,34 @@ test "update switches threshold atomically" {
     store.update("warning");
     try std.testing.expect(store.isEnabled(.warning));
     try std.testing.expect(!store.isEnabled(.notice));
+}
+
+test "instance name prefixes every emitted line" {
+    var sink = LogTestSink{};
+    defer sink.deinit();
+
+    var store = LogStore.init("debug");
+    store.emit_override = .{ .context = &sink, .fn_ptr = LogTestSink.run };
+    store.setInstance("edge");
+    store.info("forwarder started rules={d}", .{2});
+    try std.testing.expectEqualStrings("instance=edge forwarder started rules=2", sink.captured.items);
+    sink.captured.clearRetainingCapacity();
+
+    // Clearing the instance restores the plain format.
+    store.setInstance(null);
+    store.info("plain", .{});
+    try std.testing.expectEqualStrings("plain", sink.captured.items);
+}
+
+test "instance prefix truncates oversized messages without losing the newline" {
+    var sink = LogTestSink{};
+    defer sink.deinit();
+
+    var store = LogStore.init("debug");
+    store.emit_override = .{ .context = &sink, .fn_ptr = LogTestSink.run };
+    store.setInstance("a");
+    const payload = "x" ** (max_message_bytes + 32);
+    store.log(.info, "{s}", .{payload});
+    try std.testing.expect(sink.captured.items.len <= max_message_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, sink.captured.items, "instance=a "));
 }

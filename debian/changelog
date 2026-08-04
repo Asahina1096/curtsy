@@ -1,3 +1,23 @@
+curtsy (0.3.3) noble; urgency=medium
+
+  * Add multi-instance operation: several independent curtsy processes can
+    run side by side. The new --instance NAME flag (charset [A-Za-z0-9._-],
+    at most 64 bytes) only prefixes every log line with instance=NAME, sets
+    the process name (PR_SET_NAME, capped at the 15-byte kernel comm limit)
+    and names the systemd unit; it never affects configuration, routing or
+    forwarding. A packaged curtsy@.service systemd template unit runs
+    `curtsy --instance %i --config /etc/curtsy/instances/%i.yaml`, while
+    the plain curtsy.service stays the default single instance.
+  * Document multi-instance port sharing: SO_REUSEPORT only groups sockets
+    of the same effective UID, so DynamicUser=true template instances cannot
+    share a listen address:port unless a fixed User= is set. Each instance
+    loads its own eBPF programs, so multiple instances coexist without
+    kernel conflicts.
+  * Synchronize release metadata across the CLI version string, build.zig
+    package version, man page, and changelog.
+
+ -- Curtsy contributors <maintainers@example.invalid>  Tue, 04 Aug 2026 00:00:00 +0000
+
 curtsy (0.3.2) noble; urgency=medium
 
   * Refactor the configuration module registry: the comptime module type

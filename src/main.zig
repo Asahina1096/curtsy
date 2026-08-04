@@ -14,6 +14,13 @@
 //!       --protocols L   tcp,udp protocol list (single-rule shorthand only)
 //!       --balance NAME  Balancer name (single-rule shorthand only)
 //!
+//! Multi-instance support:
+//!   --instance NAME    Optional instance identifier used only for log
+//!                      prefixing, process naming (PR_SET_NAME) and the
+//!                      systemd template unit name. It never affects
+//!                      configuration, routing or any forwarding decision.
+//!                      Allowed charset is [A-Za-z0-9._-], at most 64 bytes.
+//!
 //! A run is one configuration cycle through the module engine (conf.zig):
 //! every module parses its own directives, the core module resolves addresses
 //! and the unified orchestrator (core.ForwarderService) drives 1..N rules.
@@ -29,12 +36,12 @@ const conf = @import("conf.zig");
 const core = @import("modules/core.zig");
 const log = @import("log.zig");
 
-const version = "0.3.2";
+const version = "0.3.3";
 
 const usage =
-    \\Usage: curtsy --config <path> [--check-config]
-    \\       curtsy --listen <endpoint> --upstream <endpoint> [--protocols <list>] [--balance <name>] [--check-config]
-    \\       curtsy --rule <spec> [--rule <spec> ...] [--check-config]
+    \\Usage: curtsy --config <path> [--check-config] [--instance <name>]
+    \\       curtsy --listen <endpoint> --upstream <endpoint> [--protocols <list>] [--balance <name>] [--check-config] [--instance <name>]
+    \\       curtsy --rule <spec> [--rule <spec> ...] [--check-config] [--instance <name>]
     \\
     \\Transparent TCP and UDP traffic forwarder
     \\
@@ -43,6 +50,11 @@ const usage =
     \\      --check-config   Validate configuration and exit
     \\      --version        Print version and exit
     \\  -h, --help           Show this help and exit
+    \\      --instance <name>  Instance identifier: prefixes every log line
+    \\                          with instance=<name>, renames the process
+    \\                          (PR_SET_NAME, visible in ps/top) and names the
+    \\                          systemd unit (template %i). Never affects
+    \\                          forwarding. Charset [A-Za-z0-9._-], <= 64 bytes.
     \\
     \\CLI running mode (optional module; cannot be combined with --config):
     \\  -l, --listen <endpoint>     Listen endpoint for the single-rule shorthand,
@@ -62,16 +74,25 @@ const Options = union(enum) {
     file: struct {
         path: []const u8,
         check_config: bool,
+        instance: ?[]const u8,
     },
     cli: struct {
         configuration: cli.Configuration,
         check_config: bool,
+        instance: ?[]const u8,
     },
 
     fn checkConfig(self: Options) bool {
         return switch (self) {
             .file => |value| value.check_config,
             .cli => |*value| value.check_config,
+        };
+    }
+
+    fn instance(self: Options) ?[]const u8 {
+        return switch (self) {
+            .file => |value| value.instance,
+            .cli => |*value| value.instance,
         };
     }
 };
@@ -116,11 +137,13 @@ pub fn main(init: std.process.Init) u8 {
         return 0;
     }
 
+    if (options.instance()) |name| setProcessName(name);
+
     const source: core.ConfigSource = switch (options) {
         .file => |value| .{ .file = value.path },
         .cli => |*value| .{ .cli = &value.configuration },
     };
-    var service = core.ForwarderService.init(gpa, source, cycle, resolved);
+    var service = core.ForwarderService.init(gpa, source, cycle, resolved, options.instance());
     owns_cycle = false;
     service.run() catch |err| {
         writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});
@@ -147,6 +170,7 @@ fn parseArgs(
 ) error{ OutOfMemory, InvalidConfiguration }!?Options {
     var config_path: ?[]const u8 = null;
     var check_config = false;
+    var instance: ?[]const u8 = null;
     var listen: ?[]const u8 = null;
     var upstream: ?[]const u8 = null;
     var rule_specs: std.ArrayList([]const u8) = .empty;
@@ -201,6 +225,12 @@ fn parseArgs(
             balance = std.mem.span(args[i]);
         } else if (std.mem.startsWith(u8, arg, "--balance=")) {
             balance = arg["--balance=".len..];
+        } else if (std.mem.eql(u8, arg, "--instance")) {
+            i += 1;
+            if (i >= args.len) return usageError("missing value for '{s}'", .{arg});
+            instance = std.mem.span(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--instance=")) {
+            instance = arg["--instance=".len..];
         } else {
             return usageError("unexpected argument '{s}'", .{arg});
         }
@@ -213,10 +243,16 @@ fn parseArgs(
         return usageError("cannot combine '--config' with CLI endpoint flags", .{});
     }
 
+    if (instance) |name| {
+        if (!validateInstanceName(name)) {
+            return usageError("invalid --instance name '{s}': allowed charset is [A-Za-z0-9._-], length 1..64", .{name});
+        }
+    }
+
     if (!has_cli) {
         const path = config_path orelse
             return usageError("missing expected argument '--config <path>' or CLI endpoint flags", .{});
-        return .{ .file = .{ .path = path, .check_config = check_config } };
+        return .{ .file = .{ .path = path, .check_config = check_config, .instance = instance } };
     }
 
     if (rule_specs.items.len > 0) {
@@ -224,13 +260,44 @@ fn parseArgs(
             return usageError("cannot combine '--rule' with '--listen'/'--upstream'/'--protocols'/'--balance'", .{});
         }
         const config = (try cli.parseFlags(gpa, null, null, rule_specs.items, null, null, diag)).?;
-        return .{ .cli = .{ .configuration = config, .check_config = check_config } };
+        return .{ .cli = .{ .configuration = config, .check_config = check_config, .instance = instance } };
     }
 
     if (listen == null) return usageError("missing expected argument '--listen <endpoint>'", .{});
     if (upstream == null) return usageError("missing expected argument '--upstream <endpoint>'", .{});
     const config = (try cli.parseFlags(gpa, listen, upstream, &.{}, protocols, balance, diag)).?;
-    return .{ .cli = .{ .configuration = config, .check_config = check_config } };
+    return .{ .cli = .{ .configuration = config, .check_config = check_config, .instance = instance } };
+}
+
+/// Validate an --instance name against the documented charset and length.
+/// The rule matches systemd unit instance names (the %i of a template unit),
+/// so a name accepted here is safe to use as `curtsy@<name>.service`.
+fn validateInstanceName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |c| {
+        const valid = std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-';
+        if (!valid) return false;
+    }
+    return true;
+}
+
+/// Rename the process (PR_SET_NAME, visible in `ps`/`top`) after the instance
+/// name so multiple instances are distinguishable in process listings. The
+/// kernel caps the comm name at 16 bytes including the NUL, so longer names
+/// are truncated; a missing null terminator within the capped window is
+/// replaced. Mirrors the thread-naming call in the UDP relay.
+fn setProcessName(name: []const u8) void {
+    const max_comm: usize = 15;
+    var comm: [max_comm + 1]u8 = [_]u8{0} ** (max_comm + 1);
+    const len = @min(name.len, max_comm);
+    @memcpy(comm[0..len], name[0..len]);
+    _ = std.os.linux.prctl(
+        @intFromEnum(std.os.linux.PR.SET_NAME),
+        @intFromPtr(&comm),
+        0,
+        0,
+        0,
+    );
 }
 
 /// Print a command-line misuse message plus usage and signal exit 64 (null).
@@ -251,4 +318,20 @@ fn writeErr(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
     log.writeAllFd(std.posix.STDERR_FILENO, text);
+}
+
+test "instance names follow the documented charset and length" {
+    try std.testing.expect(validateInstanceName("edge"));
+    try std.testing.expect(validateInstanceName("dmz-2"));
+    try std.testing.expect(validateInstanceName("a.b_c-d"));
+    try std.testing.expect(validateInstanceName("A0zZ9"));
+
+    try std.testing.expect(!validateInstanceName(""));
+    try std.testing.expect(!validateInstanceName("has space"));
+    try std.testing.expect(!validateInstanceName("has/slash"));
+    try std.testing.expect(!validateInstanceName("has:colon"));
+    try std.testing.expect(!validateInstanceName("has@at"));
+    const long = "a" ** 65;
+    try std.testing.expect(!validateInstanceName(long));
+    try std.testing.expect(validateInstanceName("b" ** 64));
 }

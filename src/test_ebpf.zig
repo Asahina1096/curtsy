@@ -8,6 +8,7 @@
 //! test.zig.
 
 test {
+    _ = @import("main.zig");
     _ = @import("net.zig");
     _ = @import("yaml.zig");
     _ = @import("module.zig");

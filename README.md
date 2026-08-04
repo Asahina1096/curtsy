@@ -152,6 +152,35 @@ curtsy --listen :9000 --upstream example.com --check-config
 - CLI 模式始终是 rules 模式；由于参数在进程生命周期内固定，SIGHUP 重载会重新校验规则并重新解析监听/上游主机名（DNS 变化生效），参数描述的集合本身不变。
 - 全局 section（timeouts/limits/logging/runtime/performance）仍是 YAML 专属，命令行简写只覆盖端点类配置。
 
+## 多实例运行
+
+一台宿主机上可以同时运行多个相互独立的 curtsy 实例，每个实例有自己的配置文件、监听地址和热重载。实例只是一个进程身份：`--instance NAME` 只给每条日志加 `instance=NAME` 前缀（并设置进程名、用于 systemd 单元命名），不参与任何配置、路由或转发逻辑；字符集为 `[A-Za-z0-9._-]`，最长 64 字节，是 systemd 模板单元实例名合法字符集的安全子集。
+
+systemd 模板单元（已随包安装）：
+
+```bash
+# 每个实例一个配置文件
+sudo mkdir -p /etc/curtsy/instances
+sudo install -m 0644 config.example.yaml /etc/curtsy/instances/edge.yaml
+sudo install -m 0644 config.example.yaml /etc/curtsy/instances/dmz.yaml
+sudo systemctl enable --now curtsy@edge curtsy@dmz
+```
+
+每个实例实际运行 `curtsy --instance %i --config /etc/curtsy/instances/%i.yaml`；原 `curtsy.service` 保持为默认单实例（使用 `/etc/curtsy/config.yaml`）。
+
+命令行多实例：
+
+```bash
+curtsy --config edge.yaml --instance edge
+curtsy --config dmz.yaml --instance dmz
+```
+
+端口共享：监听 socket 带 `SO_REUSEPORT`，但内核只把**相同 effective UID** 的 socket 分到同一组。systemd 模板的 `DynamicUser=true` 会给每个实例分配独立 uid，因此两个实例无法共享同一 `地址:端口`（后绑定者 bind 失败）；需要共享端口时须固定 `User=`（或去掉 `DynamicUser` 以同一用户运行）。共享端口是有意的水平伸缩（内核/BPF 分流），不是自动冲突检测；共享时建议各实例 `workerThreads` 一致，避免 reuseport eBPF（按各自 worker 数取模）与内核 hash 混用导致分布不均。
+
+资源规划：auto 的 `workerThreads` 与限额按每实例独立取满计算，tuning daemon 又读取全局 `/proc/net/netstat`，多实例会互相叠加；建议多实例部署时显式配置 worker 数与限额。
+
+eBPF：observer kprobe 按实例自身 pid 过滤，sockmap/reuseport 程序按进程/socket 装载，多个实例互不冲突。
+
 ## 信号
 
 - `SIGHUP`：重新读取并应用配置。重载是事务式的：新规则和新增协议监听会先绑定但保持暂停（不接受 TCP、不转发 UDP），连同上游 generation 和 listen backlog 预检全部就绪后才提交并激活；任一失败则整体保留旧配置，候选配置正常释放。配置无效或新端口绑定失败时继续使用旧配置。

@@ -7,6 +7,7 @@
 //! root. build.zig wires this file as the test module root source.
 
 test {
+    _ = @import("main.zig");
     _ = @import("net.zig");
     _ = @import("yaml.zig");
     _ = @import("module.zig");

@@ -1,4 +1,4 @@
-.TH CURTSY 1 "August 2026" "curtsy 0.3.2" "User Commands"
+.TH CURTSY 1 "August 2026" "curtsy 0.3.3" "User Commands"
 .SH NAME
 curtsy \- transparent TCP and UDP traffic forwarder
 .SH SYNOPSIS
@@ -7,6 +7,10 @@ curtsy \- transparent TCP and UDP traffic forwarder
 .I PATH
 [
 .B --check-config
+]
+[
+.B --instance
+.I NAME
 ]
 .br
 .B curtsy
@@ -29,6 +33,20 @@ Read the YAML configuration from
 Validate the configuration and resolved endpoints, then exit. Configuration
 errors are reported on standard error and use exit status 2.
 .TP
+.B --instance
+.I NAME
+Optional instance identifier used only to prefix every log line with
+.IR instance=\fINAME\fR
+and to name the process; it never affects configuration, routing or
+forwarding. The name must match
+.B [A-Za-z0-9._-]
+and be at most 64 bytes, a safe subset of systemd's template unit instance
+names, so
+.B curtsy@\fINAME\fR.service
+passes
+.IR %i
+here.
+.TP
 .B --version
 Print the program version and exit.
 .TP
@@ -43,13 +61,55 @@ running configuration unchanged.
 .B SIGINT, SIGTERM
 Stop accepting new connections and exit gracefully. Existing TCP connections
 are allowed to drain until the configured shutdown grace period expires.
+.SH MULTIPLE INSTANCES
+Several independent
+.B curtsy
+processes may run side by side, each with its own configuration, listen
+addresses and hot reload. Give each an instance name so its log lines are
+distinguishable:
+.TP
+.I systemd template
+.B systemctl enable --now curtsy@\fINAME\fR
+runs
+.B curtsy --instance \fINAME\fR --config /etc/curtsy/instances/\fINAME\fR.yaml.
+The
+.B curtsy.service
+unit remains the default single instance.
+.TP
+.I command line
+Start a process per instance, each with its own
+.B --config
+path and
+.B --instance
+name.
+.PP
+Sockets for the same listen address and port carry SO_REUSEPORT, which only
+groups sockets owned by the same effective UID. The
+.B DynamicUser=true
+template gives each instance a distinct uid, so instances cannot share one
+listen address:port; set a fixed
+.B User=
+to share a port across instances. Shared ports are an intentional scale-out,
+not automatic conflict detection. Each instance loads its own eBPF programs
+(observer kprobes, sockmap, reuseport), so multiple instances coexist without
+kernel conflicts.
 .SH FILES
 .TP
 .I /etc/curtsy/config.yaml
-Default configuration path used by the packaged systemd service.
+Default configuration path used by the packaged
+.B curtsy.service
+unit.
+.TP
+.I /etc/curtsy/instances/\fINAME\fR.yaml
+Per-instance configuration path used by the packaged
+.B curtsy@.service
+template.
 .TP
 .I /usr/lib/systemd/system/curtsy.service
 Packaged systemd service unit.
+.TP
+.I /usr/lib/systemd/system/curtsy@.service
+Packaged systemd template unit for multiple instances.
 .SH EXIT STATUS
 .TP
 .B 0

@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "curtsy",
         .root_module = exe_mod,
-        .version = .{ .major = 0, .minor = 3, .patch = 2 },
+        .version = .{ .major = 0, .minor = 3, .patch = 3 },
     });
     exe.pie = true;
     // A deterministic content-based ELF build id (.note.gnu.build-id) lets the

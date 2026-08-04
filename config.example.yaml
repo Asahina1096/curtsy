@@ -66,3 +66,46 @@ upstream:
 # Two rules must not share the same listen address and protocol. Upstream
 # health is passive: 3 consecutive failures park an upstream for 10s
 # (exponential backoff, 5min cap), then it rejoins automatically.
+
+# ---------------------------------------------------------------------------
+# Multi-instance operation (optional)
+# ---------------------------------------------------------------------------
+# Several independent curtsy processes can run side by side, each with its own
+# configuration file, listen addresses and hot reload. An instance is just a
+# process identity: the --instance NAME flag only prefixes every log line with
+# instance=NAME, sets the process name, and names the systemd unit; it never
+# affects configuration, routing or forwarding. Allowed charset is
+# [A-Za-z0-9._-], at most 64 bytes (a safe subset of systemd template unit
+# instance names).
+#
+# systemd template:
+#   # /etc/curtsy/instances/edge.yaml and /etc/curtsy/instances/dmz.yaml
+#   sudo systemctl enable --now curtsy@edge curtsy@dmz
+#   # each instance runs:
+#   #   curtsy --instance edge --config /etc/curtsy/instances/edge.yaml
+# The plain curtsy.service unit keeps using /etc/curtsy/config.yaml as the
+# default single instance.
+#
+# command line:
+#   curtsy --config edge.yaml --instance edge
+#   curtsy --config dmz.yaml --instance dmz
+#
+# Port sharing: sockets on the same listen address:port carry SO_REUSEPORT,
+# which the kernel only groups across sockets owned by the SAME effective UID.
+# systemd's DynamicUser=true gives each template instance a distinct uid, so
+# two instances cannot share one listen address:port (the second bind fails).
+# To share a port across instances, set a fixed User= (or run without
+# DynamicUser as one user); a shared port is an intentional scale-out with the
+# kernel/BPF distributing flows, not automatic conflict detection. When
+# sharing a port, keep each instance's workerThreads equal so the reuseport
+# eBPF modulus (per-instance worker count) and the kernel hash do not mix into
+# a lopsided distribution.
+#
+# Resource planning: auto-tuned workerThreads and limits are computed per
+# instance as if it owned the whole machine, and the tuning daemon reads the
+# global /proc/net/netstat counters. With several instances, prefer explicit
+# workerThreads and limits so totals stay within budget.
+#
+# eBPF: observer kprobes are filtered by the instance's own pid and sockmap /
+# reuseport programs are loaded per process/socket, so multiple instances
+# coexist without kernel-level conflicts.

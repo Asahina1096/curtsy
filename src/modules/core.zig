@@ -728,13 +728,16 @@ pub const ForwarderService = struct {
         config_source: ConfigSource,
         loaded: conf.Cycle,
         resolved: ResolvedForwarder,
+        instance_name: ?[]const u8,
     ) ForwarderService {
+        var logger = log.LogStore.init(resolved.configuration.logging.level);
+        logger.setInstance(instance_name);
         return .{
             .allocator = allocator,
             .config_source = config_source,
             .loaded = loaded,
             .resolved = resolved,
-            .logger = log.LogStore.init(resolved.configuration.logging.level),
+            .logger = logger,
             .worker_threads = autotune.workerThreads(resolved.configuration.runtime.worker_threads, .system()),
             .tuning_view = tuningViewFor(resolved.configuration, resolved.rules),
         };
@@ -2373,7 +2376,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2476,7 +2479,7 @@ test "cli source starts and reloads through the config source" {
         return error.TestResolveFailed;
     };
 
-    var service = ForwarderService.init(testing.allocator, .{ .cli = &config }, cycle, resolved);
+    var service = ForwarderService.init(testing.allocator, .{ .cli = &config }, cycle, resolved, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2647,7 +2650,7 @@ test "snapshot aggregates listener metrics across rules" {
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.2", port: 9001 }
     , null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved);
+    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null);
     defer service.deinit();
 
     // Rule 0: one TCP listener. Rule 1: TCP + UDP. The service-level snapshot
@@ -2682,7 +2685,7 @@ test "snapshot metrics stay all-zero when a service has no listeners" {
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.2", port: 9001 }
     , null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved);
+    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null);
     defer service.deinit();
     const snap = service.snapshot().?;
     try testing.expect(snap.metrics.isZero());
