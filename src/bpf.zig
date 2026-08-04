@@ -501,6 +501,60 @@ pub const BpfObserver = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Data-path counters
+// ---------------------------------------------------------------------------
+
+/// Low-overhead data-path observability primitives. A counter struct is any
+/// struct whose fields are u64 totals, each incremented by a single owning
+/// thread (or behind `std.atomic.Value` when the owning thread is not the only
+/// reader). Snapshotting, per-field reset and saturating delta are provided
+/// generically via comptime field iteration, so every module's counter set
+/// shares one tested implementation.
+///
+/// Counters must never feed a forwarding decision; they are pure accounting
+/// on paths that already exist.
+pub const counters = struct {
+    /// All-zero counter value for a plain (non-atomic) counter type.
+    pub fn zero(comptime T: type) T {
+        return std.mem.zeroes(T);
+    }
+
+    /// Copies the counter set; the returned value is a point-in-time snapshot
+    /// that the caller may compare with `delta` later.
+    pub fn snapshot(comptime T: type, current: T) T {
+        return current;
+    }
+
+    /// Resets a counter set (or its snapshot) to zero in place.
+    pub fn reset(self: anytype) void {
+        self.* = std.mem.zeroes(@TypeOf(self.*));
+    }
+
+    /// Saturating per-field difference `current - previous`: a counter that
+    /// wrapped or was reset between snapshots reports zero instead of
+    /// underflowing.
+    pub fn delta(comptime T: type, current: T, previous: T) T {
+        var out = zero(T);
+        inline for (std.meta.fields(T)) |field| {
+            const c = @field(current, field.name);
+            const p = @field(previous, field.name);
+            @field(out, field.name) = if (c >= p) c - p else 0;
+        }
+        return out;
+    }
+
+    /// Element-wise sum of two counter sets (used to aggregate per-worker
+    /// snapshots into a listener-wide snapshot).
+    pub fn add(comptime T: type, a: T, b: T) T {
+        var out = zero(T);
+        inline for (std.meta.fields(T)) |field| {
+            @field(out, field.name) = @field(a, field.name) + @field(b, field.name);
+        }
+        return out;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Batched UDP I/O (recvmmsg/sendmmsg, 64-datagram batches)
 // ---------------------------------------------------------------------------
 
@@ -653,6 +707,59 @@ pub const UdpSendBatchIo = struct {
         return sys(linux.sendmmsg(fd, &self.headers, @intCast(count), linux.MSG.DONTWAIT));
     }
 };
+
+/// Maximum payload a single UDP GSO send can carry (the kernel GSO size cap).
+/// A relay batch that exceeds this is split into several sends.
+pub const udp_gso_max_bytes = 65_536;
+
+/// Sends `slots` to the connected socket `fd` using UDP GSO segmentation.
+/// Every slot must have the same non-zero payload length L (the segment
+/// size): the payloads are copied contiguously into `staging` (which must
+/// hold at least udp_gso_max_bytes) and handed to the kernel as one send per
+/// up-to-64 KiB chunk with UDP_SEGMENT=L, so the kernel emits exactly one
+/// UDP datagram per segment. UDP_SEGMENT is cleared back to 0 before
+/// returning, leaving the socket in the ordinary send state for mixed-size
+/// traffic. Returns the number of datagrams handed to the kernel; on the
+/// first failed chunk with no prior progress it returns the error, otherwise
+/// the partial count so the caller can forward the remainder. A GSO send
+/// either moves the whole chunk or fails, so there is no partial-chunk
+/// progress to track.
+pub fn udpSendGso(fd: fd_t, slots: []const UdpSlot, staging: []u8) Error!usize {
+    if (slots.len == 0) return errnoError(.INVAL);
+    const gso_size: u32 = slots[0].length;
+    if (gso_size == 0 or gso_size > udp_gso_max_bytes) return errnoError(.INVAL);
+    const per_send = @max(@as(usize, 1), udp_gso_max_bytes / gso_size);
+
+    const enable: u32 = gso_size;
+    // SOL_UDP (17) is not exposed by the Zig bindings' SOL table; UDP.SEGMENT
+    // (103) is the UDP GSO segment-size option.
+    const rc_enable = linux.setsockopt(fd, 17, linux.UDP.SEGMENT, std.mem.asBytes(&enable), @sizeOf(u32));
+    if (linux.errno(rc_enable) != .SUCCESS) return errnoError(linux.errno(rc_enable));
+    defer {
+        const disable: u32 = 0;
+        _ = linux.setsockopt(fd, 17, linux.UDP.SEGMENT, std.mem.asBytes(&disable), @sizeOf(u32));
+    }
+
+    var offset: usize = 0;
+    while (offset < slots.len) {
+        const chunk = @min(per_send, slots.len - offset);
+        var length: usize = 0;
+        for (slots[offset .. offset + chunk]) |*slot| {
+            @memcpy(staging[length .. length + slot.length], slot.data[0..slot.length]);
+            length += slot.length;
+        }
+        const rc = linux.sendto(fd, staging.ptr, length, linux.MSG.NOSIGNAL, null, 0);
+        const e = linux.errno(rc);
+        if (e != .SUCCESS) {
+            if (offset == 0) return errnoError(e);
+            break;
+        }
+        const sent_bytes: usize = @intCast(rc);
+        if (sent_bytes != length) return errnoError(.IO);
+        offset += chunk;
+    }
+    return offset;
+}
 
 // ---------------------------------------------------------------------------
 // epoll / eventfd primitives
@@ -1125,6 +1232,73 @@ test "udp send batch io reuses storage across addressed, connected and partial s
     try testing.expectEqualStrings("connected-send", buffer_b[0..recv_slots_b[0].length]);
 }
 
+test "udp send gso emits exact datagram boundaries" {
+    // GSO hands a uniformly sized batch to the kernel as one send per up-to
+    // 64 KiB chunk; the receiver must observe exactly one datagram per
+    // segment, each of the segment size. Mixed sizes are a caller contract
+    // violation (the engine gates on uniformity), so only the uniform path is
+    // tested here.
+    const bound = blk: {
+        const address = loopbackV4Generic(0);
+        var storage: BoundAddress = undefined;
+        const fd = try udpListenSocket(&address, @sizeOf(posix.sockaddr.in), &storage);
+        errdefer closeFd(fd);
+        const in: *const posix.sockaddr.in = @ptrCast(&storage.address);
+        break :blk .{ .fd = fd, .port = std.mem.bigToNative(u16, in.port) };
+    };
+    defer closeFd(bound.fd);
+    const connected = try udpUpstreamSocket(&loopbackV4Generic(bound.port), @sizeOf(posix.sockaddr.in));
+    defer closeFd(connected);
+
+    const gso_size: usize = 1400;
+    const slot_count: usize = 20; // 28 KiB, under the 64 KiB GSO cap
+    var payloads: [slot_count][1400]u8 = undefined;
+    var staging: [udp_gso_max_bytes]u8 = undefined;
+    var slots: [slot_count]UdpSlot = undefined;
+    for (&payloads, 0..) |*payload, i| {
+        @memset(payload, @intCast(i + 1));
+        slots[i] = .{ .data = &payload.*, .length = gso_size };
+    }
+
+    try testing.expectEqual(@as(usize, slot_count), try udpSendGso(connected, &slots, &staging));
+    try testing.expectError(error.Invalid, udpSendGso(connected, &.{}, &staging));
+
+    // The receiver sees slot_count datagrams, each exactly gso_size bytes and
+    // in send order.
+    var receive_buffer: [slot_count][2048]u8 = undefined;
+    var recv_slots: [slot_count]UdpSlot = undefined;
+    for (&receive_buffer, 0..) |*region, i| recv_slots[i] = .{ .data = &region.*, .capacity = region.len };
+    var received: usize = 0;
+    for (0..200) |_| {
+        received += try udpRecvBatch(bound.fd, recv_slots[received..]);
+        if (received == slot_count) break;
+        const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try testing.expectEqual(slot_count, received);
+    for (recv_slots, 0..) |slot, i| {
+        try testing.expectEqual(@as(u32, gso_size), slot.length);
+        for (payloads[i]) |byte| try testing.expectEqual(@as(u8, @intCast(i + 1)), byte);
+    }
+
+    // After the GSO send the socket must be back in the plain-send state: a
+    // normal (non-multiple-of-gso-size) sendmsg still works.
+    const small = "after-gso";
+    var small_slots = [_]UdpSlot{.{ .data = @constCast(small.ptr), .length = small.len }};
+    try testing.expectEqual(@as(usize, 1), try udpSendBatch(connected, null, 0, &small_slots));
+    var small_buffer: [64]u8 = undefined;
+    var small_recv = [_]UdpSlot{.{ .data = &small_buffer, .capacity = small_buffer.len }};
+    var small_received: usize = 0;
+    for (0..200) |_| {
+        small_received += try udpRecvBatch(bound.fd, small_recv[small_received..]);
+        if (small_received == 1) break;
+        const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try testing.expectEqual(@as(usize, 1), small_received);
+    try testing.expectEqualStrings(small, small_buffer[0..small_recv[0].length]);
+}
+
 test "udp set socket buffers" {
     const destination = loopbackV4Generic(9); // unbound port is fine for connect()
     const fd = try udpUpstreamSocket(&destination, @sizeOf(posix.sockaddr.in));
@@ -1163,6 +1337,54 @@ test "udp connected client socket shares the listen port" {
         @sizeOf(posix.sockaddr.in),
     );
     defer closeFd(client_fd);
+}
+
+test "counters zero snapshot reset delta and add" {
+    const TestCounters = struct {
+        a: u64 = 0,
+        b: u64 = 0,
+        c: u64 = 0,
+    };
+
+    // zero produces an all-zero value without requiring a named literal.
+    const initial = counters.zero(TestCounters);
+    try testing.expectEqual(@as(u64, 0), initial.a);
+    try testing.expectEqual(@as(u64, 0), initial.b);
+    try testing.expectEqual(@as(u64, 0), initial.c);
+
+    var current = TestCounters{ .a = 1, .b = 2, .c = 3 };
+    // snapshot is a point-in-time copy.
+    const snap = counters.snapshot(TestCounters, current);
+    try testing.expectEqual(@as(u64, 1), snap.a);
+    try testing.expectEqual(@as(u64, 2), snap.b);
+    try testing.expectEqual(@as(u64, 3), snap.c);
+    current.b = 99;
+    try testing.expectEqual(@as(u64, 2), snap.b); // snapshot unaffected
+
+    // delta reports only the growth since the previous snapshot.
+    const grown = counters.snapshot(TestCounters, TestCounters{ .a = 5, .b = 2, .c = 8 });
+    const d = counters.delta(TestCounters, grown, snap);
+    try testing.expectEqual(@as(u64, 4), d.a);
+    try testing.expectEqual(@as(u64, 0), d.b);
+    try testing.expectEqual(@as(u64, 5), d.c);
+
+    // A counter that shrank (wrap or external reset) saturates to zero.
+    const wrapped = counters.delta(TestCounters, snap, grown);
+    try testing.expectEqual(@as(u64, 0), wrapped.a);
+    try testing.expectEqual(@as(u64, 0), wrapped.b);
+    try testing.expectEqual(@as(u64, 0), wrapped.c);
+
+    // add aggregates two snapshots element-wise.
+    const sum = counters.add(TestCounters, snap, grown);
+    try testing.expectEqual(@as(u64, 6), sum.a);
+    try testing.expectEqual(@as(u64, 4), sum.b);
+    try testing.expectEqual(@as(u64, 11), sum.c);
+
+    // reset zeroes the value in place.
+    counters.reset(&current);
+    try testing.expectEqual(@as(u64, 0), current.a);
+    try testing.expectEqual(@as(u64, 0), current.b);
+    try testing.expectEqual(@as(u64, 0), current.c);
 }
 
 test "sockmap loader rejects invalid arguments without privileges" {

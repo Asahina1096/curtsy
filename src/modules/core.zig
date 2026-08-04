@@ -19,6 +19,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 
 const autotune = @import("../autotune.zig");
+const bpf = @import("../bpf.zig");
 const conf = @import("../conf.zig");
 const fw = @import("../module.zig");
 const limits = @import("limits.zig");
@@ -142,6 +143,117 @@ pub const ResolvedForwarder = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Protocol-neutral data-path metrics
+// ---------------------------------------------------------------------------
+
+/// TCP data-path accounting in a protocol-neutral form. The leaf fields mirror
+/// `tcp.TcpDataPathCounters`; the TCP listener adapter translates between the
+/// two (a comptime assertion in tcp.zig keeps the field sets in sync). All
+/// fields are u64 cumulative totals, so the generic counter machinery applies.
+pub const TcpMetrics = struct {
+    /// Bytes moved through the splice(2) zero-copy fast path.
+    splice_bytes: u64 = 0,
+    /// Successful socket->pipe splice calls that moved data.
+    splice_calls: u64 = 0,
+    /// Splice bytes that hit destination backpressure and were copied into the
+    /// budgeted outbound queue.
+    splice_queued_bytes: u64 = 0,
+    /// Connections killed by peer splice errors (EPIPE/ECONNRESET/...).
+    splice_peer_failures: u64 = 0,
+    /// Times a worker splice pipe was retired after a structural failure.
+    splice_pipe_retired: u64 = 0,
+    /// Bytes moved through the pure buffered relay.
+    buffered_bytes: u64 = 0,
+    /// Reads performed by the buffered relay.
+    buffered_calls: u64 = 0,
+    /// Connections paired into the kernel sockmap.
+    sockmap_connections: u64 = 0,
+    /// Sockmap pairing attempts that failed and fell back to the userspace relay.
+    sockmap_pair_failures: u64 = 0,
+    /// Userspace-relayed straggler bytes read on sockmap-mode connections.
+    sockmap_read_bytes: u64 = 0,
+    /// Connections killed when the global userspace buffer budget was exhausted.
+    budget_exhausted: u64 = 0,
+};
+
+/// UDP data-path accounting in a protocol-neutral form, mirroring
+/// `udp.UdpDataPathCounters`.
+pub const UdpMetrics = struct {
+    /// recvmmsg syscalls on the relay engines, including EAGAIN and failures.
+    recv_calls: u64 = 0,
+    /// Datagrams received by the userspace relays.
+    recv_datagrams: u64 = 0,
+    /// Payload bytes received by the userspace relays.
+    recv_bytes: u64 = 0,
+    /// sendmmsg syscalls on the relay engines, including failures.
+    send_calls: u64 = 0,
+    /// Datagrams handed to the kernel by the userspace relays.
+    send_datagrams: u64 = 0,
+    /// Payload bytes handed to the kernel by the userspace relays.
+    send_bytes: u64 = 0,
+    /// Datagrams dropped because a sendmmsg batch could not make progress.
+    send_error_drops: u64 = 0,
+    /// Sockmap pairing attempts (once per association that tried to steer).
+    sockmap_pair_attempts: u64 = 0,
+    /// Sockmap pairings that succeeded (association steered by the kernel).
+    sockmap_pair_successes: u64 = 0,
+    /// Sockmap pairing attempts that failed and fell back to the userspace relay.
+    sockmap_pair_failures: u64 = 0,
+    /// Datagrams relayed by userspace on accelerated client sockets.
+    sockmap_pass_datagrams: u64 = 0,
+    /// Payload bytes of those userspace-relayed accelerated-client datagrams.
+    sockmap_pass_bytes: u64 = 0,
+};
+
+/// Protocol-neutral data-path accounting surfaced through the Listener vtable
+/// and aggregated across every listener of every live rule by the service
+/// layer. Each protocol adapter fills only its protocol half; the other half
+/// stays zero. Every leaf field is a u64 total, so the generic counter
+/// helpers apply unchanged to each half.
+///
+/// Counters are cumulative for a listener generation. A hot reload that
+/// retires a listener and binds a fresh one resets that listener's share to
+/// zero, so an across-snapshot `delta` reports the replacement as zero rather
+/// than a negative number (listeners never underflow).
+pub const MetricsSnapshot = struct {
+    tcp: TcpMetrics = .{},
+    udp: UdpMetrics = .{},
+
+    pub const zero: MetricsSnapshot = .{ .tcp = .{}, .udp = .{} };
+
+    /// True when every field is zero (used to skip idle metric log lines).
+    pub fn isZero(self: MetricsSnapshot) bool {
+        return isZeroFields(TcpMetrics, self.tcp) and isZeroFields(UdpMetrics, self.udp);
+    }
+
+    /// Element-wise sum; aggregates per-listener snapshots into a
+    /// service-wide snapshot.
+    pub fn add(a: MetricsSnapshot, b: MetricsSnapshot) MetricsSnapshot {
+        return .{
+            .tcp = bpf.counters.add(TcpMetrics, a.tcp, b.tcp),
+            .udp = bpf.counters.add(UdpMetrics, a.udp, b.udp),
+        };
+    }
+
+    /// Saturating per-field difference `current - previous`: a counter that
+    /// wrapped or was reset (a listener replaced by a fresh generation)
+    /// reports zero instead of underflowing.
+    pub fn delta(current: MetricsSnapshot, previous: MetricsSnapshot) MetricsSnapshot {
+        return .{
+            .tcp = bpf.counters.delta(TcpMetrics, current.tcp, previous.tcp),
+            .udp = bpf.counters.delta(UdpMetrics, current.udp, previous.udp),
+        };
+    }
+
+    fn isZeroFields(comptime T: type, value: T) bool {
+        inline for (std.meta.fields(T)) |field| {
+            if (@field(value, field.name) != 0) return false;
+        }
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Protocol module interface (ngx event module analogue)
 // ---------------------------------------------------------------------------
 
@@ -159,6 +271,7 @@ pub const Listener = struct {
     active_count_fn: *const fn (context: *anyopaque) usize,
     buffered_bytes_fn: *const fn (context: *anyopaque) i64,
     associations_fn: *const fn (context: *anyopaque) u64,
+    metrics_fn: *const fn (context: *anyopaque) MetricsSnapshot,
 
     pub fn activate(self: *Listener) void {
         self.activate_fn(self.context);
@@ -196,6 +309,13 @@ pub const Listener = struct {
 
     pub fn associationCount(self: *Listener) u64 {
         return self.associations_fn(self.context);
+    }
+
+    /// Cumulative data-path accounting for this listener generation, safe to
+    /// read from any thread (the adapters snapshot per-worker atomics). Pure
+    /// accounting; it never influences a forwarding or tuning decision.
+    pub fn metrics(self: *Listener) MetricsSnapshot {
+        return self.metrics_fn(self.context);
     }
 };
 
@@ -1168,14 +1288,22 @@ pub const ForwarderService = struct {
         if (self.shutting_down) return null;
         var tcp_buffered: i64 = 0;
         var udp_associations: u64 = 0;
+        var metrics = MetricsSnapshot.zero;
         for (self.rules_list.items) |rt| {
-            if (rt.tcp_listener) |listener| tcp_buffered += listener.bufferedBytesUsed();
-            if (rt.udp_listener) |listener| udp_associations += listener.associationCount();
+            if (rt.tcp_listener) |listener| {
+                tcp_buffered += listener.bufferedBytesUsed();
+                metrics = MetricsSnapshot.add(metrics, listener.metrics());
+            }
+            if (rt.udp_listener) |listener| {
+                udp_associations += listener.associationCount();
+                metrics = MetricsSnapshot.add(metrics, listener.metrics());
+            }
         }
         return .{
             .configuration = self.tuning_view,
             .tcp_buffered_bytes = tcp_buffered,
             .udp_associations = @intCast(udp_associations),
+            .metrics = metrics,
         };
     }
 
@@ -2112,4 +2240,181 @@ fn writeTestConfig(path: []const u8, text: []const u8) !void {
         if (linux.errno(written) != .SUCCESS) return error.TestConfigWriteFailed;
         rest = rest[written..];
     }
+}
+
+// ---------------------------------------------------------------------------
+// Data-path metrics tests
+// ---------------------------------------------------------------------------
+
+test "metrics snapshot zero add delta and isZero" {
+    try testing.expect(MetricsSnapshot.zero.isZero());
+    const empty = MetricsSnapshot{};
+    try testing.expect(empty.isZero());
+
+    // add sums both protocol halves element-wise.
+    const a = MetricsSnapshot{
+        .tcp = .{ .splice_bytes = 10, .splice_calls = 2 },
+        .udp = .{ .recv_calls = 5 },
+    };
+    const b = MetricsSnapshot{
+        .tcp = .{ .splice_bytes = 3 },
+        .udp = .{ .recv_calls = 7, .recv_datagrams = 4 },
+    };
+    const sum = MetricsSnapshot.add(a, b);
+    try testing.expectEqual(@as(u64, 13), sum.tcp.splice_bytes);
+    try testing.expectEqual(@as(u64, 2), sum.tcp.splice_calls);
+    try testing.expectEqual(@as(u64, 12), sum.udp.recv_calls);
+    try testing.expectEqual(@as(u64, 4), sum.udp.recv_datagrams);
+
+    // delta reports only the growth since the previous snapshot; a field that
+    // shrank (wrap or external reset) saturates to zero.
+    const grown = MetricsSnapshot{
+        .tcp = .{ .splice_bytes = 17 },
+        .udp = .{ .recv_datagrams = 10 },
+    };
+    const d = MetricsSnapshot.delta(grown, a);
+    try testing.expectEqual(@as(u64, 7), d.tcp.splice_bytes);
+    try testing.expectEqual(@as(u64, 0), d.tcp.splice_calls);
+    try testing.expectEqual(@as(u64, 0), d.udp.recv_calls);
+    try testing.expectEqual(@as(u64, 10), d.udp.recv_datagrams);
+    try testing.expect(!d.isZero());
+
+    // A listener replaced by a fresh generation starts at zero: the delta
+    // saturates to zero instead of underflowing, and isZero flags the result.
+    const replaced = MetricsSnapshot{ .tcp = .{ .splice_bytes = 0 } };
+    try testing.expect(MetricsSnapshot.delta(replaced, a).isZero());
+    try testing.expect(MetricsSnapshot.delta(a, a).isZero());
+}
+
+/// Minimal listener wrapper whose metrics_fn returns a fixed snapshot. The
+/// wrapper and its context are heap-allocated so the service's destroy path
+/// (listener.destroy) is exercised symmetrically.
+const FakeListener = struct {
+    const Context = struct {
+        metrics: MetricsSnapshot,
+    };
+
+    fn create(allocator: Allocator, metrics: MetricsSnapshot) !*Listener {
+        const context = try allocator.create(Context);
+        context.* = .{ .metrics = metrics };
+        const wrapper = try allocator.create(Listener);
+        wrapper.* = .{
+            .allocator = allocator,
+            .context = context,
+            .activate_fn = noop,
+            .stop_accepting_fn = noop,
+            .destroy_fn = destroy,
+            .update_configuration_fn = noopUpdate,
+            .update_backlog_fn = null,
+            .force_close_fn = noop,
+            .active_count_fn = zeroCount,
+            .buffered_bytes_fn = zeroBuffered,
+            .associations_fn = zeroAssociations,
+            .metrics_fn = metricsOf,
+        };
+        return wrapper;
+    }
+
+    fn noop(context: *anyopaque) void {
+        _ = context;
+    }
+
+    fn noopUpdate(context: *anyopaque, resolved: ResolvedConfiguration, reset_sessions: bool) void {
+        _ = context;
+        _ = resolved;
+        _ = reset_sessions;
+    }
+
+    fn destroy(listener_allocator: Allocator, context: *anyopaque) void {
+        const c: *Context = @ptrCast(@alignCast(context));
+        listener_allocator.destroy(c);
+    }
+
+    fn zeroCount(context: *anyopaque) usize {
+        _ = context;
+        return 0;
+    }
+
+    fn zeroBuffered(context: *anyopaque) i64 {
+        _ = context;
+        return 0;
+    }
+
+    fn zeroAssociations(context: *anyopaque) u64 {
+        _ = context;
+        return 0;
+    }
+
+    fn metricsOf(context: *anyopaque) MetricsSnapshot {
+        const c: *Context = @ptrCast(@alignCast(context));
+        return c.metrics;
+    }
+};
+
+/// RuleRuntime whose pool is real (so service.deinit's destroy path works)
+/// but whose listeners are fakes; the rule/resolved views are unused by
+/// snapshot().
+fn makeFakeRuleRuntime(allocator: Allocator, tcp_listener: ?*Listener, udp_listener: ?*Listener) !*RuleRuntime {
+    const addresses = [_]SocketAddr{SocketAddr.parseIp("127.0.0.1", 9_001).?};
+    const weights = [_]u32{1};
+    const rt = try allocator.create(RuleRuntime);
+    rt.* = .{
+        .rule = undefined,
+        .resolved = undefined,
+        .pool = try upstream.UpstreamPool.init(allocator, &addresses, &weights, upstream.defaultBalancer()),
+        .balance = upstream.defaultBalancer(),
+        .tcp_listener = tcp_listener,
+        .udp_listener = udp_listener,
+        .started_worker_threads = 0,
+        .started_udp_io_threads = 0,
+    };
+    return rt;
+}
+
+test "snapshot aggregates listener metrics across rules" {
+    const result = try resolveYamlForTest(
+        \\listen: { host: "127.0.0.1", port: 9000 }
+        \\upstream: { host: "127.0.0.2", port: 9001 }
+    , null);
+    var service = ForwarderService.init(testing.allocator, "metrics-test.yaml", result.cycle, result.resolved);
+    defer service.deinit();
+
+    // Rule 0: one TCP listener. Rule 1: TCP + UDP. The service-level snapshot
+    // must sum every listener's metrics into the matching protocol half.
+    const fake_tcp_0 = try FakeListener.create(testing.allocator, .{
+        .tcp = .{ .splice_bytes = 100, .buffered_bytes = 7 },
+    });
+    const fake_tcp_1 = try FakeListener.create(testing.allocator, .{
+        .tcp = .{ .splice_bytes = 50 },
+    });
+    const fake_udp = try FakeListener.create(testing.allocator, .{
+        .udp = .{ .recv_datagrams = 42, .send_bytes = 1_024 },
+    });
+    const rt0 = try makeFakeRuleRuntime(testing.allocator, fake_tcp_0, null);
+    const rt1 = try makeFakeRuleRuntime(testing.allocator, fake_tcp_1, fake_udp);
+    try service.rules_list.append(testing.allocator, rt0);
+    try service.rules_list.append(testing.allocator, rt1);
+
+    const snap = service.snapshot().?;
+    try testing.expectEqual(@as(u64, 150), snap.metrics.tcp.splice_bytes);
+    try testing.expectEqual(@as(u64, 7), snap.metrics.tcp.buffered_bytes);
+    try testing.expectEqual(@as(u64, 0), snap.metrics.tcp.splice_calls);
+    try testing.expectEqual(@as(u64, 42), snap.metrics.udp.recv_datagrams);
+    try testing.expectEqual(@as(u64, 1_024), snap.metrics.udp.send_bytes);
+    // The fake listeners report no buffered bytes or associations.
+    try testing.expectEqual(@as(i64, 0), snap.tcp_buffered_bytes);
+    try testing.expectEqual(@as(i64, 0), snap.udp_associations);
+}
+
+test "snapshot metrics stay all-zero when a service has no listeners" {
+    const result = try resolveYamlForTest(
+        \\listen: { host: "127.0.0.1", port: 9000 }
+        \\upstream: { host: "127.0.0.2", port: 9001 }
+    , null);
+    var service = ForwarderService.init(testing.allocator, "metrics-test.yaml", result.cycle, result.resolved);
+    defer service.deinit();
+    const snap = service.snapshot().?;
+    try testing.expect(snap.metrics.isZero());
+    try testing.expectEqual(@as(u64, 0), snap.metrics.tcp.splice_bytes);
+    try testing.expectEqual(@as(u64, 0), snap.metrics.udp.recv_datagrams);
 }

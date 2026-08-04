@@ -90,6 +90,92 @@ pub const UdpAssociationBudget = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Data-path counters
+// ---------------------------------------------------------------------------
+
+/// Listener-wide UDP data-path accounting. One counter set lives per engine
+/// (`UdpEngineCounters`) so hot-path increments never contend on a shared
+/// cache line; `UdpListener.countersSnapshot` aggregates them. Counters are
+/// pure accounting and never influence a forwarding decision.
+pub const UdpDataPathCounters = struct {
+    /// recvmmsg syscalls on this engine, including EAGAIN and failed ones.
+    recv_calls: u64 = 0,
+    /// Datagrams received by the userspace relays on this engine.
+    recv_datagrams: u64 = 0,
+    /// Payload bytes received by the userspace relays on this engine.
+    recv_bytes: u64 = 0,
+    /// sendmmsg syscalls on this engine, including failed ones.
+    send_calls: u64 = 0,
+    /// Datagrams handed to the kernel by the userspace relays on this engine.
+    send_datagrams: u64 = 0,
+    /// Payload bytes handed to the kernel by the userspace relays on this engine.
+    send_bytes: u64 = 0,
+    /// Datagrams dropped because a sendmmsg batch could not make progress.
+    send_error_drops: u64 = 0,
+    /// Sockmap pairing attempts (once per association that tried to steer).
+    sockmap_pair_attempts: u64 = 0,
+    /// Sockmap pairings that succeeded (association steered by the kernel).
+    sockmap_pair_successes: u64 = 0,
+    /// Sockmap pairing attempts that failed and fell back to the userspace relay.
+    sockmap_pair_failures: u64 = 0,
+    /// Datagrams relayed by userspace on accelerated client sockets (queued
+    /// before pairing completed or passed through by the verdict via SK_PASS).
+    sockmap_pass_datagrams: u64 = 0,
+    /// Payload bytes of those userspace-relayed accelerated-client datagrams.
+    sockmap_pass_bytes: u64 = 0,
+
+    /// Average receive batch fill: datagrams per recvmmsg syscall. 0 when idle.
+    pub fn recvAvgBatchFill(self: UdpDataPathCounters) u64 {
+        return if (self.recv_calls > 0) self.recv_datagrams / self.recv_calls else 0;
+    }
+
+    /// Average send batch fill: datagrams per sendmmsg syscall. 0 when idle.
+    pub fn sendAvgBatchFill(self: UdpDataPathCounters) u64 {
+        return if (self.send_calls > 0) self.send_datagrams / self.send_calls else 0;
+    }
+};
+
+/// Per-engine atomic counter set. Increments use .monotonic atomics on the
+/// owning I/O thread (one RMW per batched syscall, never per datagram), so a
+/// snapshot may be read from any thread without locks and without shared
+/// cache-line contention on the hot path.
+const UdpEngineCounters = struct {
+    recv_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    recv_datagrams: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    recv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    send_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    send_datagrams: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    send_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    send_error_drops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_pair_attempts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_pair_successes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_pair_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_pass_datagrams: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_pass_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn snapshot(self: *const UdpEngineCounters) UdpDataPathCounters {
+        return .{
+            .recv_calls = self.recv_calls.load(.monotonic),
+            .recv_datagrams = self.recv_datagrams.load(.monotonic),
+            .recv_bytes = self.recv_bytes.load(.monotonic),
+            .send_calls = self.send_calls.load(.monotonic),
+            .send_datagrams = self.send_datagrams.load(.monotonic),
+            .send_bytes = self.send_bytes.load(.monotonic),
+            .send_error_drops = self.send_error_drops.load(.monotonic),
+            .sockmap_pair_attempts = self.sockmap_pair_attempts.load(.monotonic),
+            .sockmap_pair_successes = self.sockmap_pair_successes.load(.monotonic),
+            .sockmap_pair_failures = self.sockmap_pair_failures.load(.monotonic),
+            .sockmap_pass_datagrams = self.sockmap_pass_datagrams.load(.monotonic),
+            .sockmap_pass_bytes = self.sockmap_pass_bytes.load(.monotonic),
+        };
+    }
+
+    fn reset(self: *UdpEngineCounters) void {
+        self.* = .{};
+    }
+};
+
+// ---------------------------------------------------------------------------
 // RuntimeConfiguration: thread-safe configuration snapshot
 // ---------------------------------------------------------------------------
 
@@ -601,6 +687,17 @@ pub const UdpListener = struct {
         return self.budget.count();
     }
 
+    /// Aggregate data-path counters across all engines. Each engine's atomic
+    /// counters are loaded and summed, so the snapshot is safe to read from
+    /// any thread; before start() (no engines) it is all zeros.
+    pub fn countersSnapshot(self: *const UdpListener) UdpDataPathCounters {
+        var total = bpf.counters.zero(UdpDataPathCounters);
+        for (self.engines.items) |slot| {
+            total = bpf.counters.add(UdpDataPathCounters, total, slot.engine.counters.snapshot());
+        }
+        return total;
+    }
+
     pub fn activate(self: *UdpListener) void {
         self.start_paused = false;
         for (self.engines.items) |slot| {
@@ -665,6 +762,7 @@ fn createProtocolListener(
         .active_count_fn = listenerZeroActive,
         .buffered_bytes_fn = listenerZeroBuffered,
         .associations_fn = listenerAssociations,
+        .metrics_fn = listenerMetrics,
     };
     return wrapper;
 }
@@ -708,6 +806,29 @@ fn listenerZeroBuffered(context: *anyopaque) i64 {
 fn listenerAssociations(context: *anyopaque) u64 {
     const listener: *UdpListener = @ptrCast(@alignCast(context));
     return listener.associationCount();
+}
+
+comptime {
+    // Every data-path counter must be surfaced in the protocol-neutral metric
+    // type; the reverse direction is enforced by the translation loop below.
+    for (std.meta.fields(UdpDataPathCounters)) |field| {
+        if (!@hasField(config.UdpMetrics, field.name)) {
+            @compileError("UdpDataPathCounters field " ++ field.name ++ " is missing from config.UdpMetrics");
+        }
+    }
+}
+
+/// Translate the listener's cumulative counters into the protocol-neutral
+/// metrics snapshot. The field sets mirror each other, so the mapping is
+/// mechanical and kept in sync by the comptime check above.
+fn listenerMetrics(context: *anyopaque) config.MetricsSnapshot {
+    const listener: *UdpListener = @ptrCast(@alignCast(context));
+    const counters = listener.countersSnapshot();
+    var udp: config.UdpMetrics = undefined;
+    inline for (std.meta.fields(config.UdpMetrics)) |field| {
+        @field(udp, field.name) = @field(counters, field.name);
+    }
+    return .{ .tcp = .{}, .udp = udp };
 }
 
 // ---------------------------------------------------------------------------
@@ -842,7 +963,6 @@ pub const UdpRelayEngine = struct {
     sweep_buffer: std.ArrayList(SocketAddr) = .empty,
     last_sweep_ms: u64 = 0,
     accelerate_cooldown_until_ms: u64 = 0,
-    send_error_drops: u64 = 0,
     last_send_error_log_ms: u64 = 0,
     /// Cached auto eligibility (no loopback upstream); refreshed on startup
     /// and reload so the I/O thread never locks the runtime snapshot.
@@ -856,12 +976,22 @@ pub const UdpRelayEngine = struct {
     /// thread like the rest of the state below; avoids rebuilding the header
     /// set on the stack for every send batch.
     send_io: bpf.UdpSendBatchIo = undefined,
-    /// Debug batch statistics, reset every stats_log_interval_ms. Only the
-    /// engine's I/O thread touches them; nothing per-datagram is shared.
-    recv_calls: u64 = 0,
-    recv_datagrams: u64 = 0,
-    send_calls: u64 = 0,
-    send_datagrams: u64 = 0,
+    /// Contiguous staging buffer for the UDP GSO fast path. Datagrams of a
+    /// uniformly sized batch are copied here so they can be handed to the
+    /// kernel as one send per up-to-64 KiB chunk with UDP_SEGMENT set to the
+    /// datagram size, replacing a 64-entry sendmmsg with a handful of GSO
+    /// sends. Confined to the engine's I/O thread.
+    gso_staging: [bpf.udp_gso_max_bytes]u8 = undefined,
+    /// Data-path accounting incremented on this engine's I/O thread; atomics
+    /// make the aggregate snapshot readable from any thread. The counters are
+    /// strictly cumulative and never reset, so `countersSnapshot` stays
+    /// coherent; `logBatchStats` derives its per-interval batch fill by
+    /// diffing successive snapshots instead.
+    counters: UdpEngineCounters = .{},
+    /// Cumulative counter snapshot at the previous stats tick; lets
+    /// `logBatchStats` report per-interval deltas without resetting the
+    /// exported atomic counters. Only the I/O thread touches it.
+    last_stats_snapshot: ?UdpDataPathCounters = null,
     last_stats_log_ms: u64 = 0,
 
     pub fn init(
@@ -1013,6 +1143,11 @@ pub const UdpRelayEngine = struct {
 
     pub fn associationCount(self: *const UdpRelayEngine) u64 {
         return self.budget.count();
+    }
+
+    /// This engine's data-path counter snapshot; safe to read from any thread.
+    pub fn countersSnapshot(self: *const UdpRelayEngine) UdpDataPathCounters {
+        return self.counters.snapshot();
     }
 
     pub fn resetAssociations(self: *UdpRelayEngine) void {
@@ -1200,14 +1335,18 @@ pub const UdpRelayEngine = struct {
     /// i.e. datagrams divided by syscalls since the previous snapshot. Idle
     /// windows are skipped so silent engines never emit log lines.
     fn logBatchStats(self: *UdpRelayEngine) void {
-        const recv_calls = self.recv_calls;
-        const recv_datagrams = self.recv_datagrams;
-        const send_calls = self.send_calls;
-        const send_datagrams = self.send_datagrams;
-        self.recv_calls = 0;
-        self.recv_datagrams = 0;
-        self.send_calls = 0;
-        self.send_datagrams = 0;
+        // Diff the cumulative counters since the last tick rather than reset
+        // them: the exported countersSnapshot must stay cumulative for any
+        // external aggregation, and the deltas are exactly the per-interval
+        // batch-fill figures this log line reports.
+        const current = self.counters.snapshot();
+        defer self.last_stats_snapshot = current;
+        const previous = self.last_stats_snapshot orelse return;
+        const interval = bpf.counters.delta(UdpDataPathCounters, current, previous);
+        const recv_calls = interval.recv_calls;
+        const recv_datagrams = interval.recv_datagrams;
+        const send_calls = interval.send_calls;
+        const send_datagrams = interval.send_datagrams;
         if (recv_calls == 0 and send_calls == 0) return;
         if (!self.log.isEnabled(log.Level.debug)) return;
         const recv_avg: u64 = if (recv_calls > 0) recv_datagrams / recv_calls else 0;
@@ -1437,21 +1576,22 @@ pub const UdpRelayEngine = struct {
         var would_block = false;
         while (calls < remaining_calls and offset < batch_size) {
             const received = recv_io.recvInto(fd, &recv_slots.*, offset) catch {
-                self.recv_calls += 1;
+                _ = self.counters.recv_calls.fetchAdd(1, .monotonic);
                 return .{ .count = offset, .calls = calls + 1, .would_block = false, .read_failed = true };
             };
             calls += 1;
-            self.recv_calls += 1;
-            self.recv_datagrams += received;
+            _ = self.counters.recv_calls.fetchAdd(1, .monotonic);
+            _ = self.counters.recv_datagrams.fetchAdd(received, .monotonic);
             if (received > 0) {
+                var bytes: u64 = 0;
+                for (recv_slots[offset .. offset + received]) |*slot| bytes += slot.length;
+                _ = self.counters.recv_bytes.fetchAdd(bytes, .monotonic);
                 // The adaptive policy's evidence is the client-side workload
                 // only: datagrams arriving on the listener (client ingress)
                 // and the accelerated client fallback socket. Upstream
                 // responses are excluded so a chatty upstream cannot arm the
                 // accelerator on the relay's reply volume.
                 if (count_policy) {
-                    var bytes: u64 = 0;
-                    for (recv_slots[offset .. offset + received]) |*slot| bytes += slot.length;
                     self.policy_recv_datagrams += received;
                     self.policy_recv_bytes += bytes;
                 }
@@ -1567,6 +1707,10 @@ pub const UdpRelayEngine = struct {
             remaining -= result.calls;
             if (result.count > 0) {
                 association.last_activity_ms = now_ms;
+                var pass_bytes: u64 = 0;
+                for (recv_slots[0..result.count]) |*slot| pass_bytes += slot.length;
+                _ = self.counters.sockmap_pass_datagrams.fetchAdd(result.count, .monotonic);
+                _ = self.counters.sockmap_pass_bytes.fetchAdd(pass_bytes, .monotonic);
                 _ = self.sendAllDatagrams(
                     association.upstream_fd,
                     null,
@@ -1637,15 +1781,31 @@ pub const UdpRelayEngine = struct {
     ) bool {
         var sent_total: usize = 0;
         while (sent_total < slots.len) {
-            const sent = self.send_io.send(fd, address, address_length, slots[sent_total..]) catch {
-                self.send_calls += 1;
-                self.noteSendError(slots.len - sent_total, context, errnoDescription(), now_ms);
+            const remaining = slots[sent_total..];
+            // GSO applies only to connected upstream sockets (address == null):
+            // the reverse direction shares the listen socket across clients and
+            // cannot carry a per-association segment size. When the fast path
+            // does apply it replaces the whole sendmmsg for that run.
+            if (address == null) {
+                if (self.gsoSendBatch(fd, remaining, context, now_ms)) |sent| {
+                    if (sent == 0) return false;
+                    sent_total += sent;
+                    if (sent == remaining.len) return true;
+                    continue;
+                }
+            }
+            const sent = self.send_io.send(fd, address, address_length, remaining) catch {
+                _ = self.counters.send_calls.fetchAdd(1, .monotonic);
+                self.noteSendError(remaining.len, context, errnoDescription(), now_ms);
                 return false;
             };
-            self.send_calls += 1;
-            self.send_datagrams += sent;
+            _ = self.counters.send_calls.fetchAdd(1, .monotonic);
+            _ = self.counters.send_datagrams.fetchAdd(sent, .monotonic);
+            var sent_bytes: u64 = 0;
+            for (remaining[0..sent]) |*slot| sent_bytes += slot.length;
+            _ = self.counters.send_bytes.fetchAdd(sent_bytes, .monotonic);
             if (sent == 0) {
-                self.noteSendError(slots.len - sent_total, context, "sendmmsg made no progress", now_ms);
+                self.noteSendError(remaining.len, context, "sendmmsg made no progress", now_ms);
                 return false;
             }
             sent_total += sent;
@@ -1653,17 +1813,61 @@ pub const UdpRelayEngine = struct {
         return true;
     }
 
+    /// UDP GSO fast path for a uniformly sized send batch to a connected
+    /// socket. Payloads are copied into the engine's staging buffer and handed
+    /// to the kernel as one send per up-to-64 KiB chunk with UDP_SEGMENT set to
+    /// the datagram size, so the kernel emits exactly one UDP datagram per
+    /// segment and amortizes the per-datagram route/skb/xmit cost over a GSO
+    /// skb. Returns null when GSO does not apply (mixed sizes, tiny batches,
+    /// empty datagrams); otherwise the number of datagrams handed to the
+    /// kernel, 0 only on a send error (the caller drops the batch like a failed
+    /// sendmmsg). Partial GSO progress is reported so the caller forwards the
+    /// remainder through the ordinary path.
+    fn gsoSendBatch(
+        self: *UdpRelayEngine,
+        fd: fd_t,
+        slots: []const bpf.UdpSlot,
+        comptime context: []const u8,
+        now_ms: u64,
+    ) ?usize {
+        // A handful of datagrams is too few to pay the staging copy and the
+        // UDP_SEGMENT toggle; sendmmsg already handles those cheaply.
+        if (slots.len < 4) return null;
+        const gso_size: usize = slots[0].length;
+        if (gso_size == 0) return null;
+        for (slots) |*slot| {
+            if (slot.length != gso_size) return null;
+        }
+        const sent = bpf.udpSendGso(fd, slots, &self.gso_staging) catch {
+            _ = self.counters.send_calls.fetchAdd(1, .monotonic);
+            self.noteSendError(slots.len, context, errnoDescription(), now_ms);
+            return 0;
+        };
+        const per_send = @max(@as(usize, 1), bpf.udp_gso_max_bytes / gso_size);
+        // udpSendGso advances whole chunks, so the datagrams it handed to the
+        // kernel are exactly ceil(sent/per_send) full chunks; counting from
+        // `sent` keeps the send_calls figure accurate on partial progress
+        // instead of assuming the whole batch was sent.
+        const calls = (sent + per_send - 1) / per_send;
+        _ = self.counters.send_calls.fetchAdd(calls, .monotonic);
+        _ = self.counters.send_datagrams.fetchAdd(sent, .monotonic);
+        var bytes: u64 = 0;
+        for (slots[0..sent]) |*slot| bytes += slot.length;
+        _ = self.counters.send_bytes.fetchAdd(bytes, .monotonic);
+        return sent;
+    }
+
     /// Drop logging is rate-limited per engine: sustained backpressure would
     /// otherwise serialize all engine threads on the shared log mutex once
     /// per failed batch.
     fn noteSendError(self: *UdpRelayEngine, dropped: usize, comptime context: []const u8, error_text: []const u8, now_ms: u64) void {
-        self.send_error_drops += dropped;
+        _ = self.counters.send_error_drops.fetchAdd(dropped, .monotonic);
         if (now_ms -% self.last_send_error_log_ms < send_error_log_interval_ms) return;
         self.last_send_error_log_ms = now_ms;
         self.log.warning("udp datagrams dropped {s} dropped={d} total_dropped={d} error={s}", .{
             context,
             dropped,
-            self.send_error_drops,
+            self.counters.send_error_drops.load(.monotonic),
             error_text,
         });
     }
@@ -1733,11 +1937,14 @@ pub const UdpRelayEngine = struct {
             now_ms >= self.accelerate_cooldown_until_ms)
         {
             if (self.listen_bound.get(listen_fd)) |bind_storage| {
+                _ = self.counters.sockmap_pair_attempts.fetchAdd(1, .monotonic);
                 if (self.accelerateAssociation(bind_storage, client_address, client_address_length, upstream_fd)) |accelerated| {
                     client_fd = accelerated.fd;
                     pairing = accelerated.pairing;
+                    _ = self.counters.sockmap_pair_successes.fetchAdd(1, .monotonic);
                     self.policy.notePairingSuccess();
                 } else |err| {
+                    _ = self.counters.sockmap_pair_failures.fetchAdd(1, .monotonic);
                     // Kernel steering is best-effort per association; fall
                     // back to the userspace relay for this client. Repeated
                     // failures (e.g. a full sockhash) pause further attempts
@@ -2286,8 +2493,8 @@ test "udp drain budget counts eagain and error recvmmsg syscalls" {
     try testing.expectEqual(@as(usize, 1), eagain.calls);
     try testing.expect(eagain.would_block);
     try testing.expect(!eagain.read_failed);
-    try testing.expectEqual(@as(u64, 1), engine.recv_calls);
-    try testing.expectEqual(@as(u64, 0), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 1), engine.counters.snapshot().recv_calls);
+    try testing.expectEqual(@as(u64, 0), engine.counters.snapshot().recv_datagrams);
 
     // A non-socket fd makes recvmmsg fail (ENOTSOCK): the failed syscall is
     // counted exactly once and the drain ends with read_failed so the caller
@@ -2299,8 +2506,8 @@ test "udp drain budget counts eagain and error recvmmsg syscalls" {
     try testing.expectEqual(@as(usize, 1), failed.calls);
     try testing.expect(!failed.would_block);
     try testing.expect(failed.read_failed);
-    try testing.expectEqual(@as(u64, 2), engine.recv_calls);
-    try testing.expectEqual(@as(u64, 0), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 2), engine.counters.snapshot().recv_calls);
+    try testing.expectEqual(@as(u64, 0), engine.counters.snapshot().recv_datagrams);
 }
 
 test "udp drain budget yields multiple consolidated batches within one readiness" {
@@ -2360,7 +2567,7 @@ test "udp drain budget yields multiple consolidated batches within one readiness
     }
 
     try testing.expectEqual(@as(usize, 200), total);
-    try testing.expectEqual(@as(u64, 200), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 200), engine.counters.snapshot().recv_datagrams);
     try testing.expect(ended_on_eagain);
     // A hot source yields multiple 64-datagram forward batches.
     try testing.expect(full_batches >= 3);
@@ -2368,7 +2575,7 @@ test "udp drain budget yields multiple consolidated batches within one readiness
     try testing.expect(max_calls_in_round <= UdpRelayEngine.max_batches_per_drain);
     // 200 datagrams need at least ceil(200/64)=4 data syscalls plus at least
     // one EAGAIN; every attempted recvmmsg was counted, none dropped.
-    try testing.expect(engine.recv_calls >= 5);
+    try testing.expect(engine.counters.snapshot().recv_calls >= 5);
 }
 
 const ScriptedRecvResult = union(enum) {
@@ -2417,9 +2624,9 @@ test "udp drain budget counts success then error without re-adding work" {
     try testing.expect(!result.would_block);
     try testing.expect(result.read_failed);
     // Two successes plus the failing syscall: exactly three calls.
-    try testing.expectEqual(@as(u64, 3), engine.recv_calls);
+    try testing.expectEqual(@as(u64, 3), engine.counters.snapshot().recv_calls);
     // Only the two successfully received datagrams are counted.
-    try testing.expectEqual(@as(u64, 2), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 2), engine.counters.snapshot().recv_datagrams);
 }
 
 test "udp policy evidence counts client-side receives only, not upstream responses" {
@@ -2435,7 +2642,7 @@ test "udp policy evidence counts client-side receives only, not upstream respons
         .{ .datagrams = 0 },
     } };
     _ = engine.drainRecvBatch(-1, recv_slots, &upstream_script, UdpRelayEngine.max_batches_per_drain, false);
-    try testing.expectEqual(@as(u64, 2), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 2), engine.counters.snapshot().recv_datagrams);
     try testing.expectEqual(@as(u64, 0), engine.policy_recv_datagrams);
     try testing.expectEqual(@as(u64, 0), engine.policy_recv_bytes);
 
@@ -2446,7 +2653,7 @@ test "udp policy evidence counts client-side receives only, not upstream respons
         .{ .datagrams = 0 },
     } };
     _ = engine.drainRecvBatch(-1, recv_slots, &client_script, UdpRelayEngine.max_batches_per_drain, true);
-    try testing.expectEqual(@as(u64, 4), engine.recv_datagrams);
+    try testing.expectEqual(@as(u64, 4), engine.counters.snapshot().recv_datagrams);
     try testing.expectEqual(@as(u64, 2), engine.policy_recv_datagrams);
     try testing.expectEqual(@as(u64, 2), engine.policy_recv_bytes);
 }
@@ -3093,4 +3300,292 @@ test "udp sockmap end-to-end with real BPF (gated: CURTSY_ENABLE_EBPF_TESTS)" {
     };
     settled.listener_ptr = &listener;
     try testing.expect(waitForCondition(settled.check, 2_000));
+}
+
+// ---------------------------------------------------------------------------
+// Data-path counter tests
+// ---------------------------------------------------------------------------
+
+test "udp engine counters snapshot reset delta and batch fill" {
+    var harness = try DrainHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+
+    // Initial snapshot is all zeros.
+    var snap = engine.countersSnapshot();
+    try testing.expectEqual(@as(u64, 0), snap.recv_calls);
+    try testing.expectEqual(@as(u64, 0), snap.recv_datagrams);
+    try testing.expectEqual(@as(u64, 0), snap.recv_bytes);
+    try testing.expectEqual(@as(u64, 0), snap.send_calls);
+    try testing.expectEqual(@as(u64, 0), snap.send_datagrams);
+    try testing.expectEqual(@as(u64, 0), snap.send_bytes);
+    try testing.expectEqual(@as(u64, 0), snap.send_error_drops);
+    try testing.expectEqual(@as(u64, 0), snap.sockmap_pair_attempts);
+    try testing.expectEqual(@as(u64, 0), snap.sockmap_pair_successes);
+    try testing.expectEqual(@as(u64, 0), snap.sockmap_pair_failures);
+    try testing.expectEqual(@as(u64, 0), snap.sockmap_pass_datagrams);
+    try testing.expectEqual(@as(u64, 0), snap.sockmap_pass_bytes);
+    try testing.expectEqual(@as(u64, 0), snap.recvAvgBatchFill());
+    try testing.expectEqual(@as(u64, 0), snap.sendAvgBatchFill());
+
+    // A scripted drain of two datagrams (one byte each) counts calls,
+    // datagrams and bytes, plus the terminating EAGAIN syscall.
+    const recv_slots = &harness.recv_slots;
+    var script = ScriptedRecvIo{ .results = &.{
+        .{ .datagrams = 2 },
+        .{ .datagrams = 0 },
+    } };
+    _ = engine.drainRecvBatch(-1, recv_slots, &script, UdpRelayEngine.max_batches_per_drain, false);
+
+    snap = engine.countersSnapshot();
+    try testing.expectEqual(@as(u64, 2), snap.recv_calls);
+    try testing.expectEqual(@as(u64, 2), snap.recv_datagrams);
+    try testing.expectEqual(@as(u64, 2), snap.recv_bytes); // 1 byte per scripted slot
+    try testing.expectEqual(@as(u64, 1), snap.recvAvgBatchFill());
+    // Upstream responses (count_policy=false) never feed the policy totals.
+    try testing.expectEqual(@as(u64, 0), engine.policy_recv_datagrams);
+
+    // delta reports only the growth since the previous snapshot.
+    const before = engine.countersSnapshot();
+    _ = engine.counters.recv_datagrams.fetchAdd(10, .monotonic);
+    const after = engine.countersSnapshot();
+    const d = bpf.counters.delta(UdpDataPathCounters, after, before);
+    try testing.expectEqual(@as(u64, 10), d.recv_datagrams);
+    try testing.expectEqual(@as(u64, 0), d.recv_calls);
+    try testing.expectEqual(@as(u64, 0), d.recv_bytes);
+
+    // reset zeroes every field in place.
+    engine.counters.reset();
+    const reset_snap = engine.countersSnapshot();
+    try testing.expectEqual(@as(u64, 0), reset_snap.recv_calls);
+    try testing.expectEqual(@as(u64, 0), reset_snap.recv_datagrams);
+    try testing.expectEqual(@as(u64, 0), reset_snap.recv_bytes);
+    try testing.expectEqual(@as(u64, 0), reset_snap.recvAvgBatchFill());
+}
+
+test "udp logBatchStats diffs cumulative counters without resetting them" {
+    var harness = try DrainHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+
+    // The exported counters stay cumulative across stats ticks; logBatchStats
+    // derives its per-interval deltas from successive snapshots instead.
+    _ = engine.counters.recv_calls.fetchAdd(10, .monotonic);
+    _ = engine.counters.recv_datagrams.fetchAdd(30, .monotonic);
+
+    // First tick establishes the baseline; nothing is reset or logged.
+    engine.logBatchStats();
+    try testing.expectEqual(@as(u64, 10), engine.counters.snapshot().recv_calls);
+    try testing.expectEqual(@as(u64, 30), engine.counters.snapshot().recv_datagrams);
+
+    // Second tick consumes the delta; the cumulative totals remain intact.
+    _ = engine.counters.recv_calls.fetchAdd(5, .monotonic);
+    _ = engine.counters.recv_datagrams.fetchAdd(15, .monotonic);
+    engine.logBatchStats();
+    try testing.expectEqual(@as(u64, 15), engine.counters.snapshot().recv_calls);
+    try testing.expectEqual(@as(u64, 45), engine.counters.snapshot().recv_datagrams);
+}
+
+test "udp gso fast path forwards uniform batches and falls back on mixed sizes" {
+    // Plain bound loopback receiver the engine forwards into.
+    var addr = linux.sockaddr.in{
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const recv_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expect(linux.errno(recv_rc) == .SUCCESS);
+    const recv_fd: fd_t = @intCast(recv_rc);
+    defer closeFd(recv_fd);
+    try testing.expect(linux.errno(linux.bind(recv_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+    var bound = linux.sockaddr.in{ .port = 0, .addr = 0 };
+    var bound_len: socklen_t = @sizeOf(linux.sockaddr.in);
+    try testing.expect(linux.errno(linux.getsockname(recv_fd, @ptrCast(&bound), &bound_len)) == .SUCCESS);
+
+    var harness = try DrainHarness.init();
+    defer harness.deinit();
+    const engine = &harness.engine;
+    engine.send_io = bpf.UdpSendBatchIo{};
+
+    var upstream_addr = linux.sockaddr.in{
+        .port = bound.port,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const upstream_fd = try bpf.udpUpstreamSocket(@ptrCast(&upstream_addr), @sizeOf(linux.sockaddr.in));
+    defer closeFd(upstream_fd);
+
+    // Uniform batch: the GSO fast path applies (connected socket, one size).
+    var uniform: [5][100]u8 = undefined;
+    var uniform_slots: [5]bpf.UdpSlot = undefined;
+    for (&uniform, 0..) |*payload, i| {
+        @memset(payload, @intCast(i + 1));
+        uniform_slots[i] = .{ .data = &payload.*, .length = payload.len };
+    }
+    try testing.expect(engine.sendAllDatagrams(upstream_fd, null, 0, &uniform_slots, "direction=client_to_upstream", 0));
+
+    // The receiver observes 5 datagrams of exactly 100 bytes in send order.
+    var recv_buf: [5][128]u8 = undefined;
+    var recv_slots: [5]bpf.UdpSlot = undefined;
+    for (&recv_buf, 0..) |*region, i| recv_slots[i] = .{ .data = &region.*, .capacity = region.len };
+    var received: usize = 0;
+    for (0..200) |_| {
+        received += try bpf.udpRecvBatch(recv_fd, recv_slots[received..]);
+        if (received == 5) break;
+        const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try testing.expectEqual(@as(usize, 5), received);
+    for (recv_slots, 0..) |slot, i| {
+        try testing.expectEqual(@as(u32, 100), slot.length);
+        for (recv_buf[i][0..100]) |byte| try testing.expectEqual(@as(u8, @intCast(i + 1)), byte);
+    }
+    // 100*5 = 500 bytes fits one GSO send; the counters reflect a single call.
+    try testing.expectEqual(@as(u64, 1), engine.countersSnapshot().send_calls);
+    try testing.expectEqual(@as(u64, 5), engine.countersSnapshot().send_datagrams);
+    try testing.expectEqual(@as(u64, 500), engine.countersSnapshot().send_bytes);
+
+    // Mixed sizes disable the fast path; the ordinary sendmmsg must carry all
+    // datagrams with their exact boundaries intact.
+    var mixed_one = "aaa".*;
+    var mixed_two = "bbbbbb".*;
+    var mixed_three = "cccccccccc".*;
+    var mixed_slots = [_]bpf.UdpSlot{
+        .{ .data = &mixed_one, .length = mixed_one.len },
+        .{ .data = &mixed_two, .length = mixed_two.len },
+        .{ .data = &mixed_three, .length = mixed_three.len },
+    };
+    try testing.expect(engine.sendAllDatagrams(upstream_fd, null, 0, &mixed_slots, "direction=client_to_upstream", 0));
+
+    var mixed_buf: [3][16]u8 = undefined;
+    var mixed_recv: [3]bpf.UdpSlot = undefined;
+    for (&mixed_buf, 0..) |*region, i| mixed_recv[i] = .{ .data = &region.*, .capacity = region.len };
+    var mixed_received: usize = 0;
+    for (0..200) |_| {
+        mixed_received += try bpf.udpRecvBatch(recv_fd, mixed_recv[mixed_received..]);
+        if (mixed_received == 3) break;
+        const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try testing.expectEqual(@as(usize, 3), mixed_received);
+    try testing.expectEqualStrings("aaa", mixed_buf[0][0..mixed_recv[0].length]);
+    try testing.expectEqualStrings("bbbbbb", mixed_buf[1][0..mixed_recv[1].length]);
+    try testing.expectEqualStrings("cccccccccc", mixed_buf[2][0..mixed_recv[2].length]);
+    // One sendmmsg call for the mixed batch, not a GSO send.
+    try testing.expectEqual(@as(u64, 2), engine.countersSnapshot().send_calls);
+    try testing.expectEqual(@as(u64, 8), engine.countersSnapshot().send_datagrams);
+
+    // A non-null destination (the upstream-to-client reverse direction) never
+    // takes the GSO path even for a uniform batch: the shared listen socket
+    // cannot carry a per-association segment size.
+    const reverse_bind = linux.sockaddr.in{
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const reverse_fd = try bpf.udpListenSocket(@ptrCast(&reverse_bind), @sizeOf(linux.sockaddr.in), null);
+    defer closeFd(reverse_fd);
+    const reverse_dest = linux.sockaddr.in{
+        .port = bound.port,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    var reverse_slots = [_]bpf.UdpSlot{
+        .{ .data = &uniform[0], .length = uniform[0].len },
+        .{ .data = &uniform[1], .length = uniform[1].len },
+    };
+    try testing.expect(engine.sendAllDatagrams(reverse_fd, @ptrCast(&reverse_dest), @sizeOf(linux.sockaddr.in), &reverse_slots, "direction=upstream_to_client", 0));
+    // sendmmsg (one call) carried the reverse batch, so the call count went up
+    // by exactly one while the datagram count grew by two.
+    try testing.expectEqual(@as(u64, 3), engine.countersSnapshot().send_calls);
+    try testing.expectEqual(@as(u64, 10), engine.countersSnapshot().send_datagrams);
+}
+
+test "udp listener counters snapshot is all zeros before start" {
+    var logger = LogStore.init("critical");
+    const resolved = try makeUdpTestResolved(testing.allocator, 9);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = UdpListener.init(testing.allocator, resolved, &logger, false, null);
+    defer listener.deinit();
+
+    const snapshot = listener.countersSnapshot();
+    try testing.expectEqual(@as(u64, 0), snapshot.recv_calls);
+    try testing.expectEqual(@as(u64, 0), snapshot.recv_datagrams);
+    try testing.expectEqual(@as(u64, 0), snapshot.recv_bytes);
+    try testing.expectEqual(@as(u64, 0), snapshot.send_datagrams);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pair_attempts);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pass_datagrams);
+}
+
+test "udp vtable metrics translation maps engine counters into the neutral snapshot" {
+    var logger = LogStore.init("critical");
+    const resolved = try makeUdpTestResolved(testing.allocator, 9);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = UdpListener.init(testing.allocator, resolved, &logger, false, null);
+    defer listener.deinit();
+    try listener.start();
+
+    // An idle listener translates to an all-zero snapshot.
+    var metrics = listenerMetrics(&listener);
+    try testing.expectEqual(@as(u64, 0), metrics.udp.recv_calls);
+    try testing.expect(std.meta.eql(metrics.tcp, config.TcpMetrics{}));
+
+    // Drive a few engine counters and confirm they land in the right fields.
+    _ = listener.engines.items[0].engine.counters.recv_calls.fetchAdd(3, .monotonic);
+    _ = listener.engines.items[0].engine.counters.recv_datagrams.fetchAdd(11, .monotonic);
+    _ = listener.engines.items[0].engine.counters.send_error_drops.fetchAdd(1, .monotonic);
+    _ = listener.engines.items[0].engine.counters.sockmap_pair_successes.fetchAdd(5, .monotonic);
+
+    metrics = listenerMetrics(&listener);
+    try testing.expectEqual(@as(u64, 3), metrics.udp.recv_calls);
+    try testing.expectEqual(@as(u64, 11), metrics.udp.recv_datagrams);
+    try testing.expectEqual(@as(u64, 1), metrics.udp.send_error_drops);
+    try testing.expectEqual(@as(u64, 5), metrics.udp.sockmap_pair_successes);
+    // The TCP half of a UDP listener stays untouched.
+    try testing.expect(std.meta.eql(metrics.tcp, config.TcpMetrics{}));
+}
+
+test "udp counters track userspace batches and sockmap steering with a fake runtime" {
+    var echo = try UdpEchoServer.start();
+    defer echo.stop();
+
+    var fake = FakeSockmapRuntime{};
+    defer fake.deinit();
+
+    var logger = LogStore.init("critical");
+    var resolved = try makeUdpTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+    resolved.configuration.performance.udp_sockmap_acceleration = .enabled;
+
+    var listener = UdpListener.initWithSelector(testing.allocator, resolved, &logger, null, FakeSockmapRuntime.loader, null);
+    listener.loader_context = &fake;
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = try listener.localAddresses(testing.allocator);
+    defer testing.allocator.free(bound);
+    const port = bound[0].port;
+
+    const client = try udpClient();
+    defer closeFd(client);
+
+    // First round trip establishes the association and steers it through the
+    // (fake) sockmap runtime.
+    try testing.expect(try waitForEcho(client, port, "first-probe", 2_000));
+    // A second datagram now lands on the connected accelerated client socket;
+    // the fake kernel never redirects, so userspace relays it (SK_PASS path).
+    try testing.expect(try waitForEcho(client, port, "second-probe", 2_000));
+
+    const snapshot = listener.countersSnapshot();
+    // Exactly one association was established and steered.
+    try testing.expectEqual(@as(u64, 1), snapshot.sockmap_pair_attempts);
+    try testing.expectEqual(@as(u64, 1), snapshot.sockmap_pair_successes);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pair_failures);
+    // The client-side datagrams hit the accelerated fallback socket.
+    try testing.expect(snapshot.sockmap_pass_datagrams >= 1);
+    try testing.expect(snapshot.sockmap_pass_bytes >= 1);
+    // The relay performed real userspace recv/send work with batch fill.
+    try testing.expect(snapshot.recv_datagrams >= 1);
+    try testing.expect(snapshot.recv_bytes >= 1);
+    try testing.expect(snapshot.send_datagrams >= 1);
+    try testing.expect(snapshot.send_bytes >= 1);
+    try testing.expect(snapshot.sendAvgBatchFill() <= UdpRelayEngine.batch_size);
 }

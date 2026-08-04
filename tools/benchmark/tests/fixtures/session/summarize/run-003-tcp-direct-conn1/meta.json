@@ -1,0 +1,10 @@
+{
+  "run_id": "run-003-tcp-direct-conn1",
+  "protocol": "tcp",
+  "mode": "direct",
+  "point": "conn1",
+  "point_value": 1,
+  "label": "fixture",
+  "cpu_seconds": 0,
+  "test_seconds": 10
+}

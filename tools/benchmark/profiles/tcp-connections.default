@@ -1,0 +1,7 @@
+# TCP connection-count profile for the Curtsy benchmark harness.
+#
+# Each value is a number of parallel iperf3 streams (-P). The harness runs one
+# test per value, both direct (client -> iperf3 server) and via Curtsy, in the
+# configured direction(s). Values are whitespace- or comma-separated; '#' lines
+# are comments. Override on the command line with --tcp-connections.
+1 4 16 64

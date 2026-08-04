@@ -74,7 +74,9 @@ const max_relay_bytes_per_event: usize = 2 * 1_024 * 1_024;
 const write_buffer_low_watermark: usize = 1 * 1_024 * 1_024;
 const write_buffer_high_watermark: usize = 2 * 1_024 * 1_024;
 
-/// Shrink an idle outbound queue beyond this capacity.
+/// Drained outbound queues retain at most this much backing capacity; larger
+/// buffers are trimmed down (not freed) after a full drain, so repeated
+/// backpressure cycles reuse the allocation instead of re-allocating it.
 const pending_shrink_capacity: usize = 256 * 1_024;
 
 const max_accept_per_event: usize = 128;
@@ -136,6 +138,28 @@ fn isPeerSpliceErrno(errno: linux.E) bool {
     };
 }
 
+/// Reset a fully-drained outbound queue (budget_bytes == 0 implies head ==
+/// items.len), so only the length must reset. std.ArrayList's
+/// clearRetainingCapacity() memsets the whole backing buffer (up to the
+/// grown capacity) on every drain, and freeing an oversized buffer forces
+/// the next queueing cycle to allocate and zero a fresh one (std zeros
+/// every fresh allocation in allocBytesWithAlignment). Both are pure
+/// overhead here: stale bytes beyond `items.len` are never read (appends
+/// overwrite from index 0) and the budget accounts bytes, not capacity.
+///
+/// An oversized backing buffer is trimmed down to a small retained size
+/// instead of being freed: c_allocator remap shrinks in place (never
+/// allocates, never zeroes) and the retained capacity makes later growth
+/// go through memset-free realloc rather than a zeroed fresh allocation.
+/// The buffer is released at connection teardown.
+fn resetDrainedQueue(endpoint: *Endpoint, gpa: Allocator) void {
+    if (endpoint.pending.items.len >= pending_shrink_capacity) {
+        endpoint.pending.shrinkAndFree(gpa, pending_shrink_capacity);
+    }
+    endpoint.pending_head = 0;
+    endpoint.pending.items.len = 0;
+}
+
 // ---------------------------------------------------------------------------
 // TCPBufferBudget: global cap on queued userspace relay bytes
 // ---------------------------------------------------------------------------
@@ -181,6 +205,82 @@ pub const TCPBufferBudget = struct {
 
     pub fn used(self: *const TCPBufferBudget) i64 {
         return self.used_bytes.load(.monotonic);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Data-path counters
+// ---------------------------------------------------------------------------
+
+/// Listener-wide TCP data-path accounting. One counter set lives per worker
+/// (`TcpWorkerCounters`) so hot-path increments never contend on a shared
+/// cache line; `TCPListener.countersSnapshot` aggregates them. Counters are
+/// pure accounting and never influence a forwarding decision.
+pub const TcpDataPathCounters = struct {
+    /// Bytes moved through the splice(2) zero-copy fast path, including bytes
+    /// that later landed in the budgeted outbound queue on backpressure.
+    splice_bytes: u64 = 0,
+    /// Successful socket->pipe splice calls that moved data.
+    splice_calls: u64 = 0,
+    /// Splice bytes that hit destination backpressure and were copied into the
+    /// budgeted outbound queue (splice degraded to buffered mid-event).
+    splice_queued_bytes: u64 = 0,
+    /// Connections killed by peer splice errors (EPIPE/ECONNRESET/...).
+    splice_peer_failures: u64 = 0,
+    /// Times the worker splice pipe was retired after a structural failure
+    /// (EINVAL/ENOSYS/OPNOTSUPP or a pipe read failure); later connections on
+    /// this worker use the buffered relay.
+    splice_pipe_retired: u64 = 0,
+    /// Bytes moved through the pure buffered relay (no splice pipe in use).
+    buffered_bytes: u64 = 0,
+    /// Reads performed by the buffered relay.
+    buffered_calls: u64 = 0,
+    /// Connections paired into the kernel sockmap (kernel-forwarded).
+    sockmap_connections: u64 = 0,
+    /// Sockmap pairing attempts that failed and fell back to the userspace relay.
+    sockmap_pair_failures: u64 = 0,
+    /// Userspace-relayed straggler bytes read on sockmap-mode connections
+    /// (verdict-passed data userspace still had to forward).
+    sockmap_read_bytes: u64 = 0,
+    /// Connections killed when the global userspace buffer budget was exhausted.
+    budget_exhausted: u64 = 0,
+};
+
+/// Per-worker atomic counter set. Increments use .monotonic atomics on the
+/// owning worker thread (one RMW per relay event, never per byte), so a
+/// snapshot may be read from any thread without locks and without perturbing
+/// the hot path with shared-cacheline contention.
+const TcpWorkerCounters = struct {
+    splice_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    splice_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    splice_queued_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    splice_peer_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    splice_pipe_retired: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    buffered_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    buffered_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_connections: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_pair_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sockmap_read_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    budget_exhausted: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn snapshot(self: *const TcpWorkerCounters) TcpDataPathCounters {
+        return .{
+            .splice_bytes = self.splice_bytes.load(.monotonic),
+            .splice_calls = self.splice_calls.load(.monotonic),
+            .splice_queued_bytes = self.splice_queued_bytes.load(.monotonic),
+            .splice_peer_failures = self.splice_peer_failures.load(.monotonic),
+            .splice_pipe_retired = self.splice_pipe_retired.load(.monotonic),
+            .buffered_bytes = self.buffered_bytes.load(.monotonic),
+            .buffered_calls = self.buffered_calls.load(.monotonic),
+            .sockmap_connections = self.sockmap_connections.load(.monotonic),
+            .sockmap_pair_failures = self.sockmap_pair_failures.load(.monotonic),
+            .sockmap_read_bytes = self.sockmap_read_bytes.load(.monotonic),
+            .budget_exhausted = self.budget_exhausted.load(.monotonic),
+        };
+    }
+
+    fn reset(self: *TcpWorkerCounters) void {
+        self.* = .{};
     }
 };
 
@@ -582,6 +682,17 @@ pub const TCPListener = struct {
         return self.budget.used();
     }
 
+    /// Aggregate data-path counters across all workers. Each worker's atomic
+    /// counters are loaded and summed, so the snapshot is safe to read from
+    /// any thread; before start() (no workers) it is all zeros.
+    pub fn countersSnapshot(self: *const TCPListener) TcpDataPathCounters {
+        var total = bpf.counters.zero(TcpDataPathCounters);
+        for (self.workers) |*worker| {
+            total = bpf.counters.add(TcpDataPathCounters, total, worker.counters.snapshot());
+        }
+        return total;
+    }
+
     pub fn currentListeningBacklog(self: *const TCPListener) i32 {
         return self.backlog.load(.acquire);
     }
@@ -731,6 +842,7 @@ fn createProtocolListener(
         .active_count_fn = listenerActiveCount,
         .buffered_bytes_fn = listenerBufferedBytes,
         .associations_fn = listenerZeroAssociations,
+        .metrics_fn = listenerMetrics,
     };
     return wrapper;
 }
@@ -780,6 +892,29 @@ fn listenerBufferedBytes(context: *anyopaque) i64 {
 fn listenerZeroAssociations(context: *anyopaque) u64 {
     _ = context;
     return 0;
+}
+
+comptime {
+    // Every data-path counter must be surfaced in the protocol-neutral metric
+    // type; the reverse direction is enforced by the translation loop below.
+    for (std.meta.fields(TcpDataPathCounters)) |field| {
+        if (!@hasField(config.TcpMetrics, field.name)) {
+            @compileError("TcpDataPathCounters field " ++ field.name ++ " is missing from config.TcpMetrics");
+        }
+    }
+}
+
+/// Translate the listener's cumulative counters into the protocol-neutral
+/// metrics snapshot. The field sets mirror each other, so the mapping is
+/// mechanical and kept in sync by the comptime check above.
+fn listenerMetrics(context: *anyopaque) config.MetricsSnapshot {
+    const listener: *TCPListener = @ptrCast(@alignCast(context));
+    const counters = listener.countersSnapshot();
+    var tcp: config.TcpMetrics = undefined;
+    inline for (std.meta.fields(config.TcpMetrics)) |field| {
+        @field(tcp, field.name) = @field(counters, field.name);
+    }
+    return .{ .tcp = tcp, .udp = .{} };
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +971,18 @@ const Worker = struct {
     /// budgeted queue before relaySplice returns.
     splice_pipe: [2]fd_t = .{ -1, -1 },
     splice_capacity: usize = 0,
+    /// Data-path accounting incremented on this worker thread; atomics make
+    /// the aggregate snapshot readable from any thread.
+    counters: TcpWorkerCounters = .{},
     const wake_tag: u64 = 0;
+
+    /// Structural splice failure: the shared worker pipe can no longer be
+    /// trusted, so it is closed (later connections fall back to the buffered
+    /// relay) and the retirement is recorded.
+    fn retireSplicePipe(self: *Worker) void {
+        self.closeSplicePipe();
+        _ = self.counters.splice_pipe_retired.fetchAdd(1, .monotonic);
+    }
 
     fn initSplicePipe(self: *Worker) void {
         var pipe_fds: [2]fd_t = undefined;
@@ -1289,11 +1435,13 @@ const Worker = struct {
                     connection.pairing = pairing;
                     connection.mode = .sockmap;
                     connection.sockmap_next_check_ns = now + connection.idle_ns;
+                    _ = self.counters.sockmap_connections.fetchAdd(1, .monotonic);
                     listener.logger.debug("tcp connected mode=sockmap client={s} upstream={f}", .{
                         connection.clientText(), connection.upstream_addr,
                     });
                     break :blk true;
                 } else |err| {
+                    _ = self.counters.sockmap_pair_failures.fetchAdd(1, .monotonic);
                     listener.logger.debug("tcp sockmap pairing failed; using userspace relay client={s} error={s} errno={s}", .{
                         connection.clientText(), @errorName(err), @tagName(bpf.lastErrno),
                     });
@@ -1412,10 +1560,14 @@ const Worker = struct {
                     .INVAL, .NOSYS, .OPNOTSUPP => {
                         // No bytes entered the pipe. Disable splice for this
                         // worker and retry this event through buffered I/O.
-                        self.closeSplicePipe();
+                        self.retireSplicePipe();
                         return batch_bytes != 0;
                     },
                     else => {
+                        // The source socket failed mid-splice (typically a
+                        // reset from the peer); the pipe is intact and only
+                        // this connection is dropped.
+                        _ = self.counters.splice_peer_failures.fetchAdd(1, .monotonic);
                         self.killConnection(connection);
                         return true;
                     },
@@ -1428,6 +1580,8 @@ const Worker = struct {
                 return true;
             }
             batch_bytes += moved;
+            _ = self.counters.splice_calls.fetchAdd(1, .monotonic);
+            _ = self.counters.splice_bytes.fetchAdd(moved, .monotonic);
             connection.last_activity_ns = now;
             if (endpoint.is_client) {
                 connection.bytes_to_upstream += @intCast(moved);
@@ -1462,11 +1616,12 @@ const Worker = struct {
                             // the shared pipe for everyone. Neither path lets
                             // pipe residue leak into the next dispatch.
                             if (isPeerSpliceErrno(send_errno)) {
+                                _ = self.counters.splice_peer_failures.fetchAdd(1, .monotonic);
                                 self.discardPipeBytes(remaining);
                                 self.killConnection(connection);
                                 return true;
                             }
-                            self.closeSplicePipe();
+                            self.retireSplicePipe();
                             self.killConnection(connection);
                             return true;
                         },
@@ -1482,6 +1637,7 @@ const Worker = struct {
                 if (!budget.tryAcquire(remaining)) {
                     self.discardPipeBytes(remaining);
                     self.listener.logger.warning("tcp buffer budget exhausted limit={d}", .{budget.limit()});
+                    _ = self.counters.budget_exhausted.fetchAdd(1, .monotonic);
                     self.killConnection(connection);
                     return true;
                 }
@@ -1500,6 +1656,7 @@ const Worker = struct {
                 }
                 peer.pending.items.len += remaining;
                 peer.budget_bytes += remaining;
+                _ = self.counters.splice_queued_bytes.fetchAdd(remaining, .monotonic);
                 self.updateMask(peer);
                 break;
             }
@@ -1524,14 +1681,14 @@ const Worker = struct {
                 switch (errno) {
                     .INTR => continue,
                     else => {
-                        self.closeSplicePipe();
+                        self.retireSplicePipe();
                         return false;
                     },
                 }
             }
             const count: usize = @intCast(rc);
             if (count == 0) {
-                self.closeSplicePipe();
+                self.retireSplicePipe();
                 return false;
             }
             read_total += count;
@@ -1588,6 +1745,8 @@ const Worker = struct {
                 return;
             }
             batch_bytes += count;
+            _ = self.counters.buffered_calls.fetchAdd(1, .monotonic);
+            _ = self.counters.buffered_bytes.fetchAdd(count, .monotonic);
             connection.last_activity_ns = now;
             if (endpoint.is_client) {
                 connection.bytes_to_upstream += @intCast(count);
@@ -1636,6 +1795,7 @@ const Worker = struct {
                 self.killConnection(connection);
                 return;
             }
+            _ = self.counters.sockmap_read_bytes.fetchAdd(count, .monotonic);
             connection.last_activity_ns = now;
             const peer = connection.peerOf(endpoint);
             _ = self.deliver(peer, self.read_buffer[0..count]);
@@ -1661,6 +1821,7 @@ const Worker = struct {
         const budget = &connection.worker.listener.budget;
         if (!budget.tryAcquire(rest.len)) {
             self.listener.logger.warning("tcp buffer budget exhausted limit={d}", .{budget.limit()});
+            _ = self.counters.budget_exhausted.fetchAdd(1, .monotonic);
             self.killConnection(connection);
             return false;
         }
@@ -1730,12 +1891,7 @@ const Worker = struct {
         }
 
         if (endpoint.budget_bytes == 0) {
-            endpoint.pending_head = 0;
-            endpoint.pending.clearRetainingCapacity();
-            if (endpoint.pending.capacity > pending_shrink_capacity) {
-                endpoint.pending.deinit(allocator);
-                endpoint.pending = .empty;
-            }
+            resetDrainedQueue(endpoint, allocator);
             if (endpoint.fin_when_drained) {
                 self.shutdownWrite(endpoint);
             }
@@ -2373,6 +2529,48 @@ test "tcp buffer budget caps aggregate queued bytes" {
     try testing.expect(budget.tryAcquire(5));
     budget.release(5);
     try testing.expectEqual(@as(i64, 0), budget.used());
+}
+
+test "tcp drained outbound queue resets length and trims backing capacity" {
+    // A standalone endpoint with a real backing buffer; the drain-reset only
+    // touches the queue, so no live worker/socket is required.
+    var conn: Connection = undefined;
+    conn.client = .{ .connection = &conn, .fd = -1, .is_client = true };
+    conn.upstream = .{ .connection = &conn, .fd = -1, .is_client = false };
+    const endpoint = &conn.upstream;
+
+    // Backpressure queued more than the retained-capacity threshold.
+    const payload: usize = pending_shrink_capacity + 16 * 1_024;
+    const data = try testing.allocator.alloc(u8, payload);
+    defer testing.allocator.free(data);
+    @memset(data, 0x55);
+
+    try endpoint.pending.appendSlice(testing.allocator, data);
+    endpoint.pending_head = 0;
+    endpoint.budget_bytes = payload;
+
+    // A full drain resets length and head without wiping or freeing the
+    // backing buffer, and trims the grown capacity back to the retained cap.
+    // budget_bytes is already 0 when the drain completes (flushPending calls
+    // the reset after the send loop zeroes it); the reset must leave it alone.
+    endpoint.budget_bytes = 0;
+    resetDrainedQueue(endpoint, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), endpoint.pending.items.len);
+    try testing.expectEqual(@as(usize, 0), endpoint.pending_head);
+    try testing.expectEqual(@as(usize, 0), endpoint.budget_bytes);
+    try testing.expect(endpoint.pending.capacity <= pending_shrink_capacity);
+
+    // The retained buffer stays reusable for a later backpressure cycle:
+    // appends land at index 0 and a second full drain behaves identically.
+    try endpoint.pending.appendSlice(testing.allocator, data);
+    endpoint.pending_head = 0;
+    endpoint.budget_bytes = 0;
+    resetDrainedQueue(endpoint, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), endpoint.pending.items.len);
+    try testing.expectEqual(@as(usize, 0), endpoint.pending_head);
+    try testing.expect(endpoint.pending.capacity <= pending_shrink_capacity);
+
+    endpoint.pending.deinit(testing.allocator);
 }
 
 test "tcp splice helper moves bytes between stream sockets" {
@@ -3091,4 +3289,195 @@ test "tcp selector fails over from a dead upstream and evicts it" {
 
     // After threshold failures the dead upstream is parked and picks return live.
     try testing.expect(pool.pick(null, pool_module.monotonicNowNs()).eql(live));
+}
+
+// ---------------------------------------------------------------------------
+// Data-path counter tests
+// ---------------------------------------------------------------------------
+
+test "tcp worker counters snapshot and reset" {
+    var counters: TcpWorkerCounters = .{};
+    try testing.expectEqual(@as(u64, 0), counters.snapshot().splice_bytes);
+
+    _ = counters.splice_bytes.fetchAdd(42, .monotonic);
+    _ = counters.splice_calls.fetchAdd(7, .monotonic);
+    _ = counters.buffered_calls.fetchAdd(3, .monotonic);
+    _ = counters.sockmap_pair_failures.fetchAdd(1, .monotonic);
+    const snap = counters.snapshot();
+    try testing.expectEqual(@as(u64, 42), snap.splice_bytes);
+    try testing.expectEqual(@as(u64, 7), snap.splice_calls);
+    try testing.expectEqual(@as(u64, 3), snap.buffered_calls);
+    try testing.expectEqual(@as(u64, 1), snap.sockmap_pair_failures);
+
+    counters.reset();
+    const after = counters.snapshot();
+    try testing.expectEqual(@as(u64, 0), after.splice_bytes);
+    try testing.expectEqual(@as(u64, 0), after.splice_calls);
+    try testing.expectEqual(@as(u64, 0), after.buffered_calls);
+    try testing.expectEqual(@as(u64, 0), after.sockmap_pair_failures);
+}
+
+test "tcp counters snapshot is all zeros before start" {
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, 9);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 2,
+        .enable_sockmap_acceleration = false,
+    });
+    defer listener.deinit();
+
+    const snapshot = listener.countersSnapshot();
+    try testing.expectEqual(@as(u64, 0), snapshot.splice_bytes);
+    try testing.expectEqual(@as(u64, 0), snapshot.splice_calls);
+    try testing.expectEqual(@as(u64, 0), snapshot.splice_queued_bytes);
+    try testing.expectEqual(@as(u64, 0), snapshot.splice_peer_failures);
+    try testing.expectEqual(@as(u64, 0), snapshot.splice_pipe_retired);
+    try testing.expectEqual(@as(u64, 0), snapshot.buffered_bytes);
+    try testing.expectEqual(@as(u64, 0), snapshot.buffered_calls);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_connections);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pair_failures);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_read_bytes);
+    try testing.expectEqual(@as(u64, 0), snapshot.budget_exhausted);
+}
+
+test "tcp vtable metrics translation maps worker counters into the neutral snapshot" {
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, 9);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 1,
+        .enable_sockmap_acceleration = false,
+    });
+    defer listener.deinit();
+    try listener.start();
+
+    // An untouched listener translates to an all-zero snapshot.
+    var metrics = listenerMetrics(&listener);
+    try testing.expectEqual(@as(u64, 0), metrics.tcp.splice_bytes);
+    try testing.expectEqual(@as(u64, 0), metrics.tcp.splice_calls);
+    try testing.expect(std.meta.eql(metrics.udp, config.UdpMetrics{}));
+
+    // Drive a few worker counters and confirm they land in the right fields.
+    _ = listener.workers[0].counters.splice_bytes.fetchAdd(1_024, .monotonic);
+    _ = listener.workers[0].counters.splice_calls.fetchAdd(4, .monotonic);
+    _ = listener.workers[0].counters.sockmap_pair_failures.fetchAdd(2, .monotonic);
+    _ = listener.workers[0].counters.budget_exhausted.fetchAdd(1, .monotonic);
+
+    metrics = listenerMetrics(&listener);
+    try testing.expectEqual(@as(u64, 1_024), metrics.tcp.splice_bytes);
+    try testing.expectEqual(@as(u64, 4), metrics.tcp.splice_calls);
+    try testing.expectEqual(@as(u64, 2), metrics.tcp.sockmap_pair_failures);
+    try testing.expectEqual(@as(u64, 1), metrics.tcp.budget_exhausted);
+    // The UDP half of a TCP listener stays untouched.
+    try testing.expect(std.meta.eql(metrics.udp, config.UdpMetrics{}));
+}
+
+test "tcp counters account every relayed byte on exactly one path" {
+    var echo = try EchoServer.start();
+    defer echo.stop();
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 1,
+        .enable_sockmap_acceleration = false,
+    });
+    defer listener.deinit();
+    try listener.start();
+    defer {
+        listener.stopAccepting();
+        listener.forceCloseConnections();
+    }
+
+    const client = try connectClient(listener.localAddresses()[0].port);
+    defer closeFd(client);
+    var send_timeout = linux.timeval{ .sec = 10, .usec = 0 };
+    _ = linux.setsockopt(client, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&send_timeout), @sizeOf(linux.timeval));
+
+    const total: usize = 1 * 1_024 * 1_024; // 1 MiB each way through the relay
+    const send_buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(send_buf);
+    @memset(send_buf, 0x4c);
+    const recv_buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(recv_buf);
+
+    // Push the payload from a separate thread so the blocking client socket
+    // cannot deadlock against its own receive buffer on the full-duplex echo.
+    const Writer = struct {
+        fn run(fd: fd_t, bytes: []const u8) !void {
+            try writeAll(fd, bytes);
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{ client, send_buf });
+    errdefer writer.join();
+
+    try readFully(client, recv_buf);
+    try testing.expect(std.mem.allEqual(u8, recv_buf, 0x4c));
+    writer.join();
+
+    const snapshot = listener.countersSnapshot();
+    // The splice fast path was exercised on this platform.
+    try testing.expect(snapshot.splice_calls > 0);
+    try testing.expect(snapshot.splice_bytes > 0);
+    // Every relayed byte was moved by exactly one of the two userspace paths
+    // (splice into the worker pipe, or a buffered read into read_buffer);
+    // splice_queued_bytes is a subset of splice_bytes, and sockmap is off.
+    try testing.expectEqual(@as(u64, @as(u64, total) * 2), snapshot.splice_bytes + snapshot.buffered_bytes);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_connections);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pair_failures);
+    try testing.expectEqual(@as(u64, 0), snapshot.sockmap_read_bytes);
+    // A clean transfer trips no failure paths.
+    try testing.expectEqual(@as(u64, 0), snapshot.splice_peer_failures);
+    try testing.expectEqual(@as(u64, 0), snapshot.splice_pipe_retired);
+    try testing.expectEqual(@as(u64, 0), snapshot.budget_exhausted);
+}
+
+test "tcp sockmap counters track steering attempts (gated: CURTSY_ENABLE_EBPF_TESTS)" {
+    // Privileged integration test: with the real sockmap runtime loaded, a
+    // loopback connection is paired into the kernel, so either the success or
+    // the failure counter must fire. Run as root (or with CAP_BPF/CAP_NET_ADMIN):
+    // `sudo zig build test-ebpf`. Unprivileged runs of the default suite skip.
+    if (std.c.getenv("CURTSY_ENABLE_EBPF_TESTS") == null) return;
+
+    var echo = try EchoServer.start();
+    defer echo.stop();
+
+    var logger = log.LogStore.init("critical");
+    const resolved = try makeTestResolved(testing.allocator, echo.port);
+    defer testing.allocator.free(resolved.listen_addresses);
+
+    // The explicit override forces acceleration even for a loopback upstream,
+    // so the accelerator loads and every new connection attempts a pairing.
+    var listener = try TCPListener.init(resolved, &logger, .{
+        .worker_threads = 1,
+        .enable_sockmap_acceleration = true,
+    });
+    defer listener.deinit();
+    try listener.start();
+    defer {
+        listener.stopAccepting();
+        listener.forceCloseConnections();
+    }
+
+    const client = try connectClient(listener.localAddresses()[0].port);
+    defer closeFd(client);
+    try writeAll(client, "ping");
+    var received: [4]u8 = undefined;
+    try readFully(client, &received);
+    try testing.expectEqualStrings("ping", &received);
+
+    const steered = struct {
+        var listener_ptr: *TCPListener = undefined;
+        fn check() bool {
+            const snapshot = listener_ptr.countersSnapshot();
+            return snapshot.sockmap_connections + snapshot.sockmap_pair_failures >= 1;
+        }
+    };
+    steered.listener_ptr = &listener;
+    try testing.expect(waitForCondition(steered.check, 5_000));
 }

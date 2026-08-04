@@ -1,0 +1,10 @@
+{
+  "session": "fail-loss",
+  "generated_at": "2026-08-04T05:00:00Z",
+  "runs": [
+    {"run_id":"run-001-tcp-direct-conn1","protocol":"tcp","mode":"direct","point":"conn1","point_value":1,"direction":"forward","label":"x","bits_per_second":25100000000,"retransmits":90,"mean_rtt_us":50,"jitter_ms":0,"lost_percent":0,"packets":0},
+    {"run_id":"run-002-tcp-curtsy-conn1","protocol":"tcp","mode":"curtsy","point":"conn1","point_value":1,"direction":"forward","label":"x","bits_per_second":24400000000,"retransmits":130,"mean_rtt_us":61,"jitter_ms":0,"lost_percent":0,"packets":0},
+    {"run_id":"run-003-udp-direct-pkt1400","protocol":"udp","mode":"direct","point":"pkt1400","point_value":1400,"direction":"forward","label":"x","bits_per_second":24100000000,"retransmits":0,"mean_rtt_us":0,"jitter_ms":0.1,"lost_percent":0.3,"packets":1000000},
+    {"run_id":"run-004-udp-curtsy-pkt1400","protocol":"udp","mode":"curtsy","point":"pkt1400","point_value":1400,"direction":"forward","label":"x","bits_per_second":23400000000,"retransmits":0,"mean_rtt_us":0,"jitter_ms":0.2,"lost_percent":6.5,"packets":1000000}
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "run_id": "run-001-tcp-curtsy-conn1",
+  "protocol": "tcp",
+  "mode": "curtsy",
+  "point": "conn1",
+  "point_value": 1,
+  "label": "fixture",
+  "cpu_seconds": 2.0,
+  "test_seconds": 10
+}

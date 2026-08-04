@@ -1,0 +1,6 @@
+           CPU0       CPU1       CPU2       CPU3       CPU4       CPU5       CPU6       CPU7
+  0:         10          0          0          0          0          0          0          0   IO-APIC   2-edge      timer
+  8:          0          0          0          0          0          0          0          1   IO-APIC   8-edge      rtc0
+128:     1000000          0          0          0          0          0          0          0   PCI-MSI 524289-edge      enp1s0
+129:     1000000          0          0          0          0          0          0          0   PCI-MSI 524290-edge      enp1s0-rx-0
+130:     1000000          0          0          0          0          0          0          0   PCI-MSI 524291-edge      enp1s0-rx-1

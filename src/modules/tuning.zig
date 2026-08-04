@@ -2,14 +2,16 @@
 //!
 //! A daemon thread ticks every `tuning_interval_seconds`. Each tick pulls a
 //! snapshot (current resolved configuration, TCP buffered bytes used, UDP
-//! association count) through a caller-supplied function pointer, reads
-//! process-level tcp/udp sendmsg/recvmsg counters through the eBPF observer
-//! (a silent no-op when eBPF is unavailable), watches /proc/net/netstat
-//! listen-queue overflow counters, and recomputes only the limits still
-//! marked auto in `limits.auto_tuning`. Changed limits are delivered through
-//! a caller-supplied apply function pointer. The daemon never imports the
-//! TCP or UDP forwarders — the service layer wires the callbacks, exactly
-//! like service-layer callbacks.
+//! association count, aggregate data-path metrics) through a caller-supplied
+//! function pointer, logs the per-interval metric deltas at debug level
+//! (observability only — they never influence a decision), reads process-level
+//! tcp/udp sendmsg/recvmsg counters through the eBPF observer (a silent no-op
+//! when eBPF is unavailable), watches /proc/net/netstat listen-queue overflow
+//! counters, and recomputes only the limits still marked auto in
+//! `limits.auto_tuning`. Changed limits are delivered through a
+//! caller-supplied apply function pointer. The daemon never imports the TCP
+//! or UDP forwarders — the service layer wires the callbacks, exactly like
+//! service-layer callbacks.
 //!
 //! Thresholds and hysteresis:
 //!   - backlog doubles (capped at Int32.max) on any ListenOverflows/ListenDrops
@@ -36,6 +38,9 @@ pub const TuningSnapshot = struct {
     configuration: config.ResolvedConfiguration,
     tcp_buffered_bytes: i64,
     udp_associations: i64,
+    /// Aggregate data-path counters across all live rules. Observability only:
+    /// logged at debug level by the daemon; never feeds a tuning decision.
+    metrics: config.MetricsSnapshot = .{},
 };
 
 /// Called on the daemon thread once per tick. Returning null skips the tick.
@@ -242,6 +247,10 @@ pub const TuningDaemon = struct {
     observer: ?bpf.BpfObserver = null,
     last_bpf_counters: ?ObserverCounters = null,
     last_netstat_counters: ?NetstatCounters = null,
+    /// Data-path metrics at the previous tick; the next tick logs the
+    /// saturating delta. Seeded at start so the first tick is a true
+    /// interval. Only the daemon thread touches it.
+    last_metrics: ?config.MetricsSnapshot = null,
     /// CPU count and total memory never change at runtime; read once at
     /// start instead of re-reading /proc/meminfo on every tick.
     hardware: ?autotune.AutoTuneSnapshot = null,
@@ -313,6 +322,7 @@ pub const TuningDaemon = struct {
 
         self.last_bpf_counters = if (self.observer) |*observer| observer.read() catch null else null;
         if (start_snapshot) |snapshot| {
+            self.last_metrics = snapshot.metrics;
             self.last_netstat_counters = if (snapshot.configuration.configuration.limits.auto_tuning.tcp_listen_backlog)
                 NetstatCounters.read()
             else
@@ -361,6 +371,9 @@ pub const TuningDaemon = struct {
 
     fn tick(self: *TuningDaemon) void {
         const snapshot = self.snapshot_provider(self.snapshot_context) orelse return;
+        // Metrics are observability, not tuning: log them before the
+        // auto-limit gate so they emit even when every limit is fixed.
+        self.logMetrics(snapshot.metrics);
         const current = snapshot.configuration.configuration.limits;
         // Nothing to decide when every limit is fixed; skip the /proc reads
         // and observer queries entirely.
@@ -424,7 +437,50 @@ pub const TuningDaemon = struct {
         if (self.last_netstat_counters) |previous| return counters.delta(previous);
         return .zero;
     }
+
+    /// Record the current aggregate metrics and, at debug level, emit the
+    /// per-interval delta since the previous tick. The baseline is always
+    /// advanced so a later debug enable reports only the interval it covers;
+    /// idle intervals (zero delta) emit nothing. Metrics never influence a
+    /// tuning decision.
+    fn logMetrics(self: *TuningDaemon, current: config.MetricsSnapshot) void {
+        const previous = self.last_metrics;
+        self.last_metrics = current;
+        if (previous) |base| {
+            const delta = config.MetricsSnapshot.delta(current, base);
+            if (!delta.isZero()) {
+                self.logger.logLazy(.debug, delta, renderMetrics);
+            }
+        }
+    }
 };
+
+/// Renders a metrics delta as a `metrics `-prefixed, `key=value` message
+/// (`tcp_`/`udp_`-prefixed keys), skipping fields that did not move. The field
+/// set is derived from the metric types, so the format cannot drift from the
+/// counters it reports.
+fn renderMetrics(metrics: config.MetricsSnapshot, buf: []u8) []const u8 {
+    var rest = buf;
+    const head = std.fmt.bufPrint(rest, "metrics ", .{}) catch return buf[0..0];
+    rest = rest[head.len..];
+    inline for (std.meta.fields(config.TcpMetrics)) |field| {
+        const value = @field(metrics.tcp, field.name);
+        if (value != 0) {
+            const text = std.fmt.bufPrint(rest, "tcp_{s}={d} ", .{ field.name, value }) catch break;
+            rest = rest[text.len..];
+        }
+    }
+    inline for (std.meta.fields(config.UdpMetrics)) |field| {
+        const value = @field(metrics.udp, field.name);
+        if (value != 0) {
+            const text = std.fmt.bufPrint(rest, "udp_{s}={d} ", .{ field.name, value }) catch break;
+            rest = rest[text.len..];
+        }
+    }
+    var text = buf[0 .. buf.len - rest.len];
+    if (text.len > 0 and text[text.len - 1] == ' ') text = text[0 .. text.len - 1];
+    return text;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -617,7 +673,12 @@ const Harness = struct {
 var harness_listen_addresses = [_]config.SocketAddr{config.SocketAddr.initV4(.{ 127, 0, 0, 1 }, 8_080)};
 var harness_protocols = [_]config.ForwardProtocol{ .tcp, .udp };
 
-fn harnessSnapshot(limits: config.LimitConfiguration, tcp_buffered: i64, udp_associations: i64) TuningSnapshot {
+fn harnessSnapshot(
+    limits: config.LimitConfiguration,
+    tcp_buffered: i64,
+    udp_associations: i64,
+    metrics: config.MetricsSnapshot,
+) TuningSnapshot {
     return .{
         .configuration = .{
             .configuration = .{
@@ -632,6 +693,7 @@ fn harnessSnapshot(limits: config.LimitConfiguration, tcp_buffered: i64, udp_ass
         },
         .tcp_buffered_bytes = tcp_buffered,
         .udp_associations = udp_associations,
+        .metrics = metrics,
     };
 }
 
@@ -667,7 +729,7 @@ test "tick drives apply for auto fields and stop joins promptly" {
     // one-second window is zero, so only the tcp buffer field can move.
     limits.max_udp_associations = autotune.limits(.system()).max_udp_associations;
 
-    var harness = Harness{ .snapshot = harnessSnapshot(limits, 900, 0) };
+    var harness = Harness{ .snapshot = harnessSnapshot(limits, 900, 0, .{}) };
     var daemon = TuningDaemon.init(1, &logger, &harness, Harness.provider, &harness, Harness.apply);
     daemon.start();
 
@@ -696,7 +758,7 @@ test "nothing applied when no field is auto or snapshot is null" {
         .max_udp_pending_datagrams = false,
         .max_udp_pending_bytes = false,
     };
-    var harness = Harness{ .snapshot = harnessSnapshot(fixed, 999, 999) };
+    var harness = Harness{ .snapshot = harnessSnapshot(fixed, 999, 999, .{}) };
     var daemon = TuningDaemon.init(1, &logger, &harness, Harness.provider, &harness, Harness.apply);
     daemon.start();
     sleepMs(1_500);
@@ -713,7 +775,7 @@ test "nothing applied when no field is auto or snapshot is null" {
 
 test "stop interrupts a long interval immediately" {
     var logger = log.LogStore.init("critical");
-    var harness = Harness{ .snapshot = harnessSnapshot(testLimits(), 0, 0) };
+    var harness = Harness{ .snapshot = harnessSnapshot(testLimits(), 0, 0, .{}) };
     var daemon = TuningDaemon.init(3_600, &logger, &harness, Harness.provider, &harness, Harness.apply);
     daemon.start();
     sleepMs(50);
@@ -721,4 +783,133 @@ test "stop interrupts a long interval immediately" {
     daemon.stop();
     try testing.expect(monotonicMs() - stop_start < 1_000);
     try testing.expectEqual(0, harness.apply_count.load(.acquire));
+}
+
+// -- Data-path metrics observability --
+
+/// Test-local emission sink that captures messages instead of stderr.
+const Sink = struct {
+    captured: std.ArrayList(u8) = .empty,
+
+    fn run(ctx: *anyopaque, message: []const u8) void {
+        const self: *Sink = @ptrCast(@alignCast(ctx));
+        self.captured.appendSlice(std.testing.allocator, message) catch {};
+    }
+
+    fn deinit(self: *Sink) void {
+        self.captured.deinit(std.testing.allocator);
+    }
+};
+
+fn stubProvider(context: ?*anyopaque) ?TuningSnapshot {
+    _ = context;
+    return null;
+}
+
+fn stubApply(context: ?*anyopaque, limits: config.LimitConfiguration) void {
+    _ = context;
+    _ = limits;
+}
+
+test "renderMetrics formats moved fields as tcp_/udp_ key=value pairs" {
+    const delta = config.MetricsSnapshot{
+        .tcp = .{ .splice_bytes = 1_024, .splice_calls = 8, .splice_queued_bytes = 512 },
+        .udp = .{ .recv_calls = 3, .recv_datagrams = 192 },
+    };
+    var buf: [1_024]u8 = undefined;
+    const text = renderMetrics(delta, &buf);
+    try testing.expect(std.mem.indexOf(u8, text, "metrics tcp_splice_bytes=1024") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "tcp_splice_calls=8") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "tcp_splice_queued_bytes=512") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "udp_recv_calls=3") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "udp_recv_datagrams=192") != null);
+    // Unmoved fields are skipped and there is no trailing whitespace.
+    try testing.expect(std.mem.indexOf(u8, text, "udp_send_calls=0") == null);
+    try testing.expect(text.len > 0 and text[text.len - 1] != ' ');
+
+    // An all-zero delta renders only the label (never emitted by logMetrics,
+    // which skips zero deltas entirely).
+    try testing.expectEqualStrings("metrics", renderMetrics(config.MetricsSnapshot.zero, &buf));
+}
+
+test "logMetrics diffs successive snapshots and skips idle windows" {
+    var logger = log.LogStore.init("debug");
+    var sink = Sink{};
+    defer sink.deinit();
+    logger.emit_override = .{ .context = &sink, .fn_ptr = Sink.run };
+
+    var daemon = TuningDaemon.init(1, &logger, null, stubProvider, null, stubApply);
+
+    // The first snapshot only seeds the baseline; nothing is emitted.
+    daemon.logMetrics(.{ .tcp = .{ .splice_bytes = 100 }, .udp = .{ .recv_calls = 5 } });
+    try testing.expectEqual(@as(usize, 0), sink.captured.items.len);
+
+    // Growth since the baseline is emitted as the per-interval delta, with
+    // unchanged fields skipped.
+    daemon.logMetrics(.{ .tcp = .{ .splice_bytes = 140 }, .udp = .{ .recv_calls = 5 } });
+    const after_growth = sink.captured.items.len;
+    const first = sink.captured.items;
+    try testing.expect(std.mem.indexOf(u8, first, "tcp_splice_bytes=40") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "udp_recv_calls=0") == null);
+
+    // An idle window emits nothing but still advances the baseline.
+    daemon.logMetrics(.{ .tcp = .{ .splice_bytes = 140 }, .udp = .{ .recv_calls = 5 } });
+    try testing.expectEqual(after_growth, sink.captured.items.len);
+
+    // A listener replacement (counters drop to zero) saturates to an empty
+    // line rather than underflowing or reporting negative deltas.
+    daemon.logMetrics(.{ .tcp = .{ .splice_bytes = 0 }, .udp = .{ .recv_calls = 0 } });
+    try testing.expectEqual(after_growth, sink.captured.items.len);
+}
+
+/// Harness whose metrics grow by one splice byte on every provider call, so a
+/// real daemon tick observes a deterministic per-interval delta. Limits are
+/// all fixed, so nothing is ever auto-applied.
+const GrowingHarness = struct {
+    base: TuningSnapshot,
+    calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn provider(context: ?*anyopaque) ?TuningSnapshot {
+        const self: *GrowingHarness = @ptrCast(@alignCast(context));
+        const n = self.calls.fetchAdd(1, .monotonic);
+        var snapshot = self.base;
+        snapshot.metrics.tcp.splice_bytes += n;
+        return snapshot;
+    }
+
+    fn apply(context: ?*anyopaque, limits: config.LimitConfiguration) void {
+        _ = context;
+        _ = limits;
+    }
+};
+
+test "tick emits metric deltas at debug even when every limit is fixed" {
+    var logger = log.LogStore.init("debug");
+    var sink = Sink{};
+    defer sink.deinit();
+    logger.emit_override = .{ .context = &sink, .fn_ptr = Sink.run };
+
+    var fixed = testLimits();
+    fixed.auto_tuning = .{
+        .tcp_listen_backlog = false,
+        .max_tcp_buffered_bytes = false,
+        .max_udp_associations = false,
+        .max_udp_pending_datagrams = false,
+        .max_udp_pending_bytes = false,
+    };
+    const base_metrics = config.MetricsSnapshot{
+        .tcp = .{ .splice_bytes = 1_000 },
+        .udp = .{ .recv_calls = 50 },
+    };
+    var harness = GrowingHarness{ .base = harnessSnapshot(fixed, 999, 999, base_metrics) };
+    var daemon = TuningDaemon.init(1, &logger, &harness, GrowingHarness.provider, &harness, GrowingHarness.apply);
+    daemon.start();
+    sleepMs(2_000);
+    daemon.stop();
+
+    // No limit was auto, so nothing was applied; the start() baseline makes the
+    // first tick's delta a single splice byte, and the unchanged udp fields are
+    // not rendered.
+    try testing.expect(std.mem.indexOf(u8, sink.captured.items, "tcp_splice_bytes=1") != null);
+    try testing.expect(std.mem.indexOf(u8, sink.captured.items, "udp_recv_calls=") == null);
 }

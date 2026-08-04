@@ -1,0 +1,6 @@
+{
+  "end": {
+    "sum_sent": {"bits_per_second": 25000000000, "retransmits": 100},
+    "streams": [{"sender": {"mean_rtt": 50}}]
+  }
+}

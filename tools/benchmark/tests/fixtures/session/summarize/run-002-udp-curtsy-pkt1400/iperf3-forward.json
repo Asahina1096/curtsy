@@ -1,0 +1,5 @@
+{
+  "end": {
+    "sum": {"bits_per_second": 24000000000, "jitter_ms": 0.1, "lost_percent": 0.2, "packets": 1000000}
+  }
+}

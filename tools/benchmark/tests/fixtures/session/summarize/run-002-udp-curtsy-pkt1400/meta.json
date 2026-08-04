@@ -1,0 +1,10 @@
+{
+  "run_id": "run-002-udp-curtsy-pkt1400",
+  "protocol": "udp",
+  "mode": "curtsy",
+  "point": "pkt1400",
+  "point_value": 1400,
+  "label": "fixture",
+  "cpu_seconds": 2.4,
+  "test_seconds": 10
+}

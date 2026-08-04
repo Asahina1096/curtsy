@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Fake ethtool for fixture-based tests of recommend-system.sh.
+# Read-only queries (plain, -i, -l, -g, -k) succeed; mutating verbs fail so a
+# test can prove the tool never invokes them.
+set -eu
+case "${1:-}" in
+    -K | -G | -L | -C | -A | -S)
+        echo "MUTATION: ethtool $*" >&2
+        exit 127
+        ;;
+    -i)
+        cat <<'EOF'
+driver: mlx5_core
+version: 6.8.0
+firmware-version: 16.35.2000
+expansion-rom-version:
+bus-info: 0000:03:00.0
+EOF
+        ;;
+    -l)
+        cat <<'EOF'
+Channel parameters for enp1s0:
+Pre-set maximums:
+RX:		0
+TX:		0
+Other:		0
+Combined:	32
+Current hardware settings:
+RX:		8
+TX:		8
+Other:		0
+Combined:	8
+EOF
+        ;;
+    -g)
+        cat <<'EOF'
+Ring parameters for enp1s0:
+Pre-set maximums:
+RX:		8192
+TX:		8192
+RX Mini:	0
+RX Jumbo:	0
+Current hardware settings:
+RX:		2048
+TX:		2048
+RX Mini:	0
+RX Jumbo:	0
+EOF
+        ;;
+    -k)
+        cat <<'EOF'
+Features for enp1s0:
+rx-checksumming: on
+tx-checksumming: on
+tx-checksum-ipv4: on
+tcp-segmentation-offload: on
+generic-receive-offload: on
+generic-segmentation-offload: on
+EOF
+        ;;
+    *)
+        echo "Speed: 25000Mb/s"
+        ;;
+esac

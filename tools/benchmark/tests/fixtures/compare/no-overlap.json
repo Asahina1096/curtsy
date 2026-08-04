@@ -1,0 +1,7 @@
+{
+  "session": "no-overlap",
+  "generated_at": "2026-08-04T09:00:00Z",
+  "runs": [
+    {"run_id":"run-001-udp-direct-pkt64","protocol":"udp","mode":"direct","point":"pkt64","point_value":64,"direction":"forward","label":"x","bits_per_second":1000000000,"retransmits":0,"mean_rtt_us":0,"jitter_ms":0.1,"lost_percent":5,"packets":100000}
+  ]
+}

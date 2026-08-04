@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fake ip for fixture-based tests of recommend-system.sh.
+# `ip link show` style listing succeeds; `ip link set` (mutation) fails so a
+# test can prove the tool never invokes it.
+set -eu
+case "${1:-}" in
+    link)
+        case "${2:-}" in
+            set)
+                echo "MUTATION: ip $*" >&2
+                exit 127
+                ;;
+            *)
+                echo "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536"
+                echo "2: enp1s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500"
+                ;;
+        esac
+        ;;
+    -o)
+        echo "1: lo    inet 127.0.0.1/8"
+        echo "2: enp1s0 inet 192.0.2.10/24"
+        ;;
+    *)
+        echo "ip: unexpected invocation: $*" >&2
+        exit 1
+        ;;
+esac

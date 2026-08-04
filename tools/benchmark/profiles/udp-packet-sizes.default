@@ -1,0 +1,7 @@
+# UDP packet-size profile for the Curtsy benchmark harness.
+#
+# Each value is the UDP payload length (-l) in bytes for a single-stream UDP
+# test. Jumbo-fragment sizes (>= 8500) are dropped automatically when the
+# requested --mtu is smaller. Override on the command line with
+# --udp-packet-sizes.
+64 256 512 1400 9000
