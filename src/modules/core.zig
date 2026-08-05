@@ -83,14 +83,14 @@ pub const ConfigSource = union(enum) {
 /// reloads (edit and reload are human-timescale); sub-millisecond automation
 /// that both modifies the file and reloads in the same tick must use a
 /// different content signal. The tests stay on the safe side of this window.
-const ConfigFingerprint = struct {
+pub const ConfigFingerprint = struct {
     mtime_ns: u64,
     size: u64,
 
     /// Stat `path` and capture its fingerprint. Returns null when the file
     /// cannot be stat'd (missing, unreadable, overlong path): a reload then
     /// proceeds and surfaces the underlying read error as usual.
-    fn capture(path: []const u8) ?ConfigFingerprint {
+    pub fn capture(path: []const u8) ?ConfigFingerprint {
         if (path.len >= std.fs.max_path_bytes) return null;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         @memcpy(path_buf[0..path.len], path);
@@ -100,9 +100,19 @@ const ConfigFingerprint = struct {
         const rc = linux.statx(linux.AT.FDCWD, path_z.ptr, 0, linux.STATX{ .MTIME = true, .SIZE = true }, &st);
         if (linux.errno(rc) != .SUCCESS) return null;
         return .{
-            .mtime_ns = @as(u64, @intCast(st.mtime.sec)) * std.time.ns_per_s + st.mtime.nsec,
+            .mtime_ns = mtimeNs(st.mtime),
             .size = st.size,
         };
+    }
+
+    /// statx_timestamp.sec is signed: pre-1970 mtimes are negative and far
+    /// future ones overflow u64 nanoseconds. Clamp both instead of panicking
+    /// on the cast — change detection only needs a stable value for an
+    /// untouched file.
+    fn mtimeNs(ts: linux.statx_timestamp) u64 {
+        if (ts.sec < 0) return 0;
+        const sec_ns = std.math.mul(u64, @intCast(ts.sec), std.time.ns_per_s) catch std.math.maxInt(u64);
+        return sec_ns +| ts.nsec;
     }
 
     /// Whether the live file at `path` still matches this fingerprint. A file
@@ -687,11 +697,30 @@ const RuleRuntime = struct {
     /// Thread counts the listeners were started with (change needs restart).
     started_worker_threads: i64,
     started_udp_io_threads: i64,
+    /// Generation of the cycle this runtime's slices borrow, tagged when the
+    /// rule is retired. Live rules are re-pushed to the newest cycle on every
+    /// reload commit, so only retired runtimes pin an old cycle.
+    borrowed_generation: u64 = 0,
 };
 
 const ProtocolListenerSlot = struct {
     protocol: ForwardProtocol,
     listener: *Listener,
+};
+
+/// A superseded configuration cycle kept alive for objects retired while it
+/// was live (draining listeners borrow its arena). Freed by
+/// pruneRetainedCycles once no retired object references its generation.
+const RetainedCycle = struct {
+    cycle: conf.Cycle,
+    generation: u64,
+};
+
+/// A listener parked for connection draining, tagged with the generation of
+/// the cycle its configuration slices borrow.
+const RetiredListener = struct {
+    listener: *Listener,
+    borrowed_generation: u64,
 };
 
 fn customListenerSlot(rt: *RuleRuntime, protocol: ForwardProtocol) ?*ProtocolListenerSlot {
@@ -767,8 +796,13 @@ pub const ForwarderService = struct {
     retired_rules: std.ArrayList(*RuleRuntime) = .empty,
     /// Connection-oriented listeners parked for draining after their protocol was removed
     /// from a surviving rule (the pool stays with the rule).
-    retired_draining_listeners: std.ArrayList(*Listener) = .empty,
-    retained_cycles: std.ArrayList(conf.Cycle) = .empty,
+    retired_draining_listeners: std.ArrayList(RetiredListener) = .empty,
+    /// Superseded cycles kept alive only while retired (draining) objects
+    /// still borrow their arenas; pruned by pruneRetainedCycles.
+    retained_cycles: std.ArrayList(RetainedCycle) = .empty,
+    /// Generation of the current loaded cycle, bumped on every successful
+    /// reload. Retirements tag their borrowed cycle with the pre-bump value.
+    cycle_generation: u64 = 0,
     tuning_daemon: ?tuning.TuningDaemon = null,
     shutting_down: bool = false,
 
@@ -778,6 +812,7 @@ pub const ForwarderService = struct {
         loaded: conf.Cycle,
         resolved: ResolvedForwarder,
         instance_name: ?[]const u8,
+        pre_load_fingerprint: ?ConfigFingerprint,
     ) ForwarderService {
         var logger = log.LogStore.init(resolved.configuration.logging.level);
         logger.setInstance(instance_name);
@@ -789,7 +824,11 @@ pub const ForwarderService = struct {
             .logger = logger,
             .worker_threads = autotune.workerThreads(resolved.configuration.runtime.worker_threads, .system()),
             .tuning_view = tuningViewFor(resolved.configuration, resolved.rules),
-            .config_fingerprint = switch (config_source) {
+            // Prefer the fingerprint the caller captured before reading the
+            // file: an edit landing during resolution (DNS can take seconds)
+            // is then caught by the first SIGHUP instead of skipped forever.
+            // Callers that hand-built the cycle pass null and capture late.
+            .config_fingerprint = pre_load_fingerprint orelse switch (config_source) {
                 .file => |path| ConfigFingerprint.capture(path),
                 .cli => null,
             },
@@ -803,7 +842,7 @@ pub const ForwarderService = struct {
         self.reapRetiredRules(true);
         self.retired_rules.deinit(self.allocator);
         self.retired_draining_listeners.deinit(self.allocator);
-        for (self.retained_cycles.items) |*old| old.deinit();
+        for (self.retained_cycles.items) |*old| old.cycle.deinit();
         self.retained_cycles.deinit(self.allocator);
         self.loaded.deinit();
     }
@@ -876,6 +915,7 @@ pub const ForwarderService = struct {
                     _ = rt.custom_listeners.swapRemove(custom_index);
                 }
             }
+            rt.borrowed_generation = self.cycle_generation;
             self.retired_rules.append(self.allocator, rt) catch {
                 self.destroyRuleRuntime(rt);
             };
@@ -895,7 +935,7 @@ pub const ForwarderService = struct {
                 if (rt.tcp_listener) |listener| listener.forceCloseConnections();
                 for (rt.custom_listeners.items) |slot| slot.listener.forceCloseConnections();
             }
-            for (self.retired_draining_listeners.items) |listener| listener.forceCloseConnections();
+            for (self.retired_draining_listeners.items) |entry| entry.listener.forceCloseConnections();
         }
         self.reapRetiredRules(true);
         self.logger.info("forwarder stopped", .{});
@@ -1129,7 +1169,7 @@ pub const ForwarderService = struct {
             if (prep.replace_tcp) {
                 const previous = rt.tcp_listener.?;
                 previous.stopAccepting();
-                self.retired_draining_listeners.append(self.allocator, previous) catch {
+                self.retired_draining_listeners.append(self.allocator, .{ .listener = previous, .borrowed_generation = self.cycle_generation }) catch {
                     previous.forceCloseConnections();
                     previous.destroy();
                 };
@@ -1168,7 +1208,7 @@ pub const ForwarderService = struct {
                 listener.stopAccepting();
                 // The pool stays with the surviving rule; only the listener
                 // is parked for draining.
-                self.retired_draining_listeners.append(self.allocator, listener) catch {
+                self.retired_draining_listeners.append(self.allocator, .{ .listener = listener, .borrowed_generation = self.cycle_generation }) catch {
                     listener.forceCloseConnections();
                     listener.destroy();
                 };
@@ -1252,6 +1292,7 @@ pub const ForwarderService = struct {
             self.destroyRuleRuntime(rt);
             return;
         }
+        rt.borrowed_generation = self.cycle_generation;
         self.retired_rules.append(self.allocator, rt) catch {
             if (rt.tcp_listener) |listener| listener.forceCloseConnections();
             for (rt.custom_listeners.items) |slot| slot.listener.forceCloseConnections();
@@ -1272,13 +1313,40 @@ pub const ForwarderService = struct {
         }
         var j: usize = 0;
         while (j < self.retired_draining_listeners.items.len) {
-            const listener = self.retired_draining_listeners.items[j];
-            if (!force and listener.activeConnectionCount() != 0) {
+            const entry = self.retired_draining_listeners.items[j];
+            if (!force and entry.listener.activeConnectionCount() != 0) {
                 j += 1;
                 continue;
             }
-            listener.destroy();
+            entry.listener.destroy();
             _ = self.retired_draining_listeners.swapRemove(j);
+        }
+        self.pruneRetainedCycles();
+    }
+
+    /// Free superseded cycles no retired object still borrows. Live rules are
+    /// re-pushed to the newest cycle on every reload commit, so the only
+    /// borrowers of an old generation are retired rules and draining
+    /// listeners tagged with it; once they are reaped the cycle's arena is
+    /// unreachable and can be released instead of accumulating per reload.
+    fn pruneRetainedCycles(self: *ForwarderService) void {
+        var i: usize = 0;
+        prune: while (i < self.retained_cycles.items.len) {
+            const retained = &self.retained_cycles.items[i];
+            for (self.retired_rules.items) |rt| {
+                if (rt.borrowed_generation == retained.generation) {
+                    i += 1;
+                    continue :prune;
+                }
+            }
+            for (self.retired_draining_listeners.items) |entry| {
+                if (entry.borrowed_generation == retained.generation) {
+                    i += 1;
+                    continue :prune;
+                }
+            }
+            retained.cycle.deinit();
+            _ = self.retained_cycles.swapRemove(i);
         }
     }
 
@@ -1288,8 +1356,8 @@ pub const ForwarderService = struct {
             if (rt.tcp_listener) |listener| count += listener.activeConnectionCount();
             for (rt.custom_listeners.items) |slot| count += slot.listener.activeConnectionCount();
         }
-        for (self.retired_draining_listeners.items) |listener| {
-            count += listener.activeConnectionCount();
+        for (self.retired_draining_listeners.items) |entry| {
+            count += entry.listener.activeConnectionCount();
         }
         return count;
     }
@@ -1300,7 +1368,7 @@ pub const ForwarderService = struct {
             return;
         }
         listener.stopAccepting();
-        self.retired_draining_listeners.append(self.allocator, listener) catch {
+        self.retired_draining_listeners.append(self.allocator, .{ .listener = listener, .borrowed_generation = self.cycle_generation }) catch {
             listener.forceCloseConnections();
             listener.destroy();
         };
@@ -1401,6 +1469,7 @@ pub const ForwarderService = struct {
         defer self.mutex.unlock();
         if (self.shutting_down) return;
 
+        var pre_read_fingerprint: ?ConfigFingerprint = null;
         switch (self.config_source) {
             .file => |path| {
                 self.logger.info("reloading configuration path={s}", .{path});
@@ -1410,6 +1479,11 @@ pub const ForwarderService = struct {
                         return;
                     }
                 }
+                // Capture before the cycle read below: an edit landing while
+                // this reload runs (address resolution can take seconds) then
+                // mismatches at the next SIGHUP and forces another reload,
+                // instead of being fingerprinted-but-never-served.
+                pre_read_fingerprint = ConfigFingerprint.capture(path);
             },
             .cli => |config| self.logger.info("reloading cli configuration rules={d}", .{config.rules.len}),
         }
@@ -1467,15 +1541,20 @@ pub const ForwarderService = struct {
             return;
         };
 
-        self.retained_cycles.appendAssumeCapacity(self.loaded);
+        // Retirements during apply tagged the pre-bump generation as their
+        // borrowed cycle; record the previous loaded cycle under that same
+        // generation, then advance. pruneRetainedCycles frees it once those
+        // borrowers drain.
+        self.retained_cycles.appendAssumeCapacity(.{ .cycle = self.loaded, .generation = self.cycle_generation });
+        self.cycle_generation += 1;
         self.loaded = cycle;
         owns_cycle = false;
         self.resolved = candidate;
-        // The reload succeeded, so the file now reflects what we serve: capture
-        // its fingerprint so a later SIGHUP on an untouched file is a no-op.
-        // A rejected reload keeps the old fingerprint, letting a retry reload.
+        // The reload succeeded, so adopt the fingerprint captured just before
+        // the cycle was read. A rejected reload keeps the old fingerprint,
+        // letting a retry reload.
         self.config_fingerprint = switch (self.config_source) {
-            .file => |path| ConfigFingerprint.capture(path),
+            .file => pre_read_fingerprint,
             .cli => null,
         };
         self.logger.update(candidate.configuration.logging.level);
@@ -2480,7 +2559,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2583,7 +2662,7 @@ test "cli source starts and reloads through the config source" {
         return error.TestResolveFailed;
     };
 
-    var service = ForwarderService.init(testing.allocator, .{ .cli = &config }, cycle, resolved, null);
+    var service = ForwarderService.init(testing.allocator, .{ .cli = &config }, cycle, resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2622,7 +2701,7 @@ test "reload with an unchanged config file is a no-op" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2652,6 +2731,74 @@ test "reload with an unchanged config file is a no-op" {
     try testing.expectEqual(@as(usize, 1), service.rules_list.items.len);
 }
 
+test "retained cycles are pruned once no retired object borrows them" {
+    const port = try freeTcpPort();
+    const port_two = try freeTcpPort();
+    const upstream_port = try freeTcpPort();
+    var path_buf: [129]u8 = undefined;
+    const path_len = (std.fmt.bufPrint(&path_buf, "/tmp/curtsy_prune_{d}_{d}.yaml", .{ std.os.linux.getpid(), @as(u64, @truncate(monotonicNowNs())) }) catch unreachable).len;
+    path_buf[path_len] = 0;
+    const config_path: [:0]const u8 = path_buf[0..path_len :0];
+    defer _ = linux.unlink(config_path);
+
+    var initial_buf: [512]u8 = undefined;
+    const initial_yaml = std.fmt.bufPrint(&initial_buf,
+        \\logging: {{ level: critical }}
+        \\listen: {{ host: "127.0.0.1", port: {d} }}
+        \\upstream: {{ host: "127.0.0.1", port: {d} }}
+        \\
+    , .{ port, upstream_port }) catch unreachable;
+    try writeTestConfig(config_path, initial_yaml);
+
+    const initial = try resolveYamlForTest(initial_yaml, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
+    service.startInitialRules() catch {
+        service.deinit();
+        return error.TestInitialStartFailed;
+    };
+    defer service.deinit();
+
+    // In-place reload (same listen address): nothing is retired, so the
+    // superseded cycle has no borrowers and the next prune frees it.
+    var changed_buf: [512]u8 = undefined;
+    const changed_yaml = std.fmt.bufPrint(&changed_buf,
+        \\logging: {{ level: critical }}
+        \\listen: {{ host: "127.0.0.1", port: {d} }}
+        \\upstream: {{ host: "127.0.0.1", port: {d} }}
+        \\
+    , .{ port, upstream_port + 1 }) catch unreachable;
+    try writeTestConfig(config_path, changed_yaml);
+    service.reload();
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+    service.reapRetiredRules(false);
+    try testing.expectEqual(@as(usize, 0), service.retained_cycles.items.len);
+    try testing.expectEqual(@as(u16, upstream_port + 1), service.resolved.rules[0].upstream_addresses[0].port);
+
+    // A listen-address change retires the old rule; while it is parked the
+    // cycle it borrows must survive pruning, and once reaped the cycle goes.
+    // Let the file mtime advance beyond the fingerprint granularity (~1ms on
+    // ext4) so the rewrite is seen as a change.
+    var sleep_ts = linux.timespec{ .sec = 0, .nsec = 5 * 1_000_000 };
+    _ = linux.nanosleep(&sleep_ts, &sleep_ts);
+    var moved_buf: [512]u8 = undefined;
+    const moved_yaml = std.fmt.bufPrint(&moved_buf,
+        \\logging: {{ level: critical }}
+        \\listen: {{ host: "127.0.0.1", port: {d} }}
+        \\upstream: {{ host: "127.0.0.1", port: {d} }}
+        \\
+    , .{ port_two, upstream_port + 1 }) catch unreachable;
+    try writeTestConfig(config_path, moved_yaml);
+    service.reload();
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), service.retired_rules.items.len);
+    service.pruneRetainedCycles();
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+    service.reapRetiredRules(false);
+    try testing.expectEqual(@as(usize, 0), service.retired_rules.items.len);
+    try testing.expectEqual(@as(usize, 0), service.retained_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), service.rules_list.items.len);
+}
+
 test "reload after touching the file still reloads (DNS refresh preserved)" {
     const port = try freeTcpPort();
     const upstream_port = try freeTcpPort();
@@ -2671,7 +2818,7 @@ test "reload after touching the file still reloads (DNS refresh preserved)" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2700,6 +2847,19 @@ test "reload after touching the file still reloads (DNS refresh preserved)" {
     service.reload();
     try testing.expectEqual(@as(usize, 2), service.retained_cycles.items.len);
     try testing.expectEqual(@as(u16, upstream_port + 1), service.resolved.rules[0].upstream_addresses[0].port);
+}
+
+test "fingerprint mtime conversion clamps out-of-range timestamps" {
+    // Pre-1970 mtimes have negative seconds: clamp to 0 instead of panicking
+    // on the unsigned cast.
+    try testing.expectEqual(@as(u64, 0), ConfigFingerprint.mtimeNs(.{ .sec = -1, .nsec = 500_000_000, .__pad1 = 0 }));
+    // Normal timestamps convert exactly.
+    try testing.expectEqual(
+        @as(u64, 1_700_000_000) * std.time.ns_per_s + 123,
+        ConfigFingerprint.mtimeNs(.{ .sec = 1_700_000_000, .nsec = 123, .__pad1 = 0 }),
+    );
+    // Far-future seconds saturate instead of overflowing.
+    try testing.expect(ConfigFingerprint.mtimeNs(.{ .sec = std.math.maxInt(i64), .nsec = 0, .__pad1 = 0 }) >= std.math.maxInt(u64) - std.time.ns_per_s);
 }
 
 test "coalesceSignals folds duplicate signals into one dispatch decision" {
@@ -2878,7 +3038,7 @@ test "snapshot aggregates listener metrics across rules" {
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.2", port: 9001 }
     , null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null, null);
     defer service.deinit();
 
     // Rule 0: one TCP listener. Rule 1: TCP + UDP. The service-level snapshot
@@ -2913,7 +3073,7 @@ test "snapshot metrics stay all-zero when a service has no listeners" {
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.2", port: 9001 }
     , null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null, null);
     defer service.deinit();
     const snap = service.snapshot().?;
     try testing.expect(snap.metrics.isZero());

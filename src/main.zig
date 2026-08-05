@@ -115,6 +115,14 @@ pub fn main(init: std.process.Init) u8 {
         .cli => |*value| value.configuration.deinit(),
     };
 
+    // Capture the file fingerprint before reading so an edit landing during
+    // address resolution is detected as a change on the first SIGHUP instead
+    // of being fingerprinted-but-never-served.
+    const pre_load_fingerprint: ?core.ConfigFingerprint = switch (options) {
+        .file => |value| core.ConfigFingerprint.capture(value.path),
+        .cli => null,
+    };
+
     var cycle = switch (options) {
         .file => |value| conf.loadFile(gpa, value.path, &diag),
         .cli => |*value| cli.loadCycle(gpa, &value.configuration, &diag),
@@ -143,7 +151,7 @@ pub fn main(init: std.process.Init) u8 {
         .file => |value| .{ .file = value.path },
         .cli => |*value| .{ .cli = &value.configuration },
     };
-    var service = core.ForwarderService.init(gpa, source, cycle, resolved, options.instance());
+    var service = core.ForwarderService.init(gpa, source, cycle, resolved, options.instance(), pre_load_fingerprint);
     owns_cycle = false;
     service.run() catch |err| {
         writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});

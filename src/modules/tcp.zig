@@ -1325,16 +1325,8 @@ const Worker = struct {
             .connect_ns = state.snapshot.connect_ns,
             .accelerator = state.accelerator,
         };
-        // The client address text is only consumed by debug/err log lines, so
-        // formatting it on every accept is pure waste when neither level is
-        // enabled (e.g. critical). Skip the format then; error paths never
-        // run while err is disabled, so the empty text is never observed.
-        if (listener.logger.isEnabled(.debug) or listener.logger.isEnabled(.err)) {
-            if (client_address) |address| {
-                const text = std.fmt.bufPrint(&connection.client_text, "{f}", .{address}) catch unreachable;
-                connection.client_text_len = text.len;
-            }
-        }
+        // The client address text is formatted lazily on first use (see
+        // clientText), so the accept fast path does no formatting work.
 
         // Nonblocking upstream connect with connect_seconds deadline. With a
         // selector (rules module) the upstream is picked per connection and
@@ -2190,6 +2182,10 @@ const Connection = struct {
     failover_attempts: usize = 0,
     /// "[addr]:port" text; the longest form is an IPv6 literal (53 bytes).
     client_text: [56]u8 = undefined,
+    /// 0 while not yet formatted: the text is produced lazily on first use.
+    /// Formatting at accept would be wasted on the happy path, while a fixed
+    /// accept-time snapshot could stay empty forever when the log level is
+    /// raised by a reload after the connection was accepted.
     client_text_len: usize = 0,
     bytes_to_upstream: i64 = 0,
     bytes_to_client: i64 = 0,
@@ -2197,7 +2193,12 @@ const Connection = struct {
     next: ?*Connection = null,
     zombie_next: ?*Connection = null,
 
-    fn clientText(self: *const Connection) []const u8 {
+    fn clientText(self: *Connection) []const u8 {
+        if (self.client_text_len == 0) {
+            const address = self.client_addr orelse return "";
+            const text = std.fmt.bufPrint(&self.client_text, "{f}", .{address}) catch unreachable;
+            self.client_text_len = text.len;
+        }
         return self.client_text[0..self.client_text_len];
     }
 
@@ -2577,6 +2578,21 @@ fn waitForCondition(condition: *const fn () bool, timeout_ms: u64) bool {
         waited += 5;
     }
     return condition();
+}
+
+test "tcp client text formats lazily on first use" {
+    var connection: Connection = undefined;
+    connection.client_addr = config.SocketAddr.initV4(.{ 127, 0, 0, 1 }, 43210);
+    connection.client_text_len = 0;
+    try testing.expectEqualStrings("127.0.0.1:43210", connection.clientText());
+    // A second call reuses the cached text.
+    try testing.expectEqualStrings("127.0.0.1:43210", connection.clientText());
+
+    // A connection without a resolved address stays empty.
+    var anonymous: Connection = undefined;
+    anonymous.client_addr = null;
+    anonymous.client_text_len = 0;
+    try testing.expectEqualStrings("", anonymous.clientText());
 }
 
 test "tcp buffer budget caps aggregate queued bytes" {

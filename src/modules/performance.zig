@@ -91,6 +91,12 @@ fn decodeCpuAffinity(cycle: *conf.Cycle, value: *yaml.Value, path: []const u8) y
                 if (cpu < 0) {
                     return yaml.fail(cycle.gpa, cycle.diag, "{s}[{d}]: cpu ids must be non-negative", .{ path, i });
                 }
+                // cpu_set_t cannot represent ids beyond CPU_SETSIZE; reject
+                // them here instead of panicking on the u16 cast or silently
+                // skipping them in pinThread.
+                if (cpu >= linux.CPU_SETSIZE) {
+                    return yaml.fail(cycle.gpa, cycle.diag, "{s}[{d}]: cpu ids must be below {d}", .{ path, i, linux.CPU_SETSIZE });
+                }
                 cpus[i] = @intCast(cpu);
             }
             return .{ .explicit = cpus };
@@ -212,44 +218,103 @@ test "threadCpuAffinity rejects invalid values and empty lists" {
         \\
     , &diag_empty));
     defer if (diag_empty.message) |message| testing.allocator.free(message);
+
+    // Out-of-range ids are a config error, not an integer cast panic.
+    var diag_neg = conf.Diagnostics{};
+    try testing.expectError(error.InvalidConfiguration, conf.loadYaml(
+        testing.allocator,
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\performance:
+        \\  threadCpuAffinity: [-1]
+        \\
+    , &diag_neg));
+    defer if (diag_neg.message) |message| testing.allocator.free(message);
+
+    var diag_big = conf.Diagnostics{};
+    try testing.expectError(error.InvalidConfiguration, conf.loadYaml(
+        testing.allocator,
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\performance:
+        \\  threadCpuAffinity: [1024]
+        \\
+    , &diag_big));
+    defer if (diag_big.message) |message| testing.allocator.free(message);
+
+    var diag_huge = conf.Diagnostics{};
+    try testing.expectError(error.InvalidConfiguration, conf.loadYaml(
+        testing.allocator,
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\performance:
+        \\  threadCpuAffinity: [70000]
+        \\
+    , &diag_huge));
+    defer if (diag_huge.message) |message| testing.allocator.free(message);
 }
 
 test "affinityCpu selects the target cpu per policy" {
+    const eight: []const u16 = &.{ 0, 1, 2, 3, 4, 5, 6, 7 };
     // none never pins.
-    try testing.expect(affinityCpu(.none, 0, 8) == null);
-    try testing.expect(affinityCpu(.none, 5, 8) == null);
+    try testing.expect(affinityCpu(.none, 0, eight) == null);
+    try testing.expect(affinityCpu(.none, 5, eight) == null);
 
     // sequential wraps over the allowed set.
-    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 0, 8));
-    try testing.expectEqual(@as(?usize, 7), affinityCpu(.sequential, 7, 8));
-    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 8, 8));
-    try testing.expectEqual(@as(?usize, 1), affinityCpu(.sequential, 9, 8));
-    // A one-cpu cpuset pins everything to cpu 0.
-    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 42, 1));
+    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 0, eight));
+    try testing.expectEqual(@as(?usize, 7), affinityCpu(.sequential, 7, eight));
+    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 8, eight));
+    try testing.expectEqual(@as(?usize, 1), affinityCpu(.sequential, 9, eight));
+    // A one-cpu cpuset pins everything to that cpu.
+    const one: []const u16 = &.{5};
+    try testing.expectEqual(@as(?usize, 5), affinityCpu(.sequential, 42, one));
+    // A cpuset that does not start at cpu 0 still lands on allowed cpus.
+    const restricted: []const u16 = &.{ 2, 3, 6 };
+    try testing.expectEqual(@as(?usize, 2), affinityCpu(.sequential, 0, restricted));
+    try testing.expectEqual(@as(?usize, 3), affinityCpu(.sequential, 1, restricted));
+    try testing.expectEqual(@as(?usize, 6), affinityCpu(.sequential, 2, restricted));
+    try testing.expectEqual(@as(?usize, 2), affinityCpu(.sequential, 3, restricted));
+    // An unreadable/empty mask is a defensive no-op.
+    try testing.expect(affinityCpu(.sequential, 0, &.{}) == null);
 
     // Explicit lists wrap; an empty list is a defensive no-op.
     const list: []const u16 = &.{ 0, 2, 4 };
-    try testing.expectEqual(@as(?usize, 0), affinityCpu(.{ .explicit = list }, 0, 8));
-    try testing.expectEqual(@as(?usize, 4), affinityCpu(.{ .explicit = list }, 2, 8));
-    try testing.expectEqual(@as(?usize, 2), affinityCpu(.{ .explicit = list }, 4, 8));
+    try testing.expectEqual(@as(?usize, 0), affinityCpu(.{ .explicit = list }, 0, eight));
+    try testing.expectEqual(@as(?usize, 4), affinityCpu(.{ .explicit = list }, 2, eight));
+    try testing.expectEqual(@as(?usize, 2), affinityCpu(.{ .explicit = list }, 4, eight));
     const empty: []const u16 = &.{};
-    try testing.expect(affinityCpu(.{ .explicit = empty }, 0, 8) == null);
+    try testing.expect(affinityCpu(.{ .explicit = empty }, 0, eight) == null);
 }
 
-/// Number of CPUs the calling process is currently allowed to run on, from
-/// its own affinity mask (respects cpuset/cgroup restrictions). Returns at
-/// least 1 so `sequential` never divides by zero.
-fn allowedCpuCount() usize {
-    const set = std.posix.sched_getaffinity(std.os.linux.getpid()) catch return 1;
-    return @max(1, linux.CPU_COUNT(set));
+/// Enumerate the CPUs the calling process is currently allowed to run on,
+/// from its own affinity mask (respects cpuset/cgroup restrictions), into
+/// `buf` in ascending id order. Returns the populated prefix; an empty slice
+/// when the mask cannot be read or is empty.
+fn allowedCpus(buf: []u16) []const u16 {
+    const set = std.posix.sched_getaffinity(std.os.linux.getpid()) catch return &.{};
+    var count: usize = 0;
+    for (0..linux.CPU_SETSIZE) |cpu| {
+        if (count == buf.len) break;
+        const word = cpu / @bitSizeOf(usize);
+        const bit = cpu % @bitSizeOf(usize);
+        if (set[word] & (@as(usize, 1) << @intCast(bit)) != 0) {
+            buf[count] = @intCast(cpu);
+            count += 1;
+        }
+    }
+    return buf[0..count];
 }
 
 /// The CPU selected for the thread at `index` under `affinity`, or null when
-/// no pinning applies. Pure and testable; the syscall lives in `pinThread`.
-pub fn affinityCpu(affinity: CpuAffinity, index: usize, allowed: usize) ?usize {
+/// no pinning applies. `allowed` is the process's allowed CPU list in
+/// ascending order: `sequential` binds thread i to the i-th allowed CPU
+/// (wrapping), so masks that do not start at cpu 0 (taskset, systemd
+/// CPUAffinity, container cpusets) still land on legal CPUs. Pure and
+/// testable; the syscall lives in `pinThread`.
+pub fn affinityCpu(affinity: CpuAffinity, index: usize, allowed: []const u16) ?usize {
     return switch (affinity) {
         .none => null,
-        .sequential => index % @max(1, allowed),
+        .sequential => if (allowed.len == 0) null else allowed[index % allowed.len],
         .explicit => |list| if (list.len == 0) null else list[index % list.len],
     };
 }
@@ -260,7 +325,8 @@ pub fn affinityCpu(affinity: CpuAffinity, index: usize, allowed: usize) ?usize {
 /// sched_setaffinity syscall; callers treat any failure as non-fatal and
 /// continue unpinned.
 pub fn pinThread(affinity: CpuAffinity, index: usize) !void {
-    const cpu = affinityCpu(affinity, index, allowedCpuCount()) orelse return;
+    var buf: [linux.CPU_SETSIZE]u16 = undefined;
+    const cpu = affinityCpu(affinity, index, allowedCpus(&buf)) orelse return;
     if (cpu >= linux.CPU_SETSIZE) return;
     var set: linux.cpu_set_t = .{0} ** (linux.CPU_SETSIZE / @sizeOf(usize));
     const word = cpu / @bitSizeOf(usize);
