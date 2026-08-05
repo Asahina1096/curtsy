@@ -42,6 +42,15 @@ upstream:
 #                                   # relay (576..65536); smaller values improve
 #                                   # cache locality, larger datagrams truncate
 #   udpIOThreads: auto              # UDP relay threads; auto = worker count
+#   threadCpuAffinity: none         # CPU pinning for TCP workers and UDP I/O
+#                                   # threads: none | sequential | [list]
+#                                   #   none: leave scheduling to the kernel
+#                                   #   sequential: thread i binds to CPU i
+#                                   #     (modulo allowed CPUs)
+#                                   #   [0, 2, 4]: thread i binds to
+#                                   #     list[i % len]; improves cache
+#                                   #     locality on multi-core/NUMA hosts,
+#                                   #     may hurt on shared machines
 # logging:
 #   level: info
 

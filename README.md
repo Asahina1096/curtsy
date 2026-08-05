@@ -183,7 +183,7 @@ eBPF：observer kprobe 按实例自身 pid 过滤，sockmap/reuseport 程序按�
 
 ## 信号
 
-- `SIGHUP`：重新读取并应用配置。重载是事务式的：新规则和新增协议监听会先绑定但保持暂停（不接受 TCP、不转发 UDP），连同上游 generation 和 listen backlog 预检全部就绪后才提交并激活；任一失败则整体保留旧配置，候选配置正常释放。配置无效或新端口绑定失败时继续使用旧配置。
+- `SIGHUP`：重新读取并应用配置。若配置文件自上次成功加载以来未被修改（mtime 与大小一致），重载是 no-op：只记录一条日志并跳过解析/校验/应用全部阶段，因此误发的 `systemctl reload` 近乎零成本；`touch` 或编辑文件（mtime 变化）都会照常触发全量重载，主机名照常重新解析（DNS 变化生效）。注意判定基于文件系统时间戳粒度（ext4 约 1ms），编辑与重载间隔极短（亚毫秒级）的自动化可能被判定为未修改。重载是事务式的：新规则和新增协议监听会先绑定但保持暂停（不接受 TCP、不转发 UDP），连同上游 generation 和 listen backlog 预检全部就绪后才提交并激活；任一失败则整体保留旧配置，候选配置正常释放。配置无效或新端口绑定失败时继续使用旧配置。同一时刻到达的多个 SIGHUP 会合并为一次重载。
 - `SIGINT` / `SIGTERM`：停止监听并优雅退出。现有 TCP 连接最多等待 `shutdownGraceSeconds`。
 
 热加载后，已有 TCP 连接继续使用原上游，新连接使用新上游；上游变化时已有 UDP 映射会被清除并按新配置重建。
@@ -199,6 +199,10 @@ SIGHUP 热重载只重新解析配置，并事务式替换规则、监听器和�
 TCP 转发路径使用每 worker 一个 epoll loop：每个 worker 持有 `SO_REUSEPORT` 监听 socket，连接和对应上游 socket 固定在同一线程。普通用户态 relay 优先使用每 worker 一个非阻塞 pipe，通过 `splice(2)` 完成 socket→pipe→socket 零拷贝；目标端产生背压时，pipe 中剩余数据会回退到原有的用户态缓冲队列。读缓冲采用 64 KiB 到 1 MiB 的自适应块（pipe 容量按需增长，权限受限时会停留在内核允许的较小值），配合批量 flush 和水位线背压控制；splice 与 buffered 两条 relay 路径每次就绪事件最多搬移 2 MiB（每个 read 请求按剩余预算截断，避免单次超大请求越界），防止单条热连接独占 worker。待发送数据受全局 `limits.maxTCPBufferedBytes` 约束，防止大量慢速连接耗尽进程内存。worker 在一次 epoll 唤醒内复用同一个单调时钟时间戳，避免为每个数据块重复调用 `clock_gettime`。
 
 多 worker 时，Curtsy 会尝试通过 `SO_ATTACH_REUSEPORT_EBPF` 加载 reuseport eBPF 程序，按连接四元组 hash 分流到对应 worker。失败时回退到内核原生 `SO_REUSEPORT` hash，不影响服务启动。
+
+### CPU 亲和
+
+默认情况下线程调度交给内核。需要更好 cache 局部性的多核/NUMA 主机可以用 `performance.threadCpuAffinity` 把 TCP worker 与 UDP I/O 线程固定到 CPU：`none`（默认）不绑定；`sequential` 把线程 i 绑到允许的第 i 个 CPU；也可写 CPU 列表如 `[0, 2, 4]`，线程 i 绑到 `list[i % len]`。绑定在启动期一次完成（线程数变化需重启），失败只记 warning、线程照常运行；共享机器上盲目绑定可能劣化，建议用 `tools/benchmark` 实测对比。
 
 在具备 eBPF 权限的 Linux 上，Curtsy 还可创建 `BPF_MAP_TYPE_SOCKHASH`，并为每对客户端/上游 TCP socket 挂载 `SK_SKB` stream parser 与 verdict 程序。双向数据通过 `bpf_sk_redirect_hash` 在内核中直接转发，绕过用户态 relay 的 `tcp_recvmsg`、`tcp_sendmsg` 和用户缓冲区复制。BPF 同时记录双向最后活动时间，因此加速连接仍遵守 `tcpIdleSeconds`。
 

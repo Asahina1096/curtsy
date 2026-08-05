@@ -55,10 +55,11 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透�
 
 ## 运行时架构要点
 
-- 热加载（`SIGHUP`）：监听地址变化时先绑新端口再停旧监听。重载是事务式的：所有可失败操作（新规则绑定、上游 generation 准备、新增协议监听、listen backlog 预检）先全部准备好；新 listener 在准备阶段保持暂停，不接受 TCP 或转发 UDP。任一失败则整体保留旧配置并正常释放候选 cycle；全部就绪后才提交、激活并退役旧规则。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 TCP sockmap 模式时已有 TCP 连接保持原模式；改变 UDP sockmap 模式时已有 UDP 会话被清除并按新模式重建。统一编排器按规则 listen 地址集合 diff（单规则即一条规则的特例）：匹配规则原地更新（pool 健康状态按地址继承），新规则先绑定再退役旧规则，单规则 ↔ 多规则写法切换需重启。
+- 热加载（`SIGHUP`）：文件源在重载前先 `statx` 对比上次成功加载的 mtime+size，未修改则跳过整个 reload（no-op，仅记日志）；任何 touch/编辑都会触发全量重载并重新解析主机名。判定受文件系统时间戳粒度限制（ext4 约 1ms）。同一 poll 周期内的多个 SIGHUP 合并为一次重载（shutdown 优先）。监听地址变化时先绑新端口再停旧监听。重载是事务式的：所有可失败操作（新规则绑定、上游 generation 准备、新增协议监听、listen backlog 预检）先全部准备好；新 listener 在准备阶段保持暂停，不接受 TCP 或转发 UDP。任一失败则整体保留旧配置并正常释放候选 cycle；全部就绪后才提交、激活并退役旧规则。已有 TCP 连接继续使用原上游，上游变化时已有 UDP 会话会被清除并按新配置重建。改变 TCP sockmap 模式时已有 TCP 连接保持原模式；改变 UDP sockmap 模式时已有 UDP 会话被清除并按新模式重建。统一编排器按规则 listen 地址集合 diff（单规则即一条规则的特例）：匹配规则原地更新（pool 健康状态按地址继承），新规则先绑定再退役旧规则，单规则 ↔ 多规则写法切换需重启。
 - 优雅退出：先停止 accept，等待已有 TCP 连接，超时后强制关闭。
 - TCP 性能：`splice(2)` socket→pipe→socket 零拷贝快路径，背压时回退 64..256 KiB 自适应读缓冲、批量 flush 和水位线控制；每次 epoll 唤醒复用单调时间戳。多 worker 时尝试 `SO_ATTACH_REUSEPORT_EBPF`，失败时回退内核原生 `SO_REUSEPORT` hash。
 - UDP 性能：I/O 线程池（默认每 CPU 一个，`performance.udpIOThreads` 可调）经 `SO_REUSEPORT` 共享监听端口；每线程用 epoll 驱动自己的监听与上游 socket，`recvmmsg`/`sendmmsg` 以 64 报文为一批收发；会话建立是同步的。
+- CPU 亲和：`performance.threadCpuAffinity`（`none`/`sequential`/CPU 列表，默认 `none`）在 TCP worker 与 UDP engine 线程启动时按线程下标 `sched_setaffinity`（`gettid`，非 `getpid`）；pinning 失败仅记 warning 不致命。pinning 是启动期一次性行为，线程数变化需重启。
 - sockmap 加速：`performance.tcpSockmapAcceleration` 的 `auto` 跳过 loopback 上游。UDP `auto` 从用户态批量 relay 启动，仅在非 loopback、连续 5 个一秒窗口达到每窗口 200 报文且平均至少 256 字节后尝试 sockmap；加载、配对或回落异常进入 30 秒冷却并安全退回用户态。`enabled` 强制尽力尝试，`disabled` 始终关闭；不承诺 UDP 报文顺序。
 - 并发约定：跨线程共享状态使用 `std.atomic.Value` 或 `log.Mutex`；worker/engine 私有可变状态只在对应线程上访问。
 

@@ -68,6 +68,51 @@ pub const ConfigSource = union(enum) {
     cli: *const cli.Configuration,
 };
 
+/// Cheap identity of a loaded configuration file: the modification time and
+/// size captured when it was last loaded. SIGHUP compares the live stat
+/// against this fingerprint and skips the entire reload (parse, resolve,
+/// apply) when the file was never touched. Any touch or edit changes at
+/// least one field, so a reload is never silently skipped for a modified
+/// file, and DNS hostnames are re-resolved on every real reload exactly as
+/// before. Captured with statx because the stat wrapper is unavailable on
+/// Linux in this std release.
+///
+/// Timestamps resolve at filesystem granularity (typically ~1ms on ext4): a
+/// file modified and reloaded within one granularity tick of the fingerprint
+/// capture can still match and be skipped. That is acceptable for operator
+/// reloads (edit and reload are human-timescale); sub-millisecond automation
+/// that both modifies the file and reloads in the same tick must use a
+/// different content signal. The tests stay on the safe side of this window.
+const ConfigFingerprint = struct {
+    mtime_ns: u64,
+    size: u64,
+
+    /// Stat `path` and capture its fingerprint. Returns null when the file
+    /// cannot be stat'd (missing, unreadable, overlong path): a reload then
+    /// proceeds and surfaces the underlying read error as usual.
+    fn capture(path: []const u8) ?ConfigFingerprint {
+        if (path.len >= std.fs.max_path_bytes) return null;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const path_z: [:0]const u8 = path_buf[0..path.len :0];
+        var st: linux.Statx = undefined;
+        const rc = linux.statx(linux.AT.FDCWD, path_z.ptr, 0, linux.STATX{ .MTIME = true, .SIZE = true }, &st);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        return .{
+            .mtime_ns = @as(u64, @intCast(st.mtime.sec)) * std.time.ns_per_s + st.mtime.nsec,
+            .size = st.size,
+        };
+    }
+
+    /// Whether the live file at `path` still matches this fingerprint. A file
+    /// that cannot be stat'd is treated as changed so a reload is attempted.
+    fn matches(self: ConfigFingerprint, path: []const u8) bool {
+        const live = capture(path) orelse return false;
+        return live.mtime_ns == self.mtime_ns and live.size == self.size;
+    }
+};
+
 /// Load a fresh configuration cycle from the source, mirroring how the main
 /// entry point bootstraps the first cycle.
 fn loadConfigCycle(gpa: Allocator, source: ConfigSource, diag: *conf.Diagnostics) conf.LoadError!conf.Cycle {
@@ -712,6 +757,10 @@ pub const ForwarderService = struct {
     worker_threads: i64,
     /// Global-section view for the tuning daemon (which only reads limits).
     tuning_view: ResolvedConfiguration,
+    /// Fingerprint of the config file at its last successful load. A SIGHUP
+    /// whose file still matches is a no-op (reload skipped). null until a
+    /// file-source cycle has been captured, and null for CLI sources.
+    config_fingerprint: ?ConfigFingerprint,
 
     mutex: log.Mutex = .{},
     rules_list: std.ArrayList(*RuleRuntime) = .empty,
@@ -740,6 +789,10 @@ pub const ForwarderService = struct {
             .logger = logger,
             .worker_threads = autotune.workerThreads(resolved.configuration.runtime.worker_threads, .system()),
             .tuning_view = tuningViewFor(resolved.configuration, resolved.rules),
+            .config_fingerprint = switch (config_source) {
+                .file => |path| ConfigFingerprint.capture(path),
+                .cli => null,
+            },
         };
     }
 
@@ -1264,6 +1317,33 @@ pub const ForwarderService = struct {
     // Signals and reload
     // ------------------------------------------------------------------
 
+    /// One dispatch decision for a drained batch of queued signals.
+    const PendingSignals = struct {
+        hup: bool = false,
+        /// First shutdown signal seen; null if none. Shutdown wins over reload.
+        shutdown: ?linux.SIG = null,
+        pipe: bool = false,
+    };
+
+    /// Coalesce a batch of queued signals into a single dispatch decision:
+    /// multiple SIGHUPs become one reload, and a shutdown signal suppresses
+    /// any reload. Order is irrelevant because reload and shutdown are both
+    /// idempotent side effects.
+    fn coalesceSignals(signals: []const linux.SIG) PendingSignals {
+        var pending = PendingSignals{};
+        for (signals) |signal| {
+            switch (signal) {
+                .HUP => pending.hup = true,
+                .INT, .TERM => {
+                    if (pending.shutdown == null) pending.shutdown = signal;
+                },
+                .PIPE => pending.pipe = true,
+                else => {},
+            }
+        }
+        return pending;
+    }
+
     fn pollSignals(self: *ForwarderService, signal_fd: posix.fd_t) void {
         var fds = [_]posix.pollfd{.{
             .fd = signal_fd,
@@ -1279,15 +1359,23 @@ pub const ForwarderService = struct {
         // needed to distinguish "nothing happened" from "signal readable".
         if ((fds[0].revents & linux.POLL.IN) == 0) return;
 
+        // Drain the whole queue, coalescing back-to-back signals: several
+        // SIGHUPs (e.g. a systemctl reload storm) become one reload, and a
+        // shutdown signal suppresses any queued reload. Standard signals
+        // coalesce in the kernel anyway, so the queue is small; the bounded
+        // buffer only decides which of the first few are observed.
+        var queued: [32]linux.SIG = undefined;
+        var queued_count: usize = 0;
         while (true) {
             var info: linux.signalfd_siginfo = undefined;
             const rc = linux.read(signal_fd, @ptrCast(&info), @sizeOf(linux.signalfd_siginfo));
             switch (linux.errno(rc)) {
                 .SUCCESS => {
-                    if (rc != @sizeOf(linux.signalfd_siginfo)) return;
-                    self.handleSignal(@enumFromInt(info.signo));
+                    if (rc != @sizeOf(linux.signalfd_siginfo)) break;
+                    if (queued_count < queued.len) queued[queued_count] = @enumFromInt(info.signo);
+                    queued_count += 1;
                 },
-                .AGAIN => return,
+                .AGAIN => break,
                 .INTR => continue,
                 else => |err| {
                     self.logger.err("signal read failed errno={s}", .{@tagName(err)});
@@ -1295,15 +1383,16 @@ pub const ForwarderService = struct {
                 },
             }
         }
-    }
 
-    fn handleSignal(self: *ForwarderService, signal: linux.SIG) void {
-        switch (signal) {
-            .HUP => self.reload(),
-            .INT => self.requestShutdown("SIGINT"),
-            .TERM => self.requestShutdown("SIGTERM"),
-            .PIPE => {},
-            else => {},
+        const pending = coalesceSignals(queued[0..@min(queued_count, queued.len)]);
+        if (pending.shutdown) |signal| {
+            self.requestShutdown(switch (signal) {
+                .INT => "SIGINT",
+                .TERM => "SIGTERM",
+                else => unreachable,
+            });
+        } else if (pending.hup) {
+            self.reload();
         }
     }
 
@@ -1313,7 +1402,15 @@ pub const ForwarderService = struct {
         if (self.shutting_down) return;
 
         switch (self.config_source) {
-            .file => |path| self.logger.info("reloading configuration path={s}", .{path}),
+            .file => |path| {
+                self.logger.info("reloading configuration path={s}", .{path});
+                if (self.config_fingerprint) |fingerprint| {
+                    if (fingerprint.matches(path)) {
+                        self.logger.info("configuration unchanged; reload skipped", .{});
+                        return;
+                    }
+                }
+            },
             .cli => |config| self.logger.info("reloading cli configuration rules={d}", .{config.rules.len}),
         }
 
@@ -1374,6 +1471,13 @@ pub const ForwarderService = struct {
         self.loaded = cycle;
         owns_cycle = false;
         self.resolved = candidate;
+        // The reload succeeded, so the file now reflects what we serve: capture
+        // its fingerprint so a later SIGHUP on an untouched file is a no-op.
+        // A rejected reload keeps the old fingerprint, letting a retry reload.
+        self.config_fingerprint = switch (self.config_source) {
+            .file => |path| ConfigFingerprint.capture(path),
+            .cli => null,
+        };
         self.logger.update(candidate.configuration.logging.level);
         self.logger.info("configuration reloaded rules={d}", .{candidate.rules.len});
     }
@@ -2497,6 +2601,130 @@ test "cli source starts and reloads through the config source" {
     try testing.expectEqual(@as(u16, upstream_port), service.resolved.rules[0].upstream_addresses[0].port);
     try testing.expectEqual(@as(usize, 1), service.rules_list.items.len);
     try testing.expectEqual(@as(u16, upstream_port), service.rules_list.items[0].resolved.configuration.upstream.port);
+}
+
+test "reload with an unchanged config file is a no-op" {
+    const port = try freeTcpPort();
+    const upstream_port = try freeTcpPort();
+    var path_buf: [129]u8 = undefined;
+    const path_len = (std.fmt.bufPrint(&path_buf, "/tmp/curtsy_unchanged_{d}_{d}.yaml", .{ std.os.linux.getpid(), @as(u64, @truncate(monotonicNowNs())) }) catch unreachable).len;
+    path_buf[path_len] = 0;
+    const config_path: [:0]const u8 = path_buf[0..path_len :0];
+    defer _ = linux.unlink(config_path);
+
+    var initial_buf: [512]u8 = undefined;
+    const initial_yaml = std.fmt.bufPrint(&initial_buf,
+        \\logging: {{ level: critical }}
+        \\listen: {{ host: "127.0.0.1", port: {d} }}
+        \\upstream: {{ host: "127.0.0.1", port: {d} }}
+        \\
+    , .{ port, upstream_port }) catch unreachable;
+    try writeTestConfig(config_path, initial_yaml);
+
+    const initial = try resolveYamlForTest(initial_yaml, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null);
+    service.startInitialRules() catch {
+        service.deinit();
+        return error.TestInitialStartFailed;
+    };
+    defer service.deinit();
+
+    // A real change reloads and re-captures the fingerprint.
+    var changed_buf: [512]u8 = undefined;
+    const changed_yaml = std.fmt.bufPrint(&changed_buf,
+        \\logging: {{ level: critical }}
+        \\listen: {{ host: "127.0.0.1", port: {d} }}
+        \\upstream: {{ host: "127.0.0.1", port: {d} }}
+        \\
+    , .{ port, upstream_port + 1 }) catch unreachable;
+    try writeTestConfig(config_path, changed_yaml);
+    service.reload();
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+    try testing.expectEqual(@as(u16, upstream_port + 1), service.resolved.rules[0].upstream_addresses[0].port);
+
+    // The file is untouched, so a second reload must be a no-op: no new cycle
+    // is retained, the resolved rules are not re-created, and the live rule
+    // list is untouched.
+    service.reload();
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), service.resolved.rules.len);
+    try testing.expectEqual(@as(u16, upstream_port + 1), service.resolved.rules[0].upstream_addresses[0].port);
+    try testing.expectEqual(@as(usize, 1), service.rules_list.items.len);
+}
+
+test "reload after touching the file still reloads (DNS refresh preserved)" {
+    const port = try freeTcpPort();
+    const upstream_port = try freeTcpPort();
+    var path_buf: [129]u8 = undefined;
+    const path_len = (std.fmt.bufPrint(&path_buf, "/tmp/curtsy_touch_{d}_{d}.yaml", .{ std.os.linux.getpid(), @as(u64, @truncate(monotonicNowNs())) }) catch unreachable).len;
+    path_buf[path_len] = 0;
+    const config_path: [:0]const u8 = path_buf[0..path_len :0];
+    defer _ = linux.unlink(config_path);
+
+    var initial_buf: [512]u8 = undefined;
+    const initial_yaml = std.fmt.bufPrint(&initial_buf,
+        \\logging: {{ level: critical }}
+        \\listen: {{ host: "127.0.0.1", port: {d} }}
+        \\upstream: {{ host: "127.0.0.1", port: {d} }}
+        \\
+    , .{ port, upstream_port }) catch unreachable;
+    try writeTestConfig(config_path, initial_yaml);
+
+    const initial = try resolveYamlForTest(initial_yaml, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null);
+    service.startInitialRules() catch {
+        service.deinit();
+        return error.TestInitialStartFailed;
+    };
+    defer service.deinit();
+
+    // First reload picks up a real change.
+    var changed_buf: [512]u8 = undefined;
+    const changed_yaml = std.fmt.bufPrint(&changed_buf,
+        \\logging: {{ level: critical }}
+        \\listen: {{ host: "127.0.0.1", port: {d} }}
+        \\upstream: {{ host: "127.0.0.1", port: {d} }}
+        \\
+    , .{ port, upstream_port + 1 }) catch unreachable;
+    try writeTestConfig(config_path, changed_yaml);
+    service.reload();
+    try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
+
+    // Rewriting identical content (same size, fresh mtime) is a touch: it must
+    // still trigger a full reload so hostnames are re-resolved on demand. The
+    // stat fingerprint resolves at filesystem timestamp granularity (~1ms on
+    // ext4), so let the file mtime advance beyond the capture before touching.
+    var sleep_ts = linux.timespec{ .sec = 0, .nsec = 5 * 1_000_000 };
+    _ = linux.nanosleep(&sleep_ts, &sleep_ts);
+    try writeTestConfig(config_path, changed_yaml);
+    service.reload();
+    try testing.expectEqual(@as(usize, 2), service.retained_cycles.items.len);
+    try testing.expectEqual(@as(u16, upstream_port + 1), service.resolved.rules[0].upstream_addresses[0].port);
+}
+
+test "coalesceSignals folds duplicate signals into one dispatch decision" {
+    // Multiple HUPs become a single reload.
+    const hups = ForwarderService.coalesceSignals(&.{ linux.SIG.HUP, linux.SIG.HUP, linux.SIG.HUP });
+    try testing.expect(hups.hup);
+    try testing.expect(hups.shutdown == null);
+
+    // A shutdown signal suppresses the reload and keeps the first shutdown
+    // signal as the reason.
+    const shutdown_wins = ForwarderService.coalesceSignals(&.{ linux.SIG.HUP, linux.SIG.TERM });
+    try testing.expect(shutdown_wins.shutdown == linux.SIG.TERM);
+    try testing.expect(shutdown_wins.hup);
+
+    // First shutdown signal wins among shutdown signals.
+    const first_wins = ForwarderService.coalesceSignals(&.{ linux.SIG.TERM, linux.SIG.INT });
+    try testing.expect(first_wins.shutdown == linux.SIG.TERM);
+
+    // Empty batch and unrelated signals stay inert.
+    const empty = ForwarderService.coalesceSignals(&.{});
+    try testing.expect(!empty.hup);
+    try testing.expect(empty.shutdown == null);
+    const pipe_only = ForwarderService.coalesceSignals(&.{ linux.SIG.PIPE });
+    try testing.expect(!pipe_only.hup);
+    try testing.expect(pipe_only.shutdown == null);
 }
 
 /// Writes `text` to `path`, truncating any prior content.

@@ -27,6 +27,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const bpf = @import("../bpf.zig");
 const config = @import("core.zig");
+const performance = @import("performance.zig");
 const upstream = @import("upstream.zig");
 const autotune = @import("../autotune.zig");
 const log = @import("../log.zig");
@@ -404,6 +405,9 @@ pub const TCPListener = struct {
     /// reloads never rebind — the service layer swaps listeners instead).
     listen_addresses: []config.SocketAddr,
     configured_worker_threads: i64,
+    /// CPU affinity for the workers, captured at init; worker-count changes
+    /// require a restart, so the value is fixed for this listener's lifetime.
+    cpu_affinity: performance.CpuAffinity = .none,
 
     workers: []Worker = &.{},
     listen_fds: []fd_t = &.{}, // [worker * listen_addresses.len + address]
@@ -441,6 +445,7 @@ pub const TCPListener = struct {
             .state = .{ .snapshot = snapshot, .accelerator = null },
             .listen_addresses = try allocator.dupe(config.SocketAddr, configuration.listen_addresses),
             .configured_worker_threads = configuration.configuration.runtime.worker_threads,
+            .cpu_affinity = configuration.configuration.performance.thread_cpu_affinity,
             .backlog = std.atomic.Value(i32).init(@intCast(configuration.configuration.limits.tcp_listen_backlog)),
         };
         errdefer allocator.free(self.listen_addresses);
@@ -595,6 +600,7 @@ pub const TCPListener = struct {
                 .listener = self,
                 .index = worker_index,
                 .listen_fds = fds,
+                .cpu_affinity = self.cpu_affinity,
             };
             self.workers[worker_index].epoll_fd = bpf.epollCreate() catch {
                 lastErrno = bpf.lastErrno;
@@ -951,6 +957,9 @@ const Worker = struct {
     listener: *TCPListener,
     index: usize,
     listen_fds: []fd_t,
+    /// CPU affinity captured at spawn time (thread-count changes require a
+    /// restart, so the value is fixed for this worker's lifetime).
+    cpu_affinity: performance.CpuAffinity = .none,
     epoll_fd: fd_t = -1,
     wake_fd: fd_t = -1,
     thread: ?std.Thread = null,
@@ -976,7 +985,43 @@ const Worker = struct {
     /// Data-path accounting incremented on this worker thread; atomics make
     /// the aggregate snapshot readable from any thread.
     counters: TcpWorkerCounters = .{},
+    /// Local accumulation of the hot counters, folded into `counters` once per
+    /// epoll wake by `flushCounters`. The relay hot paths increment these plain
+    /// fields instead of taking a locked RMW per splice or buffered read; the
+    /// atomics still hold the same totals at snapshot time.
+    local_splice_bytes: u64 = 0,
+    local_splice_calls: u64 = 0,
+    local_splice_queued_bytes: u64 = 0,
+    local_buffered_bytes: u64 = 0,
+    local_buffered_calls: u64 = 0,
+    local_sockmap_read_bytes: u64 = 0,
     const wake_tag: u64 = 0;
+
+    /// Fold the per-wake local accumulations into the atomic counter set. Runs
+    /// once per epoll wake on the owning worker thread; rare or once-per-
+    /// connection counters (retired pipe, peer failures, sockmap pairing,
+    /// budget exhaustion) keep their direct fetchAdd because they are far too
+    /// infrequent to matter.
+    fn flushCounters(self: *Worker) void {
+        if (self.local_splice_bytes == 0 and self.local_splice_calls == 0 and
+            self.local_splice_queued_bytes == 0 and self.local_buffered_bytes == 0 and
+            self.local_buffered_calls == 0 and self.local_sockmap_read_bytes == 0)
+        {
+            return;
+        }
+        _ = self.counters.splice_bytes.fetchAdd(self.local_splice_bytes, .monotonic);
+        _ = self.counters.splice_calls.fetchAdd(self.local_splice_calls, .monotonic);
+        _ = self.counters.splice_queued_bytes.fetchAdd(self.local_splice_queued_bytes, .monotonic);
+        _ = self.counters.buffered_bytes.fetchAdd(self.local_buffered_bytes, .monotonic);
+        _ = self.counters.buffered_calls.fetchAdd(self.local_buffered_calls, .monotonic);
+        _ = self.counters.sockmap_read_bytes.fetchAdd(self.local_sockmap_read_bytes, .monotonic);
+        self.local_splice_bytes = 0;
+        self.local_splice_calls = 0;
+        self.local_splice_queued_bytes = 0;
+        self.local_buffered_bytes = 0;
+        self.local_buffered_calls = 0;
+        self.local_sockmap_read_bytes = 0;
+    }
 
     /// Structural splice failure: the shared worker pipe can no longer be
     /// trusted, so it is closed (later connections fall back to the buffered
@@ -1036,6 +1081,13 @@ const Worker = struct {
     }
 
     fn main(self: *Worker) void {
+        // Pin this worker to its affinity CPU before entering the relay loop.
+        // A failed pin is non-fatal: the worker just stays on kernel scheduling.
+        performance.pinThread(self.cpu_affinity, self.index) catch |err| {
+            self.listener.logger.warning("tcp worker cpu affinity failed worker={d} error={s}", .{
+                self.index, @errorName(err),
+            });
+        };
         var events: [max_events_per_wait]linux.epoll_event = undefined;
         var now = monotonicNowNs();
         while (!self.stopping.load(.acquire)) {
@@ -1057,6 +1109,9 @@ const Worker = struct {
             for (events[0..count]) |event| {
                 self.dispatch(event, now);
             }
+            // Fold this wake's local relay accounting into the atomics exactly
+            // once, so the hot path never pays a locked RMW per splice/read.
+            self.flushCounters();
             self.applyCommands();
             self.maybeSweepTimers(now);
             self.freeZombies();
@@ -1270,9 +1325,15 @@ const Worker = struct {
             .connect_ns = state.snapshot.connect_ns,
             .accelerator = state.accelerator,
         };
-        if (client_address) |address| {
-            const text = std.fmt.bufPrint(&connection.client_text, "{f}", .{address}) catch unreachable;
-            connection.client_text_len = text.len;
+        // The client address text is only consumed by debug/err log lines, so
+        // formatting it on every accept is pure waste when neither level is
+        // enabled (e.g. critical). Skip the format then; error paths never
+        // run while err is disabled, so the empty text is never observed.
+        if (listener.logger.isEnabled(.debug) or listener.logger.isEnabled(.err)) {
+            if (client_address) |address| {
+                const text = std.fmt.bufPrint(&connection.client_text, "{f}", .{address}) catch unreachable;
+                connection.client_text_len = text.len;
+            }
         }
 
         // Nonblocking upstream connect with connect_seconds deadline. With a
@@ -1582,8 +1643,8 @@ const Worker = struct {
                 return true;
             }
             batch_bytes += moved;
-            _ = self.counters.splice_calls.fetchAdd(1, .monotonic);
-            _ = self.counters.splice_bytes.fetchAdd(moved, .monotonic);
+            self.local_splice_calls += 1;
+            self.local_splice_bytes += moved;
             connection.last_activity_ns = now;
             if (endpoint.is_client) {
                 connection.bytes_to_upstream += @intCast(moved);
@@ -1658,7 +1719,7 @@ const Worker = struct {
                 }
                 peer.pending.items.len += remaining;
                 peer.budget_bytes += remaining;
-                _ = self.counters.splice_queued_bytes.fetchAdd(remaining, .monotonic);
+                self.local_splice_queued_bytes += remaining;
                 self.updateMask(peer);
                 break;
             }
@@ -1747,8 +1808,8 @@ const Worker = struct {
                 return;
             }
             batch_bytes += count;
-            _ = self.counters.buffered_calls.fetchAdd(1, .monotonic);
-            _ = self.counters.buffered_bytes.fetchAdd(count, .monotonic);
+            self.local_buffered_calls += 1;
+            self.local_buffered_bytes += count;
             connection.last_activity_ns = now;
             if (endpoint.is_client) {
                 connection.bytes_to_upstream += @intCast(count);
@@ -1797,7 +1858,7 @@ const Worker = struct {
                 self.killConnection(connection);
                 return;
             }
-            _ = self.counters.sockmap_read_bytes.fetchAdd(count, .monotonic);
+            self.local_sockmap_read_bytes += count;
             connection.last_activity_ns = now;
             const peer = connection.peerOf(endpoint);
             _ = self.deliver(peer, self.read_buffer[0..count]);
@@ -2065,6 +2126,9 @@ const Worker = struct {
     }
 
     fn teardown(self: *Worker) void {
+        // A final flush preserves any accounting accumulated since the last
+        // epoll wake before the worker's counters are destroyed.
+        self.flushCounters();
         var current = self.connections;
         while (current) |connection| {
             current = connection.next;

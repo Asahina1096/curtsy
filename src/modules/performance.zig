@@ -5,8 +5,21 @@ const std = @import("std");
 const conf = @import("../conf.zig");
 const fw = @import("../module.zig");
 const yaml = @import("../yaml.zig");
+const linux = std.os.linux;
 
 pub const SockmapAccelerationMode = enum { auto, enabled, disabled };
+
+/// How relay threads (TCP workers, UDP I/O engines) are pinned to CPUs.
+/// `none` leaves scheduling to the kernel; `sequential` binds thread i to the
+/// i-th online (allowed) CPU, wrapping; an explicit list binds thread i to
+/// list[i % list.len]. Pinning improves cache locality on multi-core/NUMA
+/// hosts but can hurt on shared machines, so it is opt-in and defaults to
+/// none. The explicit list and the config string live in the cycle arena.
+pub const CpuAffinity = union(enum) {
+    none,
+    sequential,
+    explicit: []const u16,
+};
 
 pub const max_udp_socket_buffer_bytes: i64 = 1 << 28; // 268435456
 // 576 covers the minimum IPv4 MTU; 65536 is the maximum UDP payload size.
@@ -28,6 +41,8 @@ pub const PerformanceConfiguration = struct {
     udp_datagram_buffer_bytes: i64 = default_udp_datagram_buffer_bytes,
     // Zero auto-tunes to the worker thread count.
     udp_io_threads: i64 = 0,
+    /// CPU affinity for relay threads; see `CpuAffinity`. Default: no pinning.
+    thread_cpu_affinity: CpuAffinity = .none,
 };
 
 pub const Conf = PerformanceConfiguration;
@@ -60,11 +75,35 @@ fn decodeSockmapMode(cycle: *conf.Cycle, value: *yaml.Value, path: []const u8) y
         yaml.fail(cycle.gpa, cycle.diag, "{s}: expected one of auto, enabled, disabled", .{path});
 }
 
+fn decodeCpuAffinity(cycle: *conf.Cycle, value: *yaml.Value, path: []const u8) yaml.LoadError!CpuAffinity {
+    switch (value.*) {
+        .scalar => {
+            const text = try yaml.decodeString(cycle.gpa, cycle.diag, value, path);
+            if (std.mem.eql(u8, text, "none")) return .none;
+            if (std.mem.eql(u8, text, "sequential")) return .sequential;
+            return yaml.fail(cycle.gpa, cycle.diag, "{s}: expected none, sequential, or a list of cpu ids", .{path});
+        },
+        .sequence => {
+            const items = value.sequence;
+            const cpus = try cycle.allocator().alloc(u16, items.len);
+            for (items, 0..) |entry, i| {
+                const cpu = try yaml.decodeInt(cycle.gpa, cycle.diag, entry, path);
+                if (cpu < 0) {
+                    return yaml.fail(cycle.gpa, cycle.diag, "{s}[{d}]: cpu ids must be non-negative", .{ path, i });
+                }
+                cpus[i] = @intCast(cpu);
+            }
+            return .{ .explicit = cpus };
+        },
+        else => return yaml.fail(cycle.gpa, cycle.diag, "{s}: expected none, sequential, or a list of cpu ids", .{path}),
+    }
+}
+
 fn setPerformance(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
     const c: *Conf = @ptrCast(@alignCast(slot));
     const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "performance");
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "tcpSockmapAcceleration", "udpSockmapAcceleration", "udpSocketBufferBytes", "udpDatagramBufferBytes", "udpIOThreads" }, "performance");
+    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "tcpSockmapAcceleration", "udpSockmapAcceleration", "udpSocketBufferBytes", "udpDatagramBufferBytes", "udpIOThreads", "threadCpuAffinity" }, "performance");
     if (yaml.mappingGet(map, "tcpSockmapAcceleration")) |v| {
         c.tcp_sockmap_acceleration = try decodeSockmapMode(cycle, v, "performance.tcpSockmapAcceleration");
     }
@@ -79,6 +118,9 @@ fn setPerformance(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path
     }
     const io_threads = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "udpIOThreads", "performance.udpIOThreads", 0);
     c.udp_io_threads = io_threads.value;
+    if (yaml.mappingGet(map, "threadCpuAffinity")) |v| {
+        c.thread_cpu_affinity = try decodeCpuAffinity(cycle, v, "performance.threadCpuAffinity");
+    }
 }
 
 fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
@@ -97,4 +139,134 @@ fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
         yaml.setDiag(cycle.gpa, cycle.diag, "performance.udpDatagramBufferBytes must be between {d} and {d}", .{ min_udp_datagram_buffer_bytes, max_udp_datagram_buffer_bytes });
         return error.InvalidConfiguration;
     }
+    switch (c.thread_cpu_affinity) {
+        .explicit => |list| if (list.len == 0) {
+            yaml.setDiag(cycle.gpa, cycle.diag, "performance.threadCpuAffinity list must not be empty", .{});
+            return error.InvalidConfiguration;
+        },
+        else => {},
+    }
+}
+
+const testing = std.testing;
+
+fn loadPerformanceForTest(text: []const u8) !conf.Cycle {
+    var diag = conf.Diagnostics{};
+    return conf.loadYaml(testing.allocator, text, &diag) catch |err| {
+        if (diag.message) |message| testing.allocator.free(message);
+        return err;
+    };
+}
+
+test "threadCpuAffinity decodes none, sequential and explicit lists" {
+    var cycle = try loadPerformanceForTest(
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\
+    );
+    defer cycle.deinit();
+    try testing.expect(cycle.conf(@This()).thread_cpu_affinity == .none);
+
+    var cycle_seq = try loadPerformanceForTest(
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\performance:
+        \\  threadCpuAffinity: sequential
+        \\
+    );
+    defer cycle_seq.deinit();
+    try testing.expect(cycle_seq.conf(@This()).thread_cpu_affinity == .sequential);
+
+    var cycle_list = try loadPerformanceForTest(
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\performance:
+        \\  threadCpuAffinity: [0, 2, 4]
+        \\
+    );
+    defer cycle_list.deinit();
+    const explicit = cycle_list.conf(@This()).thread_cpu_affinity;
+    try testing.expect(explicit == .explicit);
+    try testing.expectEqualSlices(u16, &.{ 0, 2, 4 }, explicit.explicit);
+}
+
+test "threadCpuAffinity rejects invalid values and empty lists" {
+    var diag = conf.Diagnostics{};
+    try testing.expectError(error.InvalidConfiguration, conf.loadYaml(
+        testing.allocator,
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\performance:
+        \\  threadCpuAffinity: bogus
+        \\
+    , &diag));
+    defer if (diag.message) |message| testing.allocator.free(message);
+
+    var diag_empty = conf.Diagnostics{};
+    try testing.expectError(error.InvalidConfiguration, conf.loadYaml(
+        testing.allocator,
+        \\listen: { port: 9000 }
+        \\upstream: { host: "localhost", port: 9000 }
+        \\performance:
+        \\  threadCpuAffinity: []
+        \\
+    , &diag_empty));
+    defer if (diag_empty.message) |message| testing.allocator.free(message);
+}
+
+test "affinityCpu selects the target cpu per policy" {
+    // none never pins.
+    try testing.expect(affinityCpu(.none, 0, 8) == null);
+    try testing.expect(affinityCpu(.none, 5, 8) == null);
+
+    // sequential wraps over the allowed set.
+    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 0, 8));
+    try testing.expectEqual(@as(?usize, 7), affinityCpu(.sequential, 7, 8));
+    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 8, 8));
+    try testing.expectEqual(@as(?usize, 1), affinityCpu(.sequential, 9, 8));
+    // A one-cpu cpuset pins everything to cpu 0.
+    try testing.expectEqual(@as(?usize, 0), affinityCpu(.sequential, 42, 1));
+
+    // Explicit lists wrap; an empty list is a defensive no-op.
+    const list: []const u16 = &.{ 0, 2, 4 };
+    try testing.expectEqual(@as(?usize, 0), affinityCpu(.{ .explicit = list }, 0, 8));
+    try testing.expectEqual(@as(?usize, 4), affinityCpu(.{ .explicit = list }, 2, 8));
+    try testing.expectEqual(@as(?usize, 2), affinityCpu(.{ .explicit = list }, 4, 8));
+    const empty: []const u16 = &.{};
+    try testing.expect(affinityCpu(.{ .explicit = empty }, 0, 8) == null);
+}
+
+/// Number of CPUs the calling process is currently allowed to run on, from
+/// its own affinity mask (respects cpuset/cgroup restrictions). Returns at
+/// least 1 so `sequential` never divides by zero.
+fn allowedCpuCount() usize {
+    const set = std.posix.sched_getaffinity(std.os.linux.getpid()) catch return 1;
+    return @max(1, linux.CPU_COUNT(set));
+}
+
+/// The CPU selected for the thread at `index` under `affinity`, or null when
+/// no pinning applies. Pure and testable; the syscall lives in `pinThread`.
+pub fn affinityCpu(affinity: CpuAffinity, index: usize, allowed: usize) ?usize {
+    return switch (affinity) {
+        .none => null,
+        .sequential => index % @max(1, allowed),
+        .explicit => |list| if (list.len == 0) null else list[index % list.len],
+    };
+}
+
+/// Pin the calling thread to the CPU selected by `affinity` for the thread at
+/// `index`. No-op for `none`. A cpu beyond the 128-bit `cpu_set_t` range is
+/// skipped (not representable). Returns an error only on a failed
+/// sched_setaffinity syscall; callers treat any failure as non-fatal and
+/// continue unpinned.
+pub fn pinThread(affinity: CpuAffinity, index: usize) !void {
+    const cpu = affinityCpu(affinity, index, allowedCpuCount()) orelse return;
+    if (cpu >= linux.CPU_SETSIZE) return;
+    var set: linux.cpu_set_t = .{0} ** (linux.CPU_SETSIZE / @sizeOf(usize));
+    const word = cpu / @bitSizeOf(usize);
+    const bit = cpu % @bitSizeOf(usize);
+    set[word] |= @as(usize, 1) << @intCast(bit);
+    // gettid() addresses the calling thread; getpid() would touch the main
+    // thread's affinity instead.
+    try linux.sched_setaffinity(linux.gettid(), &set);
 }

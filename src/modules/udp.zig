@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const config = @import("core.zig");
+const performance = @import("performance.zig");
 const upstream = @import("upstream.zig");
 const log = @import("../log.zig");
 const bpf = @import("../bpf.zig");
@@ -583,11 +584,11 @@ pub const UdpListener = struct {
         // The first engine binds the configured addresses; the rest bind the
         // addresses it actually got (relevant when the configured port is 0),
         // sharing each port through SO_REUSEPORT.
-        try self.startEngine(&self.runtime, &.{}, thread_count, true);
+        try self.startEngine(&self.runtime, &.{}, thread_count, true, 0);
         const bound = try self.engines.items[0].engine.localAddressesCopy(self.allocator);
         defer self.allocator.free(bound);
-        for (1..thread_count) |_| {
-            try self.startEngine(null, bound, thread_count, false);
+        for (1..thread_count) |index| {
+            try self.startEngine(null, bound, thread_count, false, @intCast(index));
         }
         if (thread_count > 1) {
             self.log.info("udp relay io_threads={d}", .{thread_count});
@@ -600,6 +601,7 @@ pub const UdpListener = struct {
         listen_addresses: []const SocketAddr,
         engine_count: u32,
         announce_listen: bool,
+        index: u32,
     ) Error!void {
         const slot = try self.allocator.create(EngineSlot);
         errdefer self.allocator.destroy(slot);
@@ -624,6 +626,7 @@ pub const UdpListener = struct {
             &self.budget,
             self.allocator,
             engine_count,
+            index,
             self.enable_sockmap_override,
             self.loader,
             self.loader_context,
@@ -924,6 +927,9 @@ pub const UdpRelayEngine = struct {
     /// Number of engine threads sharing this listener; used to size the
     /// per-engine sockmap so all maps together match the configured limit.
     engine_count: u32,
+    /// Index of this engine among the listener's engine threads; selects the
+    /// affinity CPU when `performance.threadCpuAffinity` is set.
+    engine_index: u32,
     announce_listen: bool,
     enable_sockmap_override: ?bool,
     loader: SockmapRuntimeLoader,
@@ -1002,6 +1008,7 @@ pub const UdpRelayEngine = struct {
         budget: *UdpAssociationBudget,
         allocator: Allocator,
         engine_count: u32,
+        engine_index: u32,
         enable_sockmap_acceleration: ?bool,
         loader: ?SockmapRuntimeLoader,
         loader_context: ?*anyopaque,
@@ -1014,6 +1021,7 @@ pub const UdpRelayEngine = struct {
             .budget = budget,
             .allocator = allocator,
             .engine_count = @max(1, engine_count),
+            .engine_index = engine_index,
             .announce_listen = announce_listen,
             .enable_sockmap_override = enable_sockmap_acceleration,
             .loader = loader orelse default_sockmap_runtime_loader,
@@ -1262,6 +1270,14 @@ pub const UdpRelayEngine = struct {
 
     fn run(self: *UdpRelayEngine) void {
         setThreadName();
+        // Pin this engine to its affinity CPU before the I/O loop. A failed
+        // pin is non-fatal: the engine just stays on kernel scheduling.
+        const affinity = self.runtime.current().configuration.performance.thread_cpu_affinity;
+        performance.pinThread(affinity, self.engine_index) catch |err| {
+            self.log.warning("udp engine cpu affinity failed index={d} error={s}", .{
+                self.engine_index, @errorName(err),
+            });
+        };
         defer self.teardown();
 
         // Slot capacity is configurable: smaller buffers improve cache/TLB
@@ -2453,7 +2469,7 @@ const DrainHarness = struct {
         self.resolved_listen = resolved.listen_addresses;
         self.budget = .{};
         self.runtime = RuntimeConfiguration.init(resolved);
-        self.engine = UdpRelayEngine.init(&self.runtime, &self.logger, &self.budget, testing.allocator, 1, null, null, null, false, null);
+        self.engine = UdpRelayEngine.init(&self.runtime, &self.logger, &self.budget, testing.allocator, 1, 0, null, null, null, false, null);
         for (&self.recv_slots, 0..) |*slot, i| {
             slot.* = .{ .data = self.buffer[i * 16 ..][0..16].ptr, .capacity = 16 };
         }
@@ -2929,6 +2945,7 @@ const PolicyHarness = struct {
             &self.budget,
             testing.allocator,
             1,
+            0,
             null,
             FakeSockmapRuntime.loader,
             &self.fake,
