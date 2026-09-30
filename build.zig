@@ -35,15 +35,10 @@ pub fn build(b: *std.Build) void {
         compileBpfObject(b, local_zig, bpf_target, dependencies.include_dir, "src/ebpf/reuseport.bpf.c", "reuseport"),
         "reuseport.bpf.o",
     );
-    _ = generated_bpf.addCopyFile(
-        compileBpfObject(b, local_zig, bpf_target, dependencies.include_dir, "src/ebpf/observer.bpf.c", "observer"),
-        "observer.bpf.o",
-    );
     const bpf_programs_source = generated_bpf.add("programs.zig",
         \\pub const tcp_sockmap = @embedFile("tcp_sockmap.bpf.o");
         \\pub const udp_sockmap = @embedFile("udp_sockmap.bpf.o");
         \\pub const reuseport = @embedFile("reuseport.bpf.o");
-        \\pub const observer = @embedFile("observer.bpf.o");
         \\
     );
     const bpf_programs_module = b.createModule(.{ .root_source_file = bpf_programs_source });

@@ -70,7 +70,7 @@ Modes:
   --check, --dry-run   Validate environment, print the execution plan and any
                        recommended system settings, then exit (default).
   --run                Execute the benchmark session.
-  --recommend          Read-only per-node system tuning recommendations
+  --recommend          Read-only per-node system recommendations
                        (NIC/IRQ/NUMA/RPS/RSS/sysctl). Never modifies anything.
   -h, --help           Print this help and exit.
 
@@ -935,7 +935,7 @@ do_run() {
 }
 
 do_recommend() {
-    info "recommend mode: read-only system tuning recommendations (nothing is modified)"
+    info "recommend mode: read-only system recommendations (nothing is modified)"
     local node dest remote_tmp
     local -A seen=()
     for node in "$client" "$proxy" "$server"; do

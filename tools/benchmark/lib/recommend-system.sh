@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# recommend-system.sh - read-only system tuning recommendation tool for the
+# recommend-system.sh - read-only system recommendation tool for the
 # Curtsy 25 Gbps benchmark harness (tools/benchmark).
 #
 # Inspects NIC speed/driver/queues, MTU/offloads, NUMA locality, RSS/RPS/XPS,
@@ -47,7 +47,7 @@ usage() {
     cat <<'EOF'
 Usage: recommend-system.sh [options]
 
-Read-only system tuning recommendation tool. Inspects NIC speed/driver/queues,
+Read-only system recommendation tool. Inspects NIC speed/driver/queues,
 MTU/offloads, NUMA locality, RSS/RPS/XPS, IRQ affinities, CPU governor and
 socket/ring limits, then emits machine-readable findings plus explicit
 suggested commands. It NEVER executes any mutating command.

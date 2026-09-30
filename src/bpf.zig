@@ -18,11 +18,9 @@ const embedded_programs = struct {
     const tcp_sockmap = bpf_programs.tcp_sockmap;
     const udp_sockmap = bpf_programs.udp_sockmap;
     const reuseport = bpf_programs.reuseport;
-    const observer = bpf_programs.observer;
 };
 
 const LibbpfObject = opaque {};
-const LibbpfLink = opaque {};
 
 extern fn curtsy_libbpf_open(
     data: *const anyopaque,
@@ -41,13 +39,6 @@ extern fn curtsy_libbpf_program_fd(object: *LibbpfObject, program_name: [*:0]con
 extern fn curtsy_libbpf_has_program(object: *LibbpfObject, program_name: [*:0]const u8) c_int;
 extern fn curtsy_libbpf_program_type(object: *LibbpfObject, program_name: [*:0]const u8) c_int;
 extern fn curtsy_libbpf_dup_program_fd(object: *LibbpfObject, program_name: [*:0]const u8) c_int;
-extern fn curtsy_libbpf_attach_kprobe(
-    object: *LibbpfObject,
-    program_name: [*:0]const u8,
-    function_name: [*:0]const u8,
-    error_out: *c_int,
-) ?*LibbpfLink;
-extern fn curtsy_libbpf_destroy_link(link: *LibbpfLink) void;
 
 pub const fd_t = linux.fd_t;
 pub const socklen_t = linux.socklen_t;
@@ -395,108 +386,6 @@ pub const SockmapRuntime = struct {
         const latest = @max(client_state.last_activity_ns, upstream_state.last_activity_ns);
         const elapsed = if (now_ns >= latest) now_ns - latest else 0;
         return if (elapsed >= idle_timeout_ns) 0 else idle_timeout_ns - elapsed;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// BPF observer: per-process tcp/udp sendmsg/recvmsg kprobe counters
-// ---------------------------------------------------------------------------
-
-const observer_counter_count = 4;
-
-pub const BpfObserver = struct {
-    pub const Counters = struct {
-        tcp_sendmsg: u64 = 0,
-        tcp_recvmsg: u64 = 0,
-        udp_sendmsg: u64 = 0,
-        udp_recvmsg: u64 = 0,
-    };
-
-    object: ?*LibbpfObject,
-    counters_fd: fd_t,
-    links: [observer_counter_count]?*LibbpfLink,
-
-    const functions = [observer_counter_count][:0]const u8{
-        "tcp_sendmsg",
-        "tcp_recvmsg",
-        "udp_sendmsg",
-        "udp_recvmsg",
-    };
-    const programs = [observer_counter_count][:0]const u8{
-        "observe_tcp_sendmsg",
-        "observe_tcp_recvmsg",
-        "observe_udp_sendmsg",
-        "observe_udp_recvmsg",
-    };
-
-    /// Loads one kprobe program per counter and attaches it to the
-    /// matching kernel function on every online CPU, filtered to
-    /// `target_pid`. Fails with an error when lacking privileges or
-    /// kprobe/BPF support.
-    pub fn create(target_pid: u32, verifier_log: ?[]u8) Error!BpfObserver {
-        if (target_pid == 0) return errnoError(.INVAL);
-
-        var observer = BpfObserver{
-            .object = null,
-            .counters_fd = -1,
-            .links = .{ null, null, null, null },
-        };
-        errdefer {
-            const saved = lastErrno;
-            observer.destroy();
-            lastErrno = saved;
-        }
-
-        observer.object = try openBpfObject(embedded_programs.observer, verifier_log);
-        const object = observer.object.?;
-        try libbpfStatus(curtsy_libbpf_set_rodata(object, &target_pid, @sizeOf(u32)));
-        try libbpfStatus(curtsy_libbpf_load(object));
-        observer.counters_fd = try libbpfFd(curtsy_libbpf_map_fd(object, "counters"));
-
-        for (0..observer_counter_count) |i| {
-            var attach_error: c_int = 0;
-            observer.links[i] = curtsy_libbpf_attach_kprobe(
-                object,
-                programs[i],
-                functions[i],
-                &attach_error,
-            ) orelse {
-                if (verifier_log) |log| {
-                    if (log.len > 0) {
-                        const text = std.fmt.bufPrint(log, "stage=kprobe_attach function={s}", .{functions[i]}) catch null;
-                        if (text != null and log.len > 0) {
-                            log[@min(text.?.len, log.len - 1)] = 0;
-                        }
-                    }
-                }
-                return libbpfError(attach_error);
-            };
-        }
-        return observer;
-    }
-
-    pub fn destroy(self: *BpfObserver) void {
-        for (0..observer_counter_count) |i| {
-            if (self.links[i]) |link| curtsy_libbpf_destroy_link(link);
-            self.links[i] = null;
-        }
-        if (self.object) |object| curtsy_libbpf_close(object);
-        self.object = null;
-        self.counters_fd = -1;
-    }
-
-    pub fn read(self: *const BpfObserver) Error!Counters {
-        var values = [4]u64{ 0, 0, 0, 0 };
-        for (0..observer_counter_count) |i| {
-            const key: u32 = @intCast(i);
-            try mapLookup(self.counters_fd, &key, &values[i]);
-        }
-        return .{
-            .tcp_sendmsg = values[0],
-            .tcp_recvmsg = values[1],
-            .udp_sendmsg = values[2],
-            .udp_recvmsg = values[3],
-        };
     }
 };
 
@@ -1391,7 +1280,6 @@ test "sockmap loader rejects invalid arguments without privileges" {
     try testing.expectError(error.Invalid, loadReusePortBpf(0, null));
     try testing.expectError(error.Invalid, SockmapRuntime.createTcp(0, null));
     try testing.expectError(error.Invalid, SockmapRuntime.createUdp(0, null));
-    try testing.expectError(error.Invalid, BpfObserver.create(0, null));
 }
 
 test "embedded BPF ELF objects open through libbpf" {
@@ -1417,13 +1305,6 @@ test "embedded BPF ELF objects open through libbpf" {
         @as(c_int, @intFromEnum(BPF.ProgType.socket_filter)),
         curtsy_libbpf_program_type(reuseport, "reuseport_select"),
     );
-
-    const target_pid: u32 = 1234;
-    const observer = try openBpfObject(embedded_programs.observer, null);
-    defer curtsy_libbpf_close(observer);
-    try libbpfStatus(curtsy_libbpf_set_rodata(observer, &target_pid, @sizeOf(u32)));
-    try libbpfStatus(curtsy_libbpf_has_program(observer, "observe_tcp_sendmsg"));
-    try libbpfStatus(curtsy_libbpf_has_program(observer, "observe_udp_recvmsg"));
 }
 
 /// Loader failures caused by missing privileges are graceful skips in the

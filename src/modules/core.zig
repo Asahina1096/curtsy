@@ -216,117 +216,6 @@ pub const ResolvedForwarder = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Protocol-neutral data-path metrics
-// ---------------------------------------------------------------------------
-
-/// TCP data-path accounting in a protocol-neutral form. The leaf fields mirror
-/// `tcp.TcpDataPathCounters`; the TCP listener adapter translates between the
-/// two (a comptime assertion in tcp.zig keeps the field sets in sync). All
-/// fields are u64 cumulative totals, so the generic counter machinery applies.
-pub const TcpMetrics = struct {
-    /// Bytes moved through the splice(2) zero-copy fast path.
-    splice_bytes: u64 = 0,
-    /// Successful socket->pipe splice calls that moved data.
-    splice_calls: u64 = 0,
-    /// Splice bytes that hit destination backpressure and were copied into the
-    /// budgeted outbound queue.
-    splice_queued_bytes: u64 = 0,
-    /// Connections killed by peer splice errors (EPIPE/ECONNRESET/...).
-    splice_peer_failures: u64 = 0,
-    /// Times a worker splice pipe was retired after a structural failure.
-    splice_pipe_retired: u64 = 0,
-    /// Bytes moved through the pure buffered relay.
-    buffered_bytes: u64 = 0,
-    /// Reads performed by the buffered relay.
-    buffered_calls: u64 = 0,
-    /// Connections paired into the kernel sockmap.
-    sockmap_connections: u64 = 0,
-    /// Sockmap pairing attempts that failed and fell back to the userspace relay.
-    sockmap_pair_failures: u64 = 0,
-    /// Userspace-relayed straggler bytes read on sockmap-mode connections.
-    sockmap_read_bytes: u64 = 0,
-    /// Connections killed when the global userspace buffer budget was exhausted.
-    budget_exhausted: u64 = 0,
-};
-
-/// UDP data-path accounting in a protocol-neutral form, mirroring
-/// `udp.UdpDataPathCounters`.
-pub const UdpMetrics = struct {
-    /// recvmmsg syscalls on the relay engines, including EAGAIN and failures.
-    recv_calls: u64 = 0,
-    /// Datagrams received by the userspace relays.
-    recv_datagrams: u64 = 0,
-    /// Payload bytes received by the userspace relays.
-    recv_bytes: u64 = 0,
-    /// sendmmsg syscalls on the relay engines, including failures.
-    send_calls: u64 = 0,
-    /// Datagrams handed to the kernel by the userspace relays.
-    send_datagrams: u64 = 0,
-    /// Payload bytes handed to the kernel by the userspace relays.
-    send_bytes: u64 = 0,
-    /// Datagrams dropped because a sendmmsg batch could not make progress.
-    send_error_drops: u64 = 0,
-    /// Sockmap pairing attempts (once per association that tried to steer).
-    sockmap_pair_attempts: u64 = 0,
-    /// Sockmap pairings that succeeded (association steered by the kernel).
-    sockmap_pair_successes: u64 = 0,
-    /// Sockmap pairing attempts that failed and fell back to the userspace relay.
-    sockmap_pair_failures: u64 = 0,
-    /// Datagrams relayed by userspace on accelerated client sockets.
-    sockmap_pass_datagrams: u64 = 0,
-    /// Payload bytes of those userspace-relayed accelerated-client datagrams.
-    sockmap_pass_bytes: u64 = 0,
-};
-
-/// Protocol-neutral data-path accounting surfaced through the Listener vtable
-/// and aggregated across every listener of every live rule by the service
-/// layer. Each protocol adapter fills only its protocol half; the other half
-/// stays zero. Every leaf field is a u64 total, so the generic counter
-/// helpers apply unchanged to each half.
-///
-/// Counters are cumulative for a listener generation. A hot reload that
-/// retires a listener and binds a fresh one resets that listener's share to
-/// zero, so an across-snapshot `delta` reports the replacement as zero rather
-/// than a negative number (listeners never underflow).
-pub const MetricsSnapshot = struct {
-    tcp: TcpMetrics = .{},
-    udp: UdpMetrics = .{},
-    pub const zero: MetricsSnapshot = .{ .tcp = .{}, .udp = .{} };
-
-    /// True when every field is zero (used to skip idle metric log lines).
-    pub fn isZero(self: MetricsSnapshot) bool {
-        return isZeroFields(TcpMetrics, self.tcp) and
-            isZeroFields(UdpMetrics, self.udp);
-    }
-
-    /// Element-wise sum; aggregates per-listener snapshots into a
-    /// service-wide snapshot.
-    pub fn add(a: MetricsSnapshot, b: MetricsSnapshot) MetricsSnapshot {
-        return .{
-            .tcp = bpf.counters.add(TcpMetrics, a.tcp, b.tcp),
-            .udp = bpf.counters.add(UdpMetrics, a.udp, b.udp),
-        };
-    }
-
-    /// Saturating per-field difference `current - previous`: a counter that
-    /// wrapped or was reset (a listener replaced by a fresh generation)
-    /// reports zero instead of underflowing.
-    pub fn delta(current: MetricsSnapshot, previous: MetricsSnapshot) MetricsSnapshot {
-        return .{
-            .tcp = bpf.counters.delta(TcpMetrics, current.tcp, previous.tcp),
-            .udp = bpf.counters.delta(UdpMetrics, current.udp, previous.udp),
-        };
-    }
-
-    fn isZeroFields(comptime T: type, value: T) bool {
-        inline for (std.meta.fields(T)) |field| {
-            if (@field(value, field.name) != 0) return false;
-        }
-        return true;
-    }
-};
-
-// ---------------------------------------------------------------------------
 // Protocol module interface (ngx event module analogue)
 // ---------------------------------------------------------------------------
 
@@ -342,9 +231,6 @@ pub const Listener = struct {
     update_backlog_fn: ?*const fn (context: *anyopaque, backlog: i32) anyerror!void,
     force_close_fn: *const fn (context: *anyopaque) void,
     active_count_fn: *const fn (context: *anyopaque) usize,
-    buffered_bytes_fn: *const fn (context: *anyopaque) i64,
-    associations_fn: *const fn (context: *anyopaque) u64,
-    metrics_fn: *const fn (context: *anyopaque) MetricsSnapshot,
     drains_connections: bool = false,
     owner_context: ?*anyopaque = null,
     owner_release_fn: ?*const fn (context: ?*anyopaque) void = null,
@@ -380,20 +266,6 @@ pub const Listener = struct {
         return self.active_count_fn(self.context);
     }
 
-    pub fn bufferedBytesUsed(self: *Listener) i64 {
-        return self.buffered_bytes_fn(self.context);
-    }
-
-    pub fn associationCount(self: *Listener) u64 {
-        return self.associations_fn(self.context);
-    }
-
-    /// Cumulative data-path accounting for this listener generation, safe to
-    /// read from any thread (the adapters snapshot per-worker atomics). Pure
-    /// accounting; it never influences a forwarding decision.
-    pub fn metrics(self: *Listener) MetricsSnapshot {
-        return self.metrics_fn(self.context);
-    }
 };
 
 /// A protocol module registers one entry in fw.protocol_modules; the
@@ -847,7 +719,7 @@ pub const ForwarderService = struct {
         defer _ = linux.close(signal_fd);
 
         self.logger.info(
-            "runtime tuned worker_threads={d} rules={d} tcp_listen_backlog={d} max_tcp_buffered_bytes={d} max_udp_associations={d}",
+            "runtime configured worker_threads={d} rules={d} tcp_listen_backlog={d} max_tcp_buffered_bytes={d} max_udp_associations={d}",
             .{
                 self.worker_threads,
                 self.resolved.rules.len,
@@ -2780,46 +2652,3 @@ fn writeTestConfigOnce(path: []const u8, text: []const u8) !void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Data-path metrics tests
-// ---------------------------------------------------------------------------
-
-test "metrics snapshot zero add delta and isZero" {
-    try testing.expect(MetricsSnapshot.zero.isZero());
-    const empty = MetricsSnapshot{};
-    try testing.expect(empty.isZero());
-
-    // add sums both protocol halves element-wise.
-    const a = MetricsSnapshot{
-        .tcp = .{ .splice_bytes = 10, .splice_calls = 2 },
-        .udp = .{ .recv_calls = 5 },
-    };
-    const b = MetricsSnapshot{
-        .tcp = .{ .splice_bytes = 3 },
-        .udp = .{ .recv_calls = 7, .recv_datagrams = 4 },
-    };
-    const sum = MetricsSnapshot.add(a, b);
-    try testing.expectEqual(@as(u64, 13), sum.tcp.splice_bytes);
-    try testing.expectEqual(@as(u64, 2), sum.tcp.splice_calls);
-    try testing.expectEqual(@as(u64, 12), sum.udp.recv_calls);
-    try testing.expectEqual(@as(u64, 4), sum.udp.recv_datagrams);
-
-    // delta reports only the growth since the previous snapshot; a field that
-    // shrank (wrap or external reset) saturates to zero.
-    const grown = MetricsSnapshot{
-        .tcp = .{ .splice_bytes = 17 },
-        .udp = .{ .recv_datagrams = 10 },
-    };
-    const d = MetricsSnapshot.delta(grown, a);
-    try testing.expectEqual(@as(u64, 7), d.tcp.splice_bytes);
-    try testing.expectEqual(@as(u64, 0), d.tcp.splice_calls);
-    try testing.expectEqual(@as(u64, 0), d.udp.recv_calls);
-    try testing.expectEqual(@as(u64, 10), d.udp.recv_datagrams);
-    try testing.expect(!d.isZero());
-
-    // A listener replaced by a fresh generation starts at zero: the delta
-    // saturates to zero instead of underflowing, and isZero flags the result.
-    const replaced = MetricsSnapshot{ .tcp = .{ .splice_bytes = 0 } };
-    try testing.expect(MetricsSnapshot.delta(replaced, a).isZero());
-    try testing.expect(MetricsSnapshot.delta(a, a).isZero());
-}

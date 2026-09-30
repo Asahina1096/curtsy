@@ -681,11 +681,6 @@ pub const UdpListener = struct {
         if (self.engines.items.len == 0) return allocator.alloc(SocketAddr, 0);
         return self.engines.items[0].engine.localAddressesCopy(allocator);
     }
-
-    pub fn associationCount(self: *const UdpListener) u64 {
-        return self.budget.count();
-    }
-
     /// Aggregate data-path counters across all engines. Each engine's atomic
     /// counters are loaded and summed, so the snapshot is safe to read from
     /// any thread; before start() (no engines) it is all zeros.
@@ -761,9 +756,6 @@ fn createProtocolListener(
         .update_backlog_fn = null,
         .force_close_fn = listenerNoopForceClose,
         .active_count_fn = listenerZeroActive,
-        .buffered_bytes_fn = listenerZeroBuffered,
-        .associations_fn = listenerAssociations,
-        .metrics_fn = listenerMetrics,
     };
     return wrapper;
 }
@@ -797,39 +789,6 @@ fn listenerNoopForceClose(context: *anyopaque) void {
 fn listenerZeroActive(context: *anyopaque) usize {
     _ = context;
     return 0;
-}
-
-fn listenerZeroBuffered(context: *anyopaque) i64 {
-    _ = context;
-    return 0;
-}
-
-fn listenerAssociations(context: *anyopaque) u64 {
-    const listener: *UdpListener = @ptrCast(@alignCast(context));
-    return listener.associationCount();
-}
-
-comptime {
-    // Every data-path counter must be surfaced in the protocol-neutral metric
-    // type; the reverse direction is enforced by the translation loop below.
-    for (std.meta.fields(UdpDataPathCounters)) |field| {
-        if (!@hasField(config.UdpMetrics, field.name)) {
-            @compileError("UdpDataPathCounters field " ++ field.name ++ " is missing from config.UdpMetrics");
-        }
-    }
-}
-
-/// Translate the listener's cumulative counters into the protocol-neutral
-/// metrics snapshot. The field sets mirror each other, so the mapping is
-/// mechanical and kept in sync by the comptime check above.
-fn listenerMetrics(context: *anyopaque) config.MetricsSnapshot {
-    const listener: *UdpListener = @ptrCast(@alignCast(context));
-    const counters = listener.countersSnapshot();
-    var udp: config.UdpMetrics = undefined;
-    inline for (std.meta.fields(config.UdpMetrics)) |field| {
-        @field(udp, field.name) = @field(counters, field.name);
-    }
-    return .{ .tcp = .{}, .udp = udp };
 }
 
 // ---------------------------------------------------------------------------
@@ -3077,9 +3036,9 @@ test "udp auto reload: unchanged eligible auto keeps the adaptive runtime active
 
     // A routine limits-only auto reload must not tear
     // acceleration down: the runtime and active policy are preserved.
-    var tuned = engine.runtime.current();
-    tuned.configuration.limits.max_udp_associations = 512;
-    engine.runtime.update(tuned);
+    var updated = engine.runtime.current();
+    updated.configuration.limits.max_udp_associations = 512;
+    engine.runtime.update(updated);
     engine.reloadAccelerator();
 
     try testing.expect(engine.sockmap_runtime != null);
@@ -3298,7 +3257,7 @@ test "udp sockmap end-to-end with real BPF (gated: CURTSY_ENABLE_EBPF_TESTS)" {
     const client = try udpClient();
     defer closeFd(client);
     try testing.expect(try waitForEcho(client, port, "bpf-e2e", 2_000));
-    try testing.expectEqual(@as(u64, 1), listener.associationCount());
+    try testing.expectEqual(@as(u64, 1), listener.budget.count());
 
     // enabled -> auto reload must tear the runtime down and keep relaying
     // through the userspace path without crashing.
@@ -3310,7 +3269,7 @@ test "udp sockmap end-to-end with real BPF (gated: CURTSY_ENABLE_EBPF_TESTS)" {
     const settled = struct {
         var listener_ptr: *UdpListener = undefined;
         fn check() bool {
-            return listener_ptr.associationCount() <= 1;
+            return listener_ptr.budget.count() <= 1;
         }
     };
     settled.listener_ptr = &listener;
@@ -3527,35 +3486,6 @@ test "udp listener counters snapshot is all zeros before start" {
     try testing.expectEqual(@as(u64, 0), snapshot.send_datagrams);
     try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pair_attempts);
     try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pass_datagrams);
-}
-
-test "udp vtable metrics translation maps engine counters into the neutral snapshot" {
-    var logger = LogStore.init("critical");
-    const resolved = try makeUdpTestResolved(testing.allocator, 9);
-    defer testing.allocator.free(resolved.listen_addresses);
-
-    var listener = UdpListener.init(testing.allocator, resolved, &logger, false, null);
-    defer listener.deinit();
-    try listener.start();
-
-    // An idle listener translates to an all-zero snapshot.
-    var metrics = listenerMetrics(&listener);
-    try testing.expectEqual(@as(u64, 0), metrics.udp.recv_calls);
-    try testing.expect(std.meta.eql(metrics.tcp, config.TcpMetrics{}));
-
-    // Drive a few engine counters and confirm they land in the right fields.
-    _ = listener.engines.items[0].engine.counters.recv_calls.fetchAdd(3, .monotonic);
-    _ = listener.engines.items[0].engine.counters.recv_datagrams.fetchAdd(11, .monotonic);
-    _ = listener.engines.items[0].engine.counters.send_error_drops.fetchAdd(1, .monotonic);
-    _ = listener.engines.items[0].engine.counters.sockmap_pair_successes.fetchAdd(5, .monotonic);
-
-    metrics = listenerMetrics(&listener);
-    try testing.expectEqual(@as(u64, 3), metrics.udp.recv_calls);
-    try testing.expectEqual(@as(u64, 11), metrics.udp.recv_datagrams);
-    try testing.expectEqual(@as(u64, 1), metrics.udp.send_error_drops);
-    try testing.expectEqual(@as(u64, 5), metrics.udp.sockmap_pair_successes);
-    // The TCP half of a UDP listener stays untouched.
-    try testing.expect(std.meta.eql(metrics.tcp, config.TcpMetrics{}));
 }
 
 test "udp counters track userspace batches and sockmap steering with a fake runtime" {

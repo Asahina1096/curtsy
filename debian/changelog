@@ -36,7 +36,7 @@ curtsy (0.3.2) noble; urgency=medium
   * Close the enabled-to-auto reload race: a reload that disallows UDP
     sockmap synchronously blocks new associations from entering sockmap
     while the async teardown command is pending, and an unchanged eligible
-    auto reload (e.g. a tuning-daemon limits tick) preserves the loaded
+    auto reload preserves the loaded
     adaptive runtime and policy instead of tearing acceleration down.
   * Make hot reload transactional: every fallible change for every rule
     (new rules, upstream generations, listeners for added protocols,
@@ -71,8 +71,7 @@ curtsy (0.3.1) noble; urgency=medium
       per-wake timestamp reuse, pointer-based association access, faster
       SocketAddr hashing, pre-sized session maps, rate-limited drop logs,
       and a cooldown after sockmap pairing failures.
-    - Logging now emits one write syscall per line; the tuning daemon
-      loads its kprobe observer only when a limit is auto-tuned.
+    - Logging now emits one write syscall per line.
   * Add performance.udpDatagramBufferBytes to size the batched UDP
     receive slots (576..65536, default 65536).
   * Build for the architecture baseline CPU by default; pass
@@ -86,23 +85,6 @@ curtsy (0.3.0) noble; urgency=medium
   * Build and test the package with zig build.
 
  -- Curtsy contributors <maintainers@example.invalid>  Thu, 30 Jul 2026 00:00:00 +0000
-
-curtsy (0.2.2) unstable; urgency=medium
-
-  * Report the failing stage in the tuning daemon eBPF observer warning
-    (kprobe attach vs program load) to make deployment diagnostics
-    unambiguous.
-
- -- Curtsy contributors <maintainers@example.invalid>  Wed, 29 Jul 2026 17:25:10 +0000
-
-curtsy (0.2.1) unstable; urgency=medium
-
-  * Fix tuning daemon eBPF observer never loading: correct an off-by-one
-    jump offset that made the verifier reject the kprobe programs, and
-    attach the kprobe PMU events per online CPU (perf_event_open rejects
-    pid == -1 with cpu == -1).
-
- -- Curtsy contributors <maintainers@example.invalid>  Wed, 29 Jul 2026 17:15:30 +0000
 
 curtsy (0.2.0) unstable; urgency=medium
 

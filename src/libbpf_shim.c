@@ -119,27 +119,3 @@ int curtsy_libbpf_dup_program_fd(struct bpf_object *object, const char *program_
     int duplicate = fcntl(program_fd, F_DUPFD_CLOEXEC, 0);
     return duplicate < 0 ? -errno : duplicate;
 }
-
-struct bpf_link *curtsy_libbpf_attach_kprobe(
-    struct bpf_object *object,
-    const char *program_name,
-    const char *function_name,
-    int *error_out
-) {
-    struct bpf_program *program = bpf_object__find_program_by_name(object, program_name);
-    if (program == NULL) {
-        if (error_out != NULL)
-            *error_out = -ENOENT;
-        return NULL;
-    }
-
-    struct bpf_link *link = bpf_program__attach_kprobe(program, false, function_name);
-    int error = pointer_error(link);
-    if (error_out != NULL)
-        *error_out = error;
-    return error == 0 ? link : NULL;
-}
-
-void curtsy_libbpf_destroy_link(struct bpf_link *link) {
-    bpf_link__destroy(link);
-}

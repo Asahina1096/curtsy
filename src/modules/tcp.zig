@@ -681,11 +681,6 @@ pub const TCPListener = struct {
         return self.active_connections.load(.acquire);
     }
 
-    /// Queued userspace relay bytes.
-    pub fn bufferedBytesUsed(self: *const TCPListener) i64 {
-        return self.budget.used();
-    }
-
     /// Aggregate data-path counters across all workers. Each worker's atomic
     /// counters are loaded and summed, so the snapshot is safe to read from
     /// any thread; before start() (no workers) it is all zeros.
@@ -846,9 +841,6 @@ fn createProtocolListener(
         .update_backlog_fn = listenerUpdateBacklog,
         .force_close_fn = listenerForceClose,
         .active_count_fn = listenerActiveCount,
-        .buffered_bytes_fn = listenerBufferedBytes,
-        .associations_fn = listenerZeroAssociations,
-        .metrics_fn = listenerMetrics,
     };
     return wrapper;
 }
@@ -888,39 +880,6 @@ fn listenerForceClose(context: *anyopaque) void {
 fn listenerActiveCount(context: *anyopaque) usize {
     const listener: *TCPListener = @ptrCast(@alignCast(context));
     return listener.activeConnectionCount();
-}
-
-fn listenerBufferedBytes(context: *anyopaque) i64 {
-    const listener: *TCPListener = @ptrCast(@alignCast(context));
-    return listener.bufferedBytesUsed();
-}
-
-fn listenerZeroAssociations(context: *anyopaque) u64 {
-    _ = context;
-    return 0;
-}
-
-comptime {
-    // Every data-path counter must be surfaced in the protocol-neutral metric
-    // type; the reverse direction is enforced by the translation loop below.
-    for (std.meta.fields(TcpDataPathCounters)) |field| {
-        if (!@hasField(config.TcpMetrics, field.name)) {
-            @compileError("TcpDataPathCounters field " ++ field.name ++ " is missing from config.TcpMetrics");
-        }
-    }
-}
-
-/// Translate the listener's cumulative counters into the protocol-neutral
-/// metrics snapshot. The field sets mirror each other, so the mapping is
-/// mechanical and kept in sync by the comptime check above.
-fn listenerMetrics(context: *anyopaque) config.MetricsSnapshot {
-    const listener: *TCPListener = @ptrCast(@alignCast(context));
-    const counters = listener.countersSnapshot();
-    var tcp: config.TcpMetrics = undefined;
-    inline for (std.meta.fields(config.TcpMetrics)) |field| {
-        @field(tcp, field.name) = @field(counters, field.name);
-    }
-    return .{ .tcp = tcp, .udp = .{} };
 }
 
 // ---------------------------------------------------------------------------
@@ -2730,7 +2689,7 @@ test "tcp echo roundtrip" {
     try testing.expectEqualStrings("hello curtsy", &received);
 
     // No relay bytes may remain queued once the echo returned.
-    try testing.expectEqual(@as(i64, 0), listener.bufferedBytesUsed());
+    try testing.expectEqual(@as(i64, 0), listener.budget.used());
 
     listener.stopAccepting();
     try testing.expectEqual(@as(usize, 0), listener.listenerSocketCount());
@@ -2820,7 +2779,7 @@ test "tcp large transfer completes through batched flushes" {
         try readFully(client, recv_buf);
         try testing.expect(std.mem.allEqual(u8, recv_buf, 0xa5));
     }
-    try testing.expectEqual(@as(i64, 0), listener.bufferedBytesUsed());
+    try testing.expectEqual(@as(i64, 0), listener.budget.used());
 }
 
 test "tcp splice relay sustains a large transfer" {
@@ -2874,7 +2833,7 @@ test "tcp splice relay sustains a large transfer" {
 
     try readFully(client, recv_buf);
     try testing.expect(std.mem.allEqual(u8, recv_buf, 0x5c));
-    try testing.expectEqual(@as(i64, 0), listener.bufferedBytesUsed());
+    try testing.expectEqual(@as(i64, 0), listener.budget.used());
     writer.join();
 }
 
@@ -3420,39 +3379,6 @@ test "tcp counters snapshot is all zeros before start" {
     try testing.expectEqual(@as(u64, 0), snapshot.sockmap_pair_failures);
     try testing.expectEqual(@as(u64, 0), snapshot.sockmap_read_bytes);
     try testing.expectEqual(@as(u64, 0), snapshot.budget_exhausted);
-}
-
-test "tcp vtable metrics translation maps worker counters into the neutral snapshot" {
-    var logger = log.LogStore.init("critical");
-    const resolved = try makeTestResolved(testing.allocator, 9);
-    defer testing.allocator.free(resolved.listen_addresses);
-
-    var listener = try TCPListener.init(resolved, &logger, .{
-        .worker_threads = 1,
-        .enable_sockmap_acceleration = false,
-    });
-    defer listener.deinit();
-    try listener.start();
-
-    // An untouched listener translates to an all-zero snapshot.
-    var metrics = listenerMetrics(&listener);
-    try testing.expectEqual(@as(u64, 0), metrics.tcp.splice_bytes);
-    try testing.expectEqual(@as(u64, 0), metrics.tcp.splice_calls);
-    try testing.expect(std.meta.eql(metrics.udp, config.UdpMetrics{}));
-
-    // Drive a few worker counters and confirm they land in the right fields.
-    _ = listener.workers[0].counters.splice_bytes.fetchAdd(1_024, .monotonic);
-    _ = listener.workers[0].counters.splice_calls.fetchAdd(4, .monotonic);
-    _ = listener.workers[0].counters.sockmap_pair_failures.fetchAdd(2, .monotonic);
-    _ = listener.workers[0].counters.budget_exhausted.fetchAdd(1, .monotonic);
-
-    metrics = listenerMetrics(&listener);
-    try testing.expectEqual(@as(u64, 1_024), metrics.tcp.splice_bytes);
-    try testing.expectEqual(@as(u64, 4), metrics.tcp.splice_calls);
-    try testing.expectEqual(@as(u64, 2), metrics.tcp.sockmap_pair_failures);
-    try testing.expectEqual(@as(u64, 1), metrics.tcp.budget_exhausted);
-    // The UDP half of a TCP listener stays untouched.
-    try testing.expect(std.meta.eql(metrics.udp, config.UdpMetrics{}));
 }
 
 test "tcp counters account every relayed byte on exactly one path" {

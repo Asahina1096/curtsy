@@ -8,7 +8,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透�
 
 - 语言与工具链：仓库内 `.toolchain` 固定 Zig 0.16.0 和 libbpf/libelf/zlib/zstd 静态依赖；eBPF 内核程序位于 `src/ebpf/*.bpf.c`，由 Zig 发行包内置的 Clang 前端在构建期编译为标准 BPF ELF。正常构建不从 PATH、`/usr/include` 或 `/usr/lib` 解析依赖。用户态代码无条件使用 Linux syscall、epoll、eventfd、signalfd、recvmmsg/sendmmsg 与 eBPF API，不保留其他平台的编译期回退。
 - 关键配置清单：`build.zig`（构建定义）、`config.example.yaml`（配置示例）。
-- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.3）；`debian/` 目录提供 Debian 打包元数据（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`/`CAP_NET_BIND_SERVICE` 最小权限运行）。打包统一入口是 `tools/build-deb.sh`，最终产物（`.deb`/`.changes`/`.buildinfo`）落在仓库内 `dist/debian/`。
+- 运行时产物：单一可执行文件 `curtsy`（当前版本 0.3.3）；`debian/` 目录提供 Debian 打包元数据（含 `debian/curtsy.service` systemd 单元，以 `DynamicUser` + `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_NET_BIND_SERVICE` 最小权限运行）。打包统一入口是 `tools/build-deb.sh`，最终产物（`.deb`/`.changes`/`.buildinfo`）落在仓库内 `dist/debian/`。
 
 ## 构建与测试命令
 
@@ -36,7 +36,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透�
 - `src/net.zig`：`SocketAddr`、resolver（可注入测试）、listen 地址展开（`*` → 双栈通配对）、协议列表助手。
 - `src/log.zig`：带原子阈值和 futex mutex 的日志门面，输出到 stderr。
 - `src/bpf.zig`：eBPF/syscall 运行时封装，负责使用 libbpf 打开内嵌 BPF ELF、配置 map/只读常量、取得 FD、管理 link/object 生命周期，以及 sockhash 操作、UDP 批量 I/O 和 Linux socket/epoll/eventfd helper。
-- `src/ebpf/`：C 编写的 eBPF 内核程序，包括 SK_SKB parser/verdict、reuseport 分流程序和 kprobe observer；Clang 产出的 ELF（含 BTF/重定位）嵌入 `curtsy`，运行时由 libbpf 加载。
+- `src/ebpf/`：C 编写的 eBPF 内核程序，包括 SK_SKB parser/verdict 和 reuseport 分流程序；Clang 产出的 ELF（含 BTF/重定位）嵌入 `curtsy`，运行时由 libbpf 加载。
 - `src/libbpf_shim.c`：隔离 Zig 与 libbpf C API 的薄封装，避免在 Zig 侧复制 libbpf 结构布局。
 
 模块（src/modules/）：

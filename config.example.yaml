@@ -113,6 +113,5 @@ upstream:
 # for the whole machine instead of relying on the built-in per-instance
 # defaults.
 #
-# eBPF: observer kprobes are filtered by the instance's own pid and sockmap /
-# reuseport programs are loaded per process/socket, so multiple instances
-# coexist without kernel-level conflicts.
+# eBPF: sockmap and reuseport programs are loaded per process/socket, so
+# multiple instances coexist without kernel-level conflicts.

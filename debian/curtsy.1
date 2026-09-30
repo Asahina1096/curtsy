@@ -91,7 +91,7 @@ listen address:port; set a fixed
 .B User=
 to share a port across instances. Shared ports are an intentional scale-out,
 not automatic conflict detection. Each instance loads its own eBPF programs
-(observer kprobes, sockmap, reuseport), so multiple instances coexist without
+(sockmap, reuseport), so multiple instances coexist without
 kernel conflicts.
 .SH FILES
 .TP
