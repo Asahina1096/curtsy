@@ -190,7 +190,7 @@ pub const PreparedGeneration = struct {
 pub const UpstreamPool = struct {
     allocator: Allocator,
     /// Readers only load this pointer. Published generations stay alive until
-    /// deinit, matching the service's retained-cycle lifetime across reloads.
+    /// deinit, matching the service's retained-cfg lifetime across reloads.
     generation: std.atomic.Value(*Generation),
     /// Written only by the configuration thread.
     retired: ?*Generation = null,

@@ -24,12 +24,11 @@
 //!     protocols=NAME[,NAME...]           optional
 //!     balance=NAME                       optional
 //!
-//! The Configuration is arena-owned (like conf.Cycle): every parsed string is
+//! The Configuration is arena-owned (like conf.Configuration): every parsed string is
 //! stored in an embedded arena and released by deinit.
 
 const std = @import("std");
 const conf = @import("../conf.zig");
-const fw = @import("../module.zig");
 const net = @import("../net.zig");
 const upstream = @import("upstream.zig");
 const yaml = @import("../yaml.zig");
@@ -63,13 +62,6 @@ pub const Configuration = struct {
     pub fn deinit(self: *Configuration) void {
         self.arena.deinit();
     }
-};
-
-/// Register the module in fw.module_types. It declares no directives and no
-/// conf hooks: the module is inert unless the command line actually carries
-/// CLI endpoint flags, which is what "disabled by default" means here.
-pub const module: fw.Module = .{
-    .name = "cli",
 };
 
 /// Parse the CLI endpoint flags into a Configuration. Returns null when no
@@ -137,7 +129,7 @@ pub fn parseFlags(
 }
 
 /// Render the configuration as a `rules:` YAML document. The output is owned
-/// by `out` and is later copied into the cycle arena by conf.loadYaml, so the
+/// by `out` and is later copied into the cfg arena by conf.loadYaml, so the
 /// buffer only needs to outlive this call.
 pub fn renderYaml(config: *const Configuration, out: *std.ArrayList(u8), gpa: Allocator) error{OutOfMemory}!void {
     try out.appendSlice(gpa, "rules:\n");
@@ -168,11 +160,11 @@ pub fn renderYaml(config: *const Configuration, out: *std.ArrayList(u8), gpa: Al
     }
 }
 
-/// Build a fully validated configuration cycle from the parsed CLI flags,
+/// Build a fully validated configuration from the parsed CLI flags,
 /// mirroring conf.loadFile for the file-based running mode. The engine dupes
-/// the rendered document into the cycle arena, so the temporary buffer is
+/// the rendered document into the cfg arena, so the temporary buffer is
 /// freed here.
-pub fn loadCycle(gpa: Allocator, config: *const Configuration, diag: *conf.Diagnostics) conf.LoadError!conf.Cycle {
+pub fn loadCycle(gpa: Allocator, config: *const Configuration, diag: *conf.Diagnostics) conf.LoadError!conf.Configuration {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try renderYaml(config, &out, gpa);
@@ -576,11 +568,11 @@ test "cli configuration decodes through the engine like the rules module" {
     defer config.deinit();
     var diag = conf.Diagnostics{};
     defer if (diag.message) |message| testing.allocator.free(message);
-    var cycle = try loadCycle(testing.allocator, &config, &diag);
-    defer cycle.deinit();
-    try testing.expect(cycle.rules_mode);
+    var cfg = try loadCycle(testing.allocator, &config, &diag);
+    defer cfg.deinit();
+    try testing.expect(cfg.rules_mode);
 
-    const decoded = rules.rulesList(&cycle);
+    const decoded = rules.rulesList(&cfg);
     try testing.expectEqual(@as(usize, 1), decoded.len);
     try testing.expectEqualStrings("*", decoded[0].listen.host);
     try testing.expectEqual(9_000, decoded[0].listen.port);
@@ -602,9 +594,9 @@ test "multi-rule cli configuration decodes weights through the engine" {
     defer config.deinit();
     var diag = conf.Diagnostics{};
     defer if (diag.message) |message| testing.allocator.free(message);
-    var cycle = try loadCycle(testing.allocator, &config, &diag);
-    defer cycle.deinit();
-    const decoded = rules.rulesList(&cycle);
+    var cfg = try loadCycle(testing.allocator, &config, &diag);
+    defer cfg.deinit();
+    const decoded = rules.rulesList(&cfg);
     try testing.expectEqual(@as(usize, 1), decoded.len);
     try testing.expectEqual(@as(usize, 2), decoded[0].upstreams.len);
     try testing.expectEqual(1, decoded[0].upstreams[0].weight);

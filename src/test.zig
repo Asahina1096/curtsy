@@ -10,7 +10,6 @@ test {
     _ = @import("main.zig");
     _ = @import("net.zig");
     _ = @import("yaml.zig");
-    _ = @import("module.zig");
     _ = @import("conf.zig");
     _ = @import("modules/core.zig");
     _ = @import("log.zig");

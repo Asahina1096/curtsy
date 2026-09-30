@@ -1,8 +1,8 @@
-//! rules module: owns the `rules` directive (root context) and the
-//! rule-context endpoint directives (listen / upstreams / protocols /
-//! balance inside a rules[] entry).
+//! rules section: owns the `rules` key (root context) and the rule-level
+//! endpoint keys (listen / upstreams / protocols / balance inside a
+//! `rules[]` entry).
 //!
-//! The root directive only records the raw node and flips the cycle to
+//! The root directive only records the raw node and flips the cfg to
 //! rules mode; the finalize hook then opens a nested rule scope per entry
 //! (conf.beginRule), dispatches the entry's keys to every module with a
 //! rule context (timeouts/limits overrides land in their own confs) and
@@ -11,7 +11,6 @@
 
 const std = @import("std");
 const conf = @import("../conf.zig");
-const fw = @import("../module.zig");
 const limits = @import("limits.zig");
 const net = @import("../net.zig");
 const timeouts = @import("timeouts.zig");
@@ -53,131 +52,93 @@ pub const RuleConf = struct {
     balance_name: ?[]const u8 = null,
 };
 
-pub const module: fw.Module = .{
-    .name = "rules",
-    .directives = &directives,
-    .create_conf = createConf,
-    .create_rule_conf = createRuleConf,
-    .finalize = finalize,
-    .validate = validate,
-};
-
-const directives = [_]fw.Directive{
-    .{ .name = "rules", .root = true, .set = setRules },
-    .{ .name = "listen", .rule = true, .set = setRuleListen },
-    .{ .name = "upstreams", .rule = true, .set = setRuleUpstreams },
-    .{ .name = "protocols", .rule = true, .set = setRuleProtocols },
-    .{ .name = "balance", .rule = true, .set = setRuleBalance },
-};
-
-/// Decoded rules of the current cycle (empty outside rules mode).
-pub fn rulesList(cycle: *conf.Cycle) []RuleConfiguration {
-    return cycle.conf(@This()).rules;
+/// Decoded rules of the current cfg (empty outside rules mode).
+pub fn rulesList(cfg: *conf.Configuration) []RuleConfiguration {
+    return cfg.rules.rules;
 }
 
 /// Shared protocols sequence decoder; used by the core
 /// module for the root directive and by this module for rule overrides.
-pub fn decodeProtocols(cycle: *conf.Cycle, value: *yaml.Value) yaml.LoadError![]net.ForwardProtocol {
+pub fn decodeProtocols(cfg: *conf.Configuration, value: *yaml.Value) yaml.LoadError![]net.ForwardProtocol {
     if (value.* != .sequence) {
-        return yaml.fail(cycle.gpa, cycle.diag, "protocols: expected a sequence", .{});
+        return yaml.fail(cfg.gpa, cfg.diag, "protocols: expected a sequence", .{});
     }
     var protocols: std.ArrayList(net.ForwardProtocol) = .empty;
     for (value.sequence) |item| {
         if (item.* != .scalar) {
-            return yaml.fail(cycle.gpa, cycle.diag, "protocols: expected a sequence of names", .{});
+            return yaml.fail(cfg.gpa, cfg.diag, "protocols: expected a sequence of names", .{});
         }
         const text = item.scalar.text;
         if (!net.validProtocolName(text)) return yaml.fail(
-            cycle.gpa,
-            cycle.diag,
+            cfg.gpa,
+            cfg.diag,
             "protocols: invalid protocol name '{s}'",
             .{text},
         );
-        try protocols.append(cycle.allocator(), net.ForwardProtocol.fromName(text));
+        try protocols.append(cfg.allocator(), net.ForwardProtocol.fromName(text));
     }
-    return protocols.toOwnedSlice(cycle.allocator());
+    return protocols.toOwnedSlice(cfg.allocator());
 }
 
-fn createConf(cycle: *conf.Cycle) error{OutOfMemory}!*anyopaque {
-    const c = try cycle.allocator().create(Conf);
-    c.* = .{};
-    return c;
-}
-
-fn createRuleConf(cycle: *conf.Cycle) error{OutOfMemory}!?*anyopaque {
-    const c = try cycle.allocator().create(RuleConf);
-    c.* = .{};
-    return c;
-}
-
-fn setRules(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+pub fn setRuleListen(cfg: *conf.Configuration, oc: *RuleConf, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+    _ = cfg;
     _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
-    c.rules_node = value;
-    conf.enterRulesMode(cycle);
-}
-
-fn setRuleListen(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
-    _ = cycle;
-    _ = path;
-    const c: *RuleConf = @ptrCast(@alignCast(slot));
+    const c = oc;
     c.listen_node = value;
 }
 
-fn setRuleUpstreams(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
-    _ = cycle;
+pub fn setRuleUpstreams(cfg: *conf.Configuration, oc: *RuleConf, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+    _ = cfg;
     _ = path;
-    const c: *RuleConf = @ptrCast(@alignCast(slot));
+    const c = oc;
     c.upstreams_node = value;
 }
 
-fn setRuleProtocols(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+pub fn setRuleProtocols(cfg: *conf.Configuration, oc: *RuleConf, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
-    const c: *RuleConf = @ptrCast(@alignCast(slot));
-    c.protocols = try decodeProtocols(cycle, value);
+    const c = oc;
+    c.protocols = try decodeProtocols(cfg, value);
 }
 
-fn setRuleBalance(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
-    const c: *RuleConf = @ptrCast(@alignCast(slot));
+pub fn setRuleBalance(cfg: *conf.Configuration, oc: *RuleConf, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+    const c = oc;
     var path_buf: [80]u8 = undefined;
     const balance_path = std.fmt.bufPrint(&path_buf, "{s}.balance", .{path}) catch "rules.balance";
-    const text = try yaml.decodeString(cycle.gpa, cycle.diag, value, balance_path);
+    const text = try yaml.decodeString(cfg.gpa, cfg.diag, value, balance_path);
     c.balance_name = text;
     c.balance = upstream.balancerByName(text);
 }
 
-fn finalize(cycle: *conf.Cycle) yaml.LoadError!void {
-    const c = cycle.conf(@This());
+pub fn finalize(cfg: *conf.Configuration) yaml.LoadError!void {
+    const c = &cfg.rules;
     const node = c.rules_node orelse return;
     if (node.* != .sequence) {
-        return yaml.fail(cycle.gpa, cycle.diag, "rules: expected a sequence", .{});
+        return yaml.fail(cfg.gpa, cfg.diag, "rules: expected a sequence", .{});
     }
     var decoded: std.ArrayList(RuleConfiguration) = .empty;
     for (node.sequence, 0..) |item, i| {
-        try decoded.append(cycle.allocator(), try decodeRule(cycle, item, i));
+        try decoded.append(cfg.allocator(), try decodeRule(cfg, item, i));
     }
-    c.rules = try decoded.toOwnedSlice(cycle.allocator());
+    c.rules = try decoded.toOwnedSlice(cfg.allocator());
 }
 
-fn decodeRule(cycle: *conf.Cycle, item: *yaml.Value, index: usize) yaml.LoadError!RuleConfiguration {
+pub fn decodeRule(cfg: *conf.Configuration, item: *yaml.Value, index: usize) yaml.LoadError!RuleConfiguration {
     var path_buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "rules[{d}]", .{index}) catch "rules";
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, item, path);
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, item, path);
 
-    try conf.beginRule(cycle, index);
-    defer conf.endRule(cycle);
-    try conf.dispatchMapping(cycle, map, .rule, path);
-
-    const bundle = &cycle.rule_bundles.items[cycle.rule_bundles.items.len - 1];
-    const rule_conf = cycle.ruleConf(bundle, @This()).?;
+    var rule_conf = RuleConf{};
+    var timeout_overrides = timeouts.RuleConf{};
+    var limit_overrides = limits.RuleConf{};
+    try conf.parseRule(cfg, &rule_conf, &timeout_overrides, &limit_overrides, map, path);
 
     const listen_node = rule_conf.listen_node orelse
-        return yaml.fail(cycle.gpa, cycle.diag, "missing required key: {s}.listen", .{path});
-    const listen = try decodeRuleListen(cycle, listen_node, path);
+        return yaml.fail(cfg.gpa, cfg.diag, "missing required key: {s}.listen", .{path});
+    const listen = try decodeRuleListen(cfg, listen_node, path);
 
     const upstreams_node = rule_conf.upstreams_node orelse
-        return yaml.fail(cycle.gpa, cycle.diag, "missing required key: {s}.upstreams", .{path});
-    const upstreams = try decodeRuleUpstreams(cycle, upstreams_node, listen.port, path);
+        return yaml.fail(cfg.gpa, cfg.diag, "missing required key: {s}.upstreams", .{path});
+    const upstreams = try decodeRuleUpstreams(cfg, upstreams_node, listen.port, path);
 
     return .{
         .protocols = rule_conf.protocols,
@@ -185,68 +146,68 @@ fn decodeRule(cycle: *conf.Cycle, item: *yaml.Value, index: usize) yaml.LoadErro
         .upstreams = upstreams,
         .balance = rule_conf.balance orelse upstream.defaultBalancer(),
         .balance_name = rule_conf.balance_name,
-        .timeouts = cycle.ruleConf(bundle, timeouts).?.*,
-        .limits = cycle.ruleConf(bundle, limits).?.*,
+        .timeouts = timeout_overrides,
+        .limits = limit_overrides,
     };
 }
 
-fn decodeRuleListen(cycle: *conf.Cycle, value: *yaml.Value, path: []const u8) yaml.LoadError!net.EndpointConfiguration {
+pub fn decodeRuleListen(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!net.EndpointConfiguration {
     var sub_buf: [80]u8 = undefined;
     const listen_path = std.fmt.bufPrint(&sub_buf, "{s}.listen", .{path}) catch path;
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, listen_path);
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "host", "port" }, listen_path);
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, value, listen_path);
+    try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{ "host", "port" }, listen_path);
     var endpoint = net.EndpointConfiguration{ .host = "*", .port = 0 };
     if (yaml.mappingGet(map, "host")) |v| {
-        endpoint.host = try yaml.decodeString(cycle.gpa, cycle.diag, v, "rules.listen.host");
+        endpoint.host = try yaml.decodeString(cfg.gpa, cfg.diag, v, "rules.listen.host");
     }
     const port_value = yaml.mappingGet(map, "port") orelse
-        return yaml.fail(cycle.gpa, cycle.diag, "missing required key: {s}.port", .{listen_path});
-    endpoint.port = try yaml.decodeInt(cycle.gpa, cycle.diag, port_value, listen_path);
+        return yaml.fail(cfg.gpa, cfg.diag, "missing required key: {s}.port", .{listen_path});
+    endpoint.port = try yaml.decodeInt(cfg.gpa, cfg.diag, port_value, listen_path);
     return endpoint;
 }
 
-fn decodeRuleUpstreams(cycle: *conf.Cycle, value: *yaml.Value, listen_port: i64, path: []const u8) yaml.LoadError![]UpstreamConfiguration {
+pub fn decodeRuleUpstreams(cfg: *conf.Configuration, value: *yaml.Value, listen_port: i64, path: []const u8) yaml.LoadError![]UpstreamConfiguration {
     var sub_buf: [80]u8 = undefined;
     const upstreams_path = std.fmt.bufPrint(&sub_buf, "{s}.upstreams", .{path}) catch path;
     if (value.* != .sequence) {
-        return yaml.fail(cycle.gpa, cycle.diag, "{s}: expected a sequence", .{upstreams_path});
+        return yaml.fail(cfg.gpa, cfg.diag, "{s}: expected a sequence", .{upstreams_path});
     }
     var upstreams: std.ArrayList(UpstreamConfiguration) = .empty;
     for (value.sequence, 0..) |item, j| {
-        const map = try yaml.requireMapping(cycle.gpa, cycle.diag, item, upstreams_path);
+        const map = try yaml.requireMapping(cfg.gpa, cfg.diag, item, upstreams_path);
         var entry_buf: [96]u8 = undefined;
         const entry_path = std.fmt.bufPrint(&entry_buf, "{s}[{d}]", .{ upstreams_path, j }) catch upstreams_path;
-        try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "host", "port", "weight" }, entry_path);
+        try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{ "host", "port", "weight" }, entry_path);
         const host_value = yaml.mappingGet(map, "host") orelse
-            return yaml.fail(cycle.gpa, cycle.diag, "missing required key: {s}.host", .{entry_path});
-        const host = try yaml.decodeString(cycle.gpa, cycle.diag, host_value, upstreams_path);
+            return yaml.fail(cfg.gpa, cfg.diag, "missing required key: {s}.host", .{entry_path});
+        const host = try yaml.decodeString(cfg.gpa, cfg.diag, host_value, upstreams_path);
         var decoded = UpstreamConfiguration{ .host = host, .port = listen_port };
         if (yaml.mappingGet(map, "port")) |v| {
-            decoded.port = try yaml.decodeInt(cycle.gpa, cycle.diag, v, upstreams_path);
+            decoded.port = try yaml.decodeInt(cfg.gpa, cfg.diag, v, upstreams_path);
         }
         if (yaml.mappingGet(map, "weight")) |v| {
-            decoded.weight = try yaml.decodeInt(cycle.gpa, cycle.diag, v, upstreams_path);
+            decoded.weight = try yaml.decodeInt(cfg.gpa, cfg.diag, v, upstreams_path);
         }
-        try upstreams.append(cycle.allocator(), decoded);
+        try upstreams.append(cfg.allocator(), decoded);
     }
-    return upstreams.toOwnedSlice(cycle.allocator());
+    return upstreams.toOwnedSlice(cfg.allocator());
 }
 
-fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
-    const c = cycle.conf(@This());
+pub fn validate(cfg: *conf.Configuration) yaml.LoadError!void {
+    const c = &cfg.rules;
     if (c.rules_node == null) return;
     if (c.rules.len == 0) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "rules must not be empty", .{});
+        yaml.setDiag(cfg.gpa, cfg.diag, "rules must not be empty", .{});
         return error.InvalidConfiguration;
     }
     for (c.rules, 0..) |rule, i| {
-        try validateRule(cycle, rule, i);
+        try validateRule(cfg, rule, i);
     }
 }
 
-fn validateRule(cycle: *conf.Cycle, rule: RuleConfiguration, i: usize) yaml.LoadError!void {
-    const gpa = cycle.gpa;
-    const diag = cycle.diag;
+pub fn validateRule(cfg: *conf.Configuration, rule: RuleConfiguration, i: usize) yaml.LoadError!void {
+    const gpa = cfg.gpa;
+    const diag = cfg.diag;
     if (std.mem.trim(u8, rule.listen.host, " \t\n\r").len == 0) {
         yaml.setDiag(gpa, diag, "rules[{d}].listen.host must not be empty", .{i});
         return error.InvalidConfiguration;
@@ -287,17 +248,17 @@ fn validateRule(cycle: *conf.Cycle, rule: RuleConfiguration, i: usize) yaml.Load
 const testing = std.testing;
 const core = @import("core.zig");
 
-fn loadRulesForTest(text: []const u8) !struct { cycle: conf.Cycle, rules: []RuleConfiguration } {
+fn loadRulesForTest(text: []const u8) !struct { cfg: conf.Configuration, rules: []RuleConfiguration } {
     var diag = conf.Diagnostics{};
-    var cycle = conf.loadYaml(testing.allocator, text, &diag) catch |err| {
+    var cfg = conf.loadYaml(testing.allocator, text, &diag) catch |err| {
         if (diag.message) |message| {
             std.debug.print("unexpected load failure: {s}\n", .{message});
             testing.allocator.free(message);
         }
         return err;
     };
-    if (!cycle.rules_mode) return error.TestUnexpectedSingleMode;
-    return .{ .cycle = cycle, .rules = rulesList(&cycle) };
+    if (!cfg.rules_mode) return error.TestUnexpectedSingleMode;
+    return .{ .cfg = cfg, .rules = rulesList(&cfg) };
 }
 
 test "loads rules with defaults and inheritance" {
@@ -312,8 +273,8 @@ test "loads rules with defaults and inheritance" {
         \\    upstreams: [ { host: "8.8.8.8", port: 53 } ]
         \\
     );
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
     const decoded = result.rules;
 
     try testing.expectEqual(@as(usize, 2), decoded.len);
@@ -345,8 +306,8 @@ test "preserves dynamically named protocols for runtime resolution" {
         \\    upstreams: [ { host: "127.0.0.1" } ]
         \\
     );
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
     const protocols = result.rules[0].protocols.?;
     try testing.expectEqual(@as(usize, 1), protocols.len);
     try testing.expectEqualStrings("probe_udp", protocols[0].name());
@@ -369,11 +330,11 @@ test "loads rule overrides and global sections" {
         \\    upstreams: [ { host: "b" } ]
         \\
     );
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
     const decoded = result.rules;
 
-    const globals = core.configuration(&cycle);
+    const globals = core.configuration(&cfg);
     try testing.expectEqualSlices(net.ForwardProtocol, &.{.tcp}, globals.protocols);
     try testing.expectEqual(8, globals.timeouts.connect_seconds);
     try testing.expectEqual(100, globals.timeouts.tcp_idle_seconds);
@@ -469,11 +430,11 @@ test "unknown balancer is rejected during resolve" {
         \\    balance: nearest
         \\
     );
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
     var diag = conf.Diagnostics{};
     defer if (diag.message) |message| testing.allocator.free(message);
-    try testing.expectError(error.ResolutionFailed, core.resolveForwarder(testing.allocator, cycle.allocator(), &cycle, fixedResolver, &diag));
+    try testing.expectError(error.ResolutionFailed, core.resolveForwarder(testing.allocator, cfg.allocator(), &cfg, fixedResolver, &diag));
     try testing.expect(std.mem.startsWith(u8, diag.message.?, "rules[0].balance: expected one of "));
 }
 
@@ -488,10 +449,10 @@ test "effective configuration merges rule overrides" {
         \\    limits: { maxTCPBufferedBytes: 8388608 }
         \\
     );
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
 
-    const effective = core.effectiveConfiguration(core.configuration(&cycle), result.rules[0]);
+    const effective = core.effectiveConfiguration(core.configuration(&cfg), result.rules[0]);
     try testing.expectEqual(8, effective.timeouts.connect_seconds);
     try testing.expectEqual(600, effective.timeouts.tcp_idle_seconds);
     try testing.expectEqual(8_388_608, effective.limits.max_tcp_buffered_bytes);

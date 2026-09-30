@@ -4,11 +4,11 @@
 //! modules plus the single-rule `listen`/`upstream`/`protocols`/`version`
 //! sugar), address resolution with cross-rule conflict detection, the
 //! protocol module interface (Listener vtable) and the unified runtime
-//! orchestrator: one cycle driving 1..N forwarding rules — a single-rule
+//! orchestrator: one cfg driving 1..N forwarding rules — a single-rule
 //! document is simply one synthesized rule (the nginx http module serving
 //! 1..N servers analogue).
 //!
-//! Hot reload (SIGHUP) runs a fresh configuration cycle and diffs rules by
+//! Hot reload (SIGHUP) loads a fresh configuration and diffs rules by
 //! their resolved listen address set: matched rules update in place
 //! (upstream pool health is inherited by address), brand-new rules bind
 //! before unmatched old ones retire, and any failure rolls the reload back
@@ -21,7 +21,8 @@ const posix = std.posix;
 const bpf = @import("../bpf.zig");
 const cli = @import("cli.zig");
 const conf = @import("../conf.zig");
-const fw = @import("../module.zig");
+const tcp = @import("tcp.zig");
+const udp = @import("udp.zig");
 const limits = @import("limits.zig");
 const log = @import("../log.zig");
 const logging = @import("logging.zig");
@@ -56,7 +57,7 @@ pub const PerformanceConfiguration = performance.PerformanceConfiguration;
 pub const SockmapAccelerationMode = performance.SockmapAccelerationMode;
 pub const RuleConfiguration = rules.RuleConfiguration;
 
-/// Where a running service loads its configuration cycle from. `file` is the
+/// Where a running service loads its configuration from. `file` is the
 /// classic YAML path (re-read on SIGHUP); `cli` re-renders the parsed CLI
 /// shorthand through cli.loadCycle, so CLI rules hot-reload through the same
 /// transactional machinery (re-validating and re-resolving hostnames; the
@@ -121,9 +122,9 @@ pub const ConfigFingerprint = struct {
     }
 };
 
-/// Load a fresh configuration cycle from the source, mirroring how the main
-/// entry point bootstraps the first cycle.
-fn loadConfigCycle(gpa: Allocator, source: ConfigSource, diag: *conf.Diagnostics) conf.LoadError!conf.Cycle {
+/// Load a fresh configuration from the source, mirroring how the main
+/// entry point bootstraps the first cfg.
+fn loadConfigCycle(gpa: Allocator, source: ConfigSource, diag: *conf.Diagnostics) conf.LoadError!conf.Configuration {
     return switch (source) {
         .file => |path| conf.loadFile(gpa, path, diag),
         .cli => |config| cli.loadCycle(gpa, config, diag),
@@ -208,7 +209,7 @@ pub const ResolvedRule = struct {
     }
 };
 
-/// The resolved whole cycle: a global view plus 1..N resolved rules.
+/// The resolved whole configuration: a global view plus 1..N resolved rules.
 pub const ResolvedForwarder = struct {
     configuration: ForwarderConfiguration,
     rules: []ResolvedRule,
@@ -232,8 +233,6 @@ pub const Listener = struct {
     force_close_fn: *const fn (context: *anyopaque) void,
     active_count_fn: *const fn (context: *anyopaque) usize,
     drains_connections: bool = false,
-    owner_context: ?*anyopaque = null,
-    owner_release_fn: ?*const fn (context: ?*anyopaque) void = null,
 
     pub fn activate(self: *Listener) void {
         self.activate_fn(self.context);
@@ -245,7 +244,6 @@ pub const Listener = struct {
 
     pub fn destroy(self: *Listener) void {
         self.destroy_fn(self.allocator, self.context);
-        if (self.owner_release_fn) |release| release(self.owner_context);
         self.allocator.destroy(self);
     }
 
@@ -268,19 +266,6 @@ pub const Listener = struct {
 
 };
 
-/// A protocol module registers one entry in fw.protocol_modules; the
-/// orchestrator spawns listeners through it instead of hardcoding TCP/UDP.
-pub const ProtocolModule = struct {
-    name: []const u8,
-    protocol: ForwardProtocol,
-    /// TCP-style listeners park for connection draining on retire.
-    drains_connections: bool,
-    context: ?*anyopaque = null,
-    retain: ?*const fn (context: ?*anyopaque) void = null,
-    release: ?*const fn (context: ?*anyopaque) void = null,
-    create: *const fn (context: ?*anyopaque, allocator: Allocator, resolved: ResolvedConfiguration, logger: *log.LogStore, selector: ?upstream.Selector, start_paused: bool) anyerror!*Listener,
-};
-
 // ---------------------------------------------------------------------------
 // Module declaration: version / protocols / listen / upstream (root sugar)
 // ---------------------------------------------------------------------------
@@ -299,98 +284,75 @@ pub const Conf = struct {
     upstream: ?EndpointConfiguration = null,
 };
 
-pub const module: fw.Module = .{
-    .name = "core",
-    .directives = &directives,
-    .create_conf = createConf,
-    .finalize = finalize,
-    .validate = validate,
-};
-
-const directives = [_]fw.Directive{
-    .{ .name = "version", .root = true, .set = setVersion },
-    .{ .name = "protocols", .root = true, .set = setProtocols },
-    .{ .name = "listen", .root = true, .set = setListen },
-    .{ .name = "upstream", .root = true, .set = setUpstream },
-};
-
-fn createConf(cycle: *conf.Cycle) error{OutOfMemory}!*anyopaque {
-    const c = try cycle.allocator().create(Conf);
-    c.* = .{};
-    return c;
+pub fn setVersion(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+    _ = path;
+    const c = &cfg.core;
+    c.version = try yaml.decodeInt(cfg.gpa, cfg.diag, value, "version");
 }
 
-fn setVersion(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+pub fn setProtocols(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
-    c.version = try yaml.decodeInt(cycle.gpa, cycle.diag, value, "version");
+    const c = &cfg.core;
+    c.protocols = try rules.decodeProtocols(cfg, value);
 }
 
-fn setProtocols(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+pub fn setListen(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
-    c.protocols = try rules.decodeProtocols(cycle, value);
-}
-
-fn setListen(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
-    _ = cycle;
-    _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
+    const c = &cfg.core;
     c.listen_node = value;
 }
 
-fn setUpstream(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
-    _ = cycle;
+pub fn setUpstream(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
+    const c = &cfg.core;
     c.upstream_node = value;
 }
 
 /// Cross-key decoding after every directive ran: the upstream port defaults
 /// to the listen port, so the order of keys in the document must not matter.
-fn finalize(cycle: *conf.Cycle) yaml.LoadError!void {
-    if (cycle.rules_mode) return;
-    const c = cycle.conf(@This());
+pub fn finalize(cfg: *conf.Configuration) yaml.LoadError!void {
+    if (cfg.rules_mode) return;
+    const c = &cfg.core;
 
     const listen_node = c.listen_node orelse
-        return yaml.fail(cycle.gpa, cycle.diag, "missing required key: listen", .{});
-    c.listen = try decodeListen(cycle, listen_node);
+        return yaml.fail(cfg.gpa, cfg.diag, "missing required key: listen", .{});
+    c.listen = try decodeListen(cfg, listen_node);
 
     const upstream_node = c.upstream_node orelse
-        return yaml.fail(cycle.gpa, cycle.diag, "missing required key: upstream", .{});
-    c.upstream = try decodeUpstreamEndpoint(cycle, upstream_node, c.listen.?.port);
+        return yaml.fail(cfg.gpa, cfg.diag, "missing required key: upstream", .{});
+    c.upstream = try decodeUpstreamEndpoint(cfg, upstream_node, c.listen.?.port);
 }
 
-fn decodeListen(cycle: *conf.Cycle, value: *yaml.Value) yaml.LoadError!EndpointConfiguration {
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "listen");
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "host", "port" }, "listen");
+pub fn decodeListen(cfg: *conf.Configuration, value: *yaml.Value) yaml.LoadError!EndpointConfiguration {
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, value, "listen");
+    try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{ "host", "port" }, "listen");
     var endpoint = EndpointConfiguration{ .host = "*", .port = 0 };
     if (yaml.mappingGet(map, "host")) |v| {
-        endpoint.host = try yaml.decodeString(cycle.gpa, cycle.diag, v, "listen.host");
+        endpoint.host = try yaml.decodeString(cfg.gpa, cfg.diag, v, "listen.host");
     }
     const port_value = yaml.mappingGet(map, "port") orelse
-        return yaml.fail(cycle.gpa, cycle.diag, "missing required key: listen.port", .{});
-    endpoint.port = try yaml.decodeInt(cycle.gpa, cycle.diag, port_value, "listen.port");
+        return yaml.fail(cfg.gpa, cfg.diag, "missing required key: listen.port", .{});
+    endpoint.port = try yaml.decodeInt(cfg.gpa, cfg.diag, port_value, "listen.port");
     return endpoint;
 }
 
-fn decodeUpstreamEndpoint(cycle: *conf.Cycle, value: *yaml.Value, listen_port: i64) yaml.LoadError!EndpointConfiguration {
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "upstream");
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "host", "port" }, "upstream");
+pub fn decodeUpstreamEndpoint(cfg: *conf.Configuration, value: *yaml.Value, listen_port: i64) yaml.LoadError!EndpointConfiguration {
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, value, "upstream");
+    try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{ "host", "port" }, "upstream");
     const host_value = yaml.mappingGet(map, "host") orelse
-        return yaml.fail(cycle.gpa, cycle.diag, "missing required key: upstream.host", .{});
-    const host = try yaml.decodeString(cycle.gpa, cycle.diag, host_value, "upstream.host");
+        return yaml.fail(cfg.gpa, cfg.diag, "missing required key: upstream.host", .{});
+    const host = try yaml.decodeString(cfg.gpa, cfg.diag, host_value, "upstream.host");
     var port = listen_port;
     if (yaml.mappingGet(map, "port")) |v| {
-        port = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "upstream.port");
+        port = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "upstream.port");
     }
     return .{ .host = host, .port = port };
 }
 
-fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
-    const c = cycle.conf(@This());
-    const gpa = cycle.gpa;
-    const diag = cycle.diag;
+pub fn validate(cfg: *conf.Configuration) yaml.LoadError!void {
+    const c = &cfg.core;
+    const gpa = cfg.gpa;
+    const diag = cfg.diag;
 
     if (c.version != 1) {
         yaml.setDiag(gpa, diag, "unsupported configuration version: {d}", .{c.version});
@@ -398,7 +360,7 @@ fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
     }
     try net.validateProtocols(gpa, diag, c.protocols orelse &default_protocols, "");
 
-    if (cycle.rules_mode) return;
+    if (cfg.rules_mode) return;
     if (std.mem.trim(u8, c.listen.?.host, " \t\n\r").len == 0) {
         yaml.setDiag(gpa, diag, "listen.host must not be empty", .{});
         return error.InvalidConfiguration;
@@ -422,18 +384,18 @@ fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
 // ---------------------------------------------------------------------------
 
 /// The global configuration view composed from every module's conf.
-pub fn configuration(cycle: *conf.Cycle) ForwarderConfiguration {
-    const c = cycle.conf(@This());
+pub fn configuration(cfg: *conf.Configuration) ForwarderConfiguration {
+    const c = &cfg.core;
     return .{
         .version = c.version,
         .protocols = c.protocols orelse &default_protocols,
         .listen = c.listen orelse .{ .host = "*", .port = 0 },
         .upstream = c.upstream orelse .{ .host = "", .port = 0 },
-        .timeouts = cycle.conf(timeouts).*,
-        .limits = cycle.conf(limits).*,
-        .logging = cycle.conf(logging).*,
-        .runtime = cycle.conf(runtime).*,
-        .performance = cycle.conf(performance).*,
+        .timeouts = cfg.timeouts,
+        .limits = cfg.limits,
+        .logging = cfg.logging,
+        .runtime = cfg.runtime,
+        .performance = cfg.performance,
     };
 }
 
@@ -449,20 +411,30 @@ pub fn effectiveConfiguration(globals: ForwarderConfiguration, rule: RuleConfigu
 }
 
 /// Resolve every rule's listen/upstream endpoints. `gpa` backs diagnostics;
-/// `alloc` backs the returned slices and must outlive them (pass the cycle
+/// `alloc` backs the returned slices and must outlive them (pass the configuration
 /// arena). A single-rule document resolves to one synthesized rule.
+/// Curtsy has no runtime protocol registration: the two data planes are
+/// compiled into this binary, and any other protocol name is unsupported by
+/// construction.
+fn protocolSupported(protocol: ForwardProtocol) bool {
+    return switch (protocol) {
+        .tcp, .udp => true,
+        .dynamic => false,
+    };
+}
+
 pub fn resolveForwarder(
     gpa: Allocator,
     alloc: Allocator,
-    cycle: *conf.Cycle,
+    cfg: *conf.Configuration,
     resolver: ?Resolver,
     diag: *conf.Diagnostics,
 ) ResolveError!ResolvedForwarder {
     const resolve = resolver orelse net.defaultResolver;
-    const globals = configuration(cycle);
+    const globals = configuration(cfg);
 
     const definitions: []RuleConfiguration = blk: {
-        if (cycle.rules_mode) break :blk rules.rulesList(cycle);
+        if (cfg.rules_mode) break :blk rules.rulesList(cfg);
         const single = try alloc.alloc(RuleConfiguration, 1);
         const single_upstreams = try alloc.alloc(rules.UpstreamConfiguration, 1);
         single_upstreams[0] = .{ .host = globals.upstream.host, .port = globals.upstream.port };
@@ -502,7 +474,7 @@ pub fn resolveForwarder(
             .upstream_addresses = upstream_addresses,
         };
         for (resolved_rules[i].effectiveProtocols()) |protocol| {
-            if (fw.protocolModule(protocol) == null) {
+            if (!protocolSupported(protocol)) {
                 net.setDiag(gpa, diag, "rules[{d}].protocols: protocol '{s}' is not registered", .{ i, protocol.name() });
                 return error.ResolutionFailed;
             }
@@ -521,7 +493,7 @@ pub fn resolveForwarder(
     return .{
         .configuration = globals,
         .rules = resolved_rules,
-        .rules_mode = cycle.rules_mode,
+        .rules_mode = cfg.rules_mode,
     };
 }
 
@@ -554,7 +526,7 @@ fn rulesConflict(a: *const ResolvedRule, b: *const ResolvedRule) ?ForwardProtoco
 /// Heap-allocated and never moved: selector contexts captured by the
 /// listeners point at the embedded pool.
 const RuleRuntime = struct {
-    /// Current generation's rule (backs slices live in a retained cycle arena).
+    /// Current generation's rule (its slices live in a retained configuration arena).
     rule: RuleConfiguration,
     /// Per-rule view handed to the listeners; listen_addresses is the rule
     /// identity used for reload diffing and never changes in place.
@@ -567,9 +539,9 @@ const RuleRuntime = struct {
     /// Thread counts the listeners were started with (change needs restart).
     started_worker_threads: i64,
     started_udp_io_threads: i64,
-    /// Generation of the cycle this runtime's slices borrow, tagged when the
-    /// rule is retired. Live rules are re-pushed to the newest cycle on every
-    /// reload commit, so only retired runtimes pin an old cycle.
+    /// Generation of the configuration these slices borrow, tagged when the
+    /// rule is retired. Live rules are re-pushed to the newest cfg on every
+    /// reload commit, so only retired runtimes pin an old cfg.
     borrowed_generation: u64 = 0,
 };
 
@@ -578,16 +550,16 @@ const ProtocolListenerSlot = struct {
     listener: *Listener,
 };
 
-/// A superseded configuration cycle kept alive for objects retired while it
+/// A superseded configuration kept alive for objects retired while it
 /// was live (draining listeners borrow its arena). Freed by
 /// pruneRetainedCycles once no retired object references its generation.
 const RetainedCycle = struct {
-    cycle: conf.Cycle,
+    cfg: conf.Configuration,
     generation: u64,
 };
 
 /// A listener parked for connection draining, tagged with the generation of
-/// the cycle its configuration slices borrow.
+/// the configuration its slices borrow.
 const RetiredListener = struct {
     listener: *Listener,
     borrowed_generation: u64,
@@ -632,11 +604,6 @@ const MatchPreparation = struct {
     added_tcp: ?*Listener = null,
     added_udp: ?*Listener = null,
     added_custom: std.ArrayList(ProtocolListenerSlot) = .empty,
-    /// The protocol remains enabled but its registered implementation changed,
-    /// so the staged listener swaps
-    /// in for an existing one at commit.
-    replace_tcp: bool = false,
-    replace_udp: bool = false,
     new_resolved: ResolvedConfiguration = undefined,
     upstream_changed: bool = false,
     want_tcp: bool = false,
@@ -650,13 +617,13 @@ const MatchPreparation = struct {
 pub const ForwarderService = struct {
     allocator: Allocator,
     config_source: ConfigSource,
-    loaded: conf.Cycle,
+    loaded: conf.Configuration,
     resolved: ResolvedForwarder,
     logger: log.LogStore,
     worker_threads: i64,
     /// Fingerprint of the config file at its last successful load. A SIGHUP
     /// whose file still matches is a no-op (reload skipped). null until a
-    /// file-source cycle has been captured, and null for CLI sources.
+    /// file-source cfg has been captured, and null for CLI sources.
     config_fingerprint: ?ConfigFingerprint,
 
     mutex: log.Mutex = .{},
@@ -668,15 +635,15 @@ pub const ForwarderService = struct {
     /// Superseded cycles kept alive only while retired (draining) objects
     /// still borrow their arenas; pruned by pruneRetainedCycles.
     retained_cycles: std.ArrayList(RetainedCycle) = .empty,
-    /// Generation of the current loaded cycle, bumped on every successful
-    /// reload. Retirements tag their borrowed cycle with the pre-bump value.
+    /// Generation of the current loaded cfg, bumped on every successful
+    /// reload. Retirements tag their borrowed cfg with the pre-bump value.
     cycle_generation: u64 = 0,
     shutting_down: bool = false,
 
     pub fn init(
         allocator: Allocator,
         config_source: ConfigSource,
-        loaded: conf.Cycle,
+        loaded: conf.Configuration,
         resolved: ResolvedForwarder,
         instance_name: ?[]const u8,
         pre_load_fingerprint: ?ConfigFingerprint,
@@ -693,7 +660,7 @@ pub const ForwarderService = struct {
             // Prefer the fingerprint the caller captured before reading the
             // file: an edit landing during resolution (DNS can take seconds)
             // is then caught by the first SIGHUP instead of skipped forever.
-            // Callers that hand-built the cycle pass null and capture late.
+            // Callers that hand-built the cfg pass null and capture late.
             .config_fingerprint = pre_load_fingerprint orelse switch (config_source) {
                 .file => |path| ConfigFingerprint.capture(path),
                 .cli => null,
@@ -707,7 +674,7 @@ pub const ForwarderService = struct {
         self.reapRetiredRules(true);
         self.retired_rules.deinit(self.allocator);
         self.retired_draining_listeners.deinit(self.allocator);
-        for (self.retained_cycles.items) |*old| old.cycle.deinit();
+        for (self.retained_cycles.items) |*old| old.cfg.deinit();
         self.retained_cycles.deinit(self.allocator);
         self.loaded.deinit();
     }
@@ -869,25 +836,21 @@ pub const ForwarderService = struct {
         });
     }
 
-    /// Spawn one protocol listener through the protocol module registry. The
-    /// pool selector stays attached across reloads so single/multi-upstream
-    /// transitions do not require rebinding the listen sockets.
+    /// Spawn one protocol listener. Both data planes are compiled into this
+    /// binary, so the protocol selects the implementation directly -- there is
+    /// no registry to consult. The pool selector stays attached across reloads
+    /// so single/multi-upstream transitions do not rebind the listen sockets.
     fn createListener(self: *ForwarderService, candidate: *const ResolvedRule, rt: *RuleRuntime, protocol: ForwardProtocol, start_paused: bool) Error!*Listener {
         _ = candidate;
-        const protocol_module = fw.protocolModule(protocol) orelse return error.ProtocolNotRegistered;
-        if (protocol_module.retain) |retain| retain(protocol_module.context);
-        errdefer if (protocol_module.release) |release| release(protocol_module.context);
-        const listener = try protocol_module.create(
-            protocol_module.context,
-            self.allocator,
-            rt.resolved,
-            &self.logger,
-            upstream.poolSelector(&rt.pool),
-            start_paused,
-        );
-        listener.owner_context = protocol_module.context;
-        listener.owner_release_fn = protocol_module.release;
-        listener.drains_connections = protocol_module.drains_connections;
+        const listener = switch (protocol) {
+            .tcp => try tcp.createProtocolListener(self.allocator, rt.resolved, &self.logger, upstream.poolSelector(&rt.pool), start_paused),
+            .udp => try udp.createProtocolListener(self.allocator, rt.resolved, &self.logger, upstream.poolSelector(&rt.pool), start_paused),
+            .dynamic => return error.ProtocolNotRegistered,
+        };
+        listener.drains_connections = switch (protocol) {
+            .tcp => true,
+            else => false,
+        };
         return listener;
     }
 
@@ -959,45 +922,21 @@ pub const ForwarderService = struct {
             );
         }
 
-        if (want_tcp) {
-            const desired_module = fw.protocolModule(.tcp).?;
-            if (rt.tcp_listener == null or rt.tcp_listener.?.owner_context != desired_module.context) {
-                prep.replace_tcp = rt.tcp_listener != null;
-                prep.added_tcp = try self.createListener(candidate, rt, .tcp, true);
-            }
+        if (want_tcp and rt.tcp_listener == null) {
+            prep.added_tcp = try self.createListener(candidate, rt, .tcp, true);
         }
-        if (want_udp) {
-            const desired_module = fw.protocolModule(.udp).?;
-            if (rt.udp_listener == null or rt.udp_listener.?.owner_context != desired_module.context) {
-                prep.replace_udp = rt.udp_listener != null;
-                prep.added_udp = try self.createListener(candidate, rt, .udp, true);
-            }
+        if (want_udp and rt.udp_listener == null) {
+            prep.added_udp = try self.createListener(candidate, rt, .udp, true);
         }
 
-        var custom_addition_count: usize = 0;
+        // Both data planes are built in, so a dynamic protocol name can never
+        // be satisfied here; `resolveForwarder` already rejected the rule.
         for (protocols) |protocol| switch (protocol) {
             .tcp, .udp => {},
-            .dynamic => {
-                const desired_module = fw.protocolModule(protocol) orelse return error.ProtocolNotRegistered;
-                const current = customListenerSlot(rt, protocol);
-                if (current == null or current.?.listener.owner_context != desired_module.context) {
-                    custom_addition_count += 1;
-                }
-            },
+            .dynamic => return error.ProtocolNotRegistered,
         };
-        try prep.added_custom.ensureTotalCapacity(self.allocator, custom_addition_count);
-        try rt.custom_listeners.ensureUnusedCapacity(self.allocator, custom_addition_count);
-        for (protocols) |protocol| switch (protocol) {
-            .tcp, .udp => {},
-            .dynamic => {
-                const desired_module = fw.protocolModule(protocol) orelse return error.ProtocolNotRegistered;
-                const current = customListenerSlot(rt, protocol);
-                if (current == null or current.?.listener.owner_context != desired_module.context) {
-                    const listener = try self.createListener(candidate, rt, protocol, true);
-                    prep.added_custom.appendAssumeCapacity(.{ .protocol = protocol, .listener = listener });
-                }
-            },
-        };
+        try prep.added_custom.ensureTotalCapacity(self.allocator, 0);
+        try rt.custom_listeners.ensureUnusedCapacity(self.allocator, 0);
 
         const backlog_changed =
             rt.resolved.configuration.limits.tcp_listen_backlog != new_resolved.configuration.limits.tcp_listen_backlog;
@@ -1028,19 +967,10 @@ pub const ForwarderService = struct {
         if (prep.added_udp orelse rt.udp_listener) |listener| listener.updateConfiguration(prep.new_resolved, prep.upstream_changed);
 
         if (prep.added_tcp) |listener| {
-            if (prep.replace_tcp) {
-                const previous = rt.tcp_listener.?;
-                previous.stopAccepting();
-                self.retired_draining_listeners.append(self.allocator, .{ .listener = previous, .borrowed_generation = self.cycle_generation }) catch {
-                    previous.forceCloseConnections();
-                    previous.destroy();
-                };
-            }
             rt.tcp_listener = listener;
             listener.activate();
         }
         if (prep.added_udp) |listener| {
-            if (prep.replace_udp) rt.udp_listener.?.destroy();
             rt.udp_listener = listener;
             listener.activate();
         }
@@ -1187,9 +1117,9 @@ pub const ForwarderService = struct {
     }
 
     /// Free superseded cycles no retired object still borrows. Live rules are
-    /// re-pushed to the newest cycle on every reload commit, so the only
+    /// re-pushed to the newest cfg on every reload commit, so the only
     /// borrowers of an old generation are retired rules and draining
-    /// listeners tagged with it; once they are reaped the cycle's arena is
+    /// listeners tagged with it; once they are reaped the cfg's arena is
     /// unreachable and can be released instead of accumulating per reload.
     fn pruneRetainedCycles(self: *ForwarderService) void {
         var i: usize = 0;
@@ -1207,7 +1137,7 @@ pub const ForwarderService = struct {
                     continue :prune;
                 }
             }
-            retained.cycle.deinit();
+            retained.cfg.deinit();
             _ = self.retained_cycles.swapRemove(i);
         }
     }
@@ -1341,7 +1271,7 @@ pub const ForwarderService = struct {
                         return;
                     }
                 }
-                // Capture before the cycle read below: an edit landing while
+                // Capture before the cfg read below: an edit landing while
                 // this reload runs (address resolution can take seconds) then
                 // mismatches at the next SIGHUP and forces another reload,
                 // instead of being fingerprinted-but-never-served.
@@ -1353,22 +1283,21 @@ pub const ForwarderService = struct {
         var diag = conf.Diagnostics{};
         defer if (diag.message) |message| self.allocator.free(message);
 
-        // A reload runs a fresh configuration cycle through the module
-        // engine, then diffs it against the live one. In CLI mode the cycle
-        // is re-rendered from the stored shorthand (re-validated and the
-        // listen/upstream hostnames re-resolved).
-        var cycle = loadConfigCycle(self.allocator, self.config_source, &diag) catch |err| {
+        // A reload decodes the document again, then diffs it against the live
+        // one. In CLI mode the configuration is re-rendered from the stored
+        // shorthand (re-validated and the hostnames re-resolved).
+        var cfg = loadConfigCycle(self.allocator, self.config_source, &diag) catch |err| {
             self.logger.err("configuration reload rejected error={s} reason={s}", .{
                 @errorName(err),
                 diag.message orelse "unknown error",
             });
             return;
         };
-        var owns_cycle = true;
-        defer if (owns_cycle) cycle.deinit();
+        var owns_config = true;
+        defer if (owns_config) cfg.deinit();
 
-        if (cycle.rules_mode != self.resolved.rules_mode) {
-            if (cycle.rules_mode) {
+        if (cfg.rules_mode != self.resolved.rules_mode) {
+            if (cfg.rules_mode) {
                 self.logger.warning("configuration now uses rules; restart required to apply rules mode", .{});
             } else {
                 self.logger.warning("configuration no longer uses rules; restart required to apply single-rule mode", .{});
@@ -1378,8 +1307,8 @@ pub const ForwarderService = struct {
 
         const candidate = resolveForwarder(
             self.allocator,
-            cycle.allocator(),
-            &cycle,
+            cfg.allocator(),
+            &cfg,
             null,
             &diag,
         ) catch |err| {
@@ -1390,30 +1319,30 @@ pub const ForwarderService = struct {
             return;
         };
 
-        // One slot for the usual success handoff (the previous loaded cycle).
+        // One slot for the usual success handoff (the previous loaded cfg).
         self.retained_cycles.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.logger.err("configuration reload rejected error={s}", .{@errorName(err)});
             return;
         };
 
         // apply is transactional: on failure nothing was published and this
-        // candidate cycle is released by the caller's defer.
+        // candidate cfg is released by the caller's defer.
         self.apply(candidate) catch |err| {
             self.logger.err("configuration reload rejected error={s}", .{@errorName(err)});
             return;
         };
 
         // Retirements during apply tagged the pre-bump generation as their
-        // borrowed cycle; record the previous loaded cycle under that same
+        // borrowed cfg; record the previous loaded cfg under that same
         // generation, then advance. pruneRetainedCycles frees it once those
         // borrowers drain.
-        self.retained_cycles.appendAssumeCapacity(.{ .cycle = self.loaded, .generation = self.cycle_generation });
+        self.retained_cycles.appendAssumeCapacity(.{ .cfg = self.loaded, .generation = self.cycle_generation });
         self.cycle_generation += 1;
-        self.loaded = cycle;
-        owns_cycle = false;
+        self.loaded = cfg;
+        owns_config = false;
         self.resolved = candidate;
         // The reload succeeded, so adopt the fingerprint captured just before
-        // the cycle was read. A rejected reload keeps the old fingerprint,
+        // the cfg was read. A rejected reload keeps the old fingerprint,
         // letting a retry reload.
         self.config_fingerprint = switch (self.config_source) {
             .file => pre_read_fingerprint,
@@ -1435,8 +1364,8 @@ pub const ForwarderService = struct {
     /// new rule list.
     ///
     /// On any preparation failure nothing is published: the live rules, pools,
-    /// listeners, `self.resolved` and cycle ownership all stay on
-    /// the previous configuration, the candidate cycle is released normally by
+    /// listeners, `self.resolved` and cfg ownership all stay on
+    /// the previous configuration, the candidate cfg is released normally by
     /// the caller, and preflighted live backlog changes are rolled back.
     pub fn apply(self: *ForwarderService, candidate: ResolvedForwarder) Error!void {
         const requested_worker_threads = candidate.configuration.runtime.worker_threads;
@@ -1586,7 +1515,7 @@ fn sleepNs(ns: u64) void {
 
 const testing = std.testing;
 
-fn loadForTest(text: []const u8) !conf.Cycle {
+fn loadForTest(text: []const u8) !conf.Configuration {
     var diag = conf.Diagnostics{};
     return conf.loadYaml(testing.allocator, text, &diag) catch |err| {
         if (diag.message) |message| {
@@ -1598,16 +1527,16 @@ fn loadForTest(text: []const u8) !conf.Cycle {
 }
 
 test "loads defaults" {
-    var cycle = try loadForTest(
+    var cfg = try loadForTest(
         \\listen:
         \\  port: 9000
         \\upstream:
         \\  host: "localhost"
         \\
     );
-    defer cycle.deinit();
-    try testing.expect(!cycle.rules_mode);
-    const config = configuration(&cycle);
+    defer cfg.deinit();
+    try testing.expect(!cfg.rules_mode);
+    const config = configuration(&cfg);
 
     try testing.expectEqual(1, config.version);
     try testing.expectEqualSlices(ForwardProtocol, &.{ .tcp, .udp }, config.protocols);
@@ -1634,24 +1563,24 @@ test "loads defaults" {
 }
 
 test "resolve rejects a protocol absent from the built-in registry" {
-    var cycle = try loadForTest(
+    var cfg = try loadForTest(
         \\protocols: [not_loaded]
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.1", port: 9001 }
         \\
     );
-    defer cycle.deinit();
+    defer cfg.deinit();
     var diag = conf.Diagnostics{};
     defer if (diag.message) |message| testing.allocator.free(message);
     try testing.expectError(
         error.ResolutionFailed,
-        resolveForwarder(testing.allocator, cycle.allocator(), &cycle, null, &diag),
+        resolveForwarder(testing.allocator, cfg.allocator(), &cfg, null, &diag),
     );
     try testing.expect(std.mem.indexOf(u8, diag.message.?, "not_loaded") != null);
 }
 
 test "loads overrides" {
-    var cycle = try loadForTest(
+    var cfg = try loadForTest(
         \\version: 1
         \\protocols: [udp]
         \\listen: { host: "::1", port: 5353 }
@@ -1672,8 +1601,8 @@ test "loads overrides" {
         \\logging: { level: debug }
         \\
     );
-    defer cycle.deinit();
-    const config = configuration(&cycle);
+    defer cfg.deinit();
+    const config = configuration(&cfg);
 
     try testing.expectEqualSlices(ForwardProtocol, &.{.udp}, config.protocols);
     try testing.expectEqualStrings("::1", config.listen.host);
@@ -1726,7 +1655,7 @@ test "rejects the removed auto keyword in numeric fields" {
 }
 
 test "accepts block sequences and comments" {
-    var cycle = try loadForTest(
+    var cfg = try loadForTest(
         \\# leading comment
         \\protocols:
         \\  - tcp   # trailing comment
@@ -1737,8 +1666,8 @@ test "accepts block sequences and comments" {
         \\  host: "example.com"
         \\
     );
-    defer cycle.deinit();
-    const config = configuration(&cycle);
+    defer cfg.deinit();
+    const config = configuration(&cfg);
     try testing.expectEqualSlices(ForwardProtocol, &.{ .tcp, .udp }, config.protocols);
     try testing.expectEqual(9_000, config.listen.port);
     try testing.expectEqual(9_000, config.upstream.port);
@@ -1813,18 +1742,18 @@ test "rejects missing required keys and non-mapping root" {
     try conf.expectLoadFailure("listen: { port: 9000 }\nupstream: { port: 9001 }\n", "missing required key: upstream.host");
 }
 
-fn resolveYamlForTest(text: []const u8, resolver: ?Resolver) !struct { cycle: conf.Cycle, resolved: ResolvedForwarder } {
-    var cycle = try loadForTest(text);
-    errdefer cycle.deinit();
+fn resolveYamlForTest(text: []const u8, resolver: ?Resolver) !struct { cfg: conf.Configuration, resolved: ResolvedForwarder } {
+    var cfg = try loadForTest(text);
+    errdefer cfg.deinit();
     var diag = conf.Diagnostics{};
-    const resolved = resolveForwarder(testing.allocator, cycle.allocator(), &cycle, resolver, &diag) catch |err| {
+    const resolved = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, resolver, &diag) catch |err| {
         if (diag.message) |message| {
             std.debug.print("unexpected resolve failure: {s}\n", .{message});
             testing.allocator.free(message);
         }
         return err;
     };
-    return .{ .cycle = cycle, .resolved = resolved };
+    return .{ .cfg = cfg, .resolved = resolved };
 }
 
 test "single rule resolves to one synthetic rule" {
@@ -1833,8 +1762,8 @@ test "single rule resolves to one synthetic rule" {
         \\upstream: { host: "127.0.0.2", port: 9001 }
         \\
     , null);
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
 
     try testing.expect(!result.resolved.rules_mode);
     try testing.expectEqual(@as(usize, 1), result.resolved.rules.len);
@@ -1858,8 +1787,8 @@ test "resolves rules listen and upstream addresses" {
         \\    upstreams: [ { host: "127.0.0.3", port: 53 } ]
         \\
     , null);
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
 
     try testing.expect(result.resolved.rules_mode);
     const first = result.resolved.rules[0];
@@ -1877,10 +1806,10 @@ test "resolves rules listen and upstream addresses" {
 }
 
 fn expectResolveFailure(text: []const u8, expected_message: []const u8) !void {
-    var cycle = try loadForTest(text);
-    defer cycle.deinit();
+    var cfg = try loadForTest(text);
+    defer cfg.deinit();
     var diag = conf.Diagnostics{};
-    const result = resolveForwarder(testing.allocator, cycle.allocator(), &cycle, null, &diag);
+    const result = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, null, &diag);
     if (result) |_| return error.TestExpectedFailureButResolved else |_| {}
     try testing.expectEqualStrings(expected_message, diag.message.?);
     if (diag.message) |message| testing.allocator.free(message);
@@ -1918,8 +1847,8 @@ test "allows rules sharing an address across disjoint protocols" {
         \\    upstreams: [ { host: "127.0.0.3", port: 9001 } ]
         \\
     , null);
-    var cycle = result.cycle;
-    defer cycle.deinit();
+    var cfg = result.cfg;
+    defer cfg.deinit();
     try testing.expectEqual(@as(usize, 2), result.resolved.rules.len);
 }
 
@@ -2095,7 +2024,7 @@ test "rule resolution flags any loopback upstream for tcp sockmap auto" {
         \\      - { host: "127.0.0.1", port: 9002 }
         \\
     , null);
-    var remote_first_cycle = remote_first.cycle;
+    var remote_first_cycle = remote_first.cfg;
     defer remote_first_cycle.deinit();
     const remote_first_rule = remote_first.resolved.rules[0];
     try testing.expectEqual(@as(usize, 2), remote_first_rule.upstream_addresses.len);
@@ -2115,7 +2044,7 @@ test "rule resolution flags any loopback upstream for tcp sockmap auto" {
         \\      - { host: "192.0.2.1", port: 9001 }
         \\
     , null);
-    var loopback_first_cycle = loopback_first.cycle;
+    var loopback_first_cycle = loopback_first.cfg;
     defer loopback_first_cycle.deinit();
     const loopback_first_rule = loopback_first.resolved.rules[0];
     const loopback_first_resolved = resolvedForRule(loopback_first_rule.effective, &loopback_first_rule);
@@ -2132,7 +2061,7 @@ test "rule resolution flags any loopback upstream for tcp sockmap auto" {
         \\      - { host: "192.0.2.2", port: 9002 }
         \\
     , null);
-    var all_remote_cycle = all_remote.cycle;
+    var all_remote_cycle = all_remote.cfg;
     defer all_remote_cycle.deinit();
     const all_remote_rule = all_remote.resolved.rules[0];
     const all_remote_resolved = resolvedForRule(all_remote_rule.effective, &all_remote_rule);
@@ -2174,7 +2103,7 @@ test "detects listen hostname resolution change" {
 
 test "config.example.yaml parses with expected values" {
     // Inline copy of ../config.example.yaml (keep in sync).
-    var cycle = try loadForTest(
+    var cfg = try loadForTest(
         \\listen:
         \\  port: 9000
         \\
@@ -2222,8 +2151,8 @@ test "config.example.yaml parses with expected values" {
         \\#     balance: round_robin
         \\
     );
-    defer cycle.deinit();
-    const config = configuration(&cycle);
+    defer cfg.deinit();
+    const config = configuration(&cfg);
     try testing.expectEqual(9_000, config.listen.port);
     try testing.expectEqualStrings("example.com", config.upstream.host);
     try testing.expectEqual(9_000, config.upstream.port);
@@ -2264,7 +2193,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
     const upstream_port = try freeTcpPort();
 
     // Config lives on disk so the reload path (which reads the file and owns
-    // the candidate cycle) is exercised, not just apply().
+    // the candidate cfg) is exercised, not just apply().
     var path_buf: [129]u8 = undefined;
     const path_len = (std.fmt.bufPrint(&path_buf, "/tmp/curtsy_reload_{d}_{d}.yaml", .{ std.os.linux.getpid(), @as(u64, @truncate(monotonicNowNs())) }) catch unreachable).len;
     path_buf[path_len] = 0;
@@ -2288,7 +2217,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2321,7 +2250,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
 
     // Transactional rollback: the rejected candidate was NOT retained and the
     // previous resolution stays authoritative, so a later valid reload has a
-    // clean cycle-ownership state (retained_cycles only holds cycles the live
+    // clean cfg-ownership state (retained_cycles only holds cycles the live
     // service actually borrows from).
     try testing.expectEqual(@as(usize, 0), service.retained_cycles.items.len);
     try testing.expectEqualStrings("critical", service.resolved.configuration.logging.level);
@@ -2360,7 +2289,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
     service.reload();
 
     // Successful reload: retained_cycles now holds only the previous loaded
-    // cycle handed off by the success path; the service serves the new rules.
+    // cfg handed off by the success path; the service serves the new rules.
     try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
     try testing.expectEqualStrings("critical", service.resolved.configuration.logging.level);
     try testing.expectEqual(@as(u16, upstream_port + 4), service.resolved.rules[0].upstream_addresses[0].port);
@@ -2381,17 +2310,17 @@ test "cli source starts and reloads through the config source" {
     var config = (try cli.parseFlags(testing.allocator, null, null, &.{spec}, null, null, &diag)).?;
     defer config.deinit();
 
-    // The service owns the cycle: cli.loadCycle renders the shorthand into a
+    // The service owns the cfg: cli.loadCycle renders the shorthand into a
     // rules document and the engine resolves the loopback endpoints.
-    var cycle = try cli.loadCycle(testing.allocator, &config, &diag);
+    var cfg = try cli.loadCycle(testing.allocator, &config, &diag);
     var resolve_diag = conf.Diagnostics{};
     defer if (resolve_diag.message) |message| testing.allocator.free(message);
-    const resolved = resolveForwarder(testing.allocator, cycle.allocator(), &cycle, null, &resolve_diag) catch {
-        cycle.deinit();
+    const resolved = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, null, &resolve_diag) catch {
+        cfg.deinit();
         return error.TestResolveFailed;
     };
 
-    var service = ForwarderService.init(testing.allocator, .{ .cli = &config }, cycle, resolved, null, null);
+    var service = ForwarderService.init(testing.allocator, .{ .cli = &config }, cfg, resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2402,7 +2331,7 @@ test "cli source starts and reloads through the config source" {
     try testing.expect(service.rules_list.items[0].tcp_listener != null);
 
     // A SIGHUP reload re-renders the stored CLI shorthand and re-resolves the
-    // same rule; the diff is a no-op and the previous cycle is retained.
+    // same rule; the diff is a no-op and the previous cfg is retained.
     service.reload();
     try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
     try testing.expectEqual(@as(usize, 1), service.resolved.rules.len);
@@ -2430,7 +2359,7 @@ test "reload with an unchanged config file is a no-op" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2450,7 +2379,7 @@ test "reload with an unchanged config file is a no-op" {
     try testing.expectEqual(@as(usize, 1), service.retained_cycles.items.len);
     try testing.expectEqual(@as(u16, upstream_port + 1), service.resolved.rules[0].upstream_addresses[0].port);
 
-    // The file is untouched, so a second reload must be a no-op: no new cycle
+    // The file is untouched, so a second reload must be a no-op: no new cfg
     // is retained, the resolved rules are not re-created, and the live rule
     // list is untouched.
     service.reload();
@@ -2480,7 +2409,7 @@ test "retained cycles are pruned once no retired object borrows them" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;
@@ -2488,7 +2417,7 @@ test "retained cycles are pruned once no retired object borrows them" {
     defer service.deinit();
 
     // In-place reload (same listen address): nothing is retired, so the
-    // superseded cycle has no borrowers and the next prune frees it.
+    // superseded cfg has no borrowers and the next prune frees it.
     var changed_buf: [512]u8 = undefined;
     const changed_yaml = std.fmt.bufPrint(&changed_buf,
         \\logging: {{ level: critical }}
@@ -2504,7 +2433,7 @@ test "retained cycles are pruned once no retired object borrows them" {
     try testing.expectEqual(@as(u16, upstream_port + 1), service.resolved.rules[0].upstream_addresses[0].port);
 
     // A listen-address change retires the old rule; while it is parked the
-    // cycle it borrows must survive pruning, and once reaped the cycle goes.
+    // cfg it borrows must survive pruning, and once reaped the cfg goes.
     // Let the file mtime advance beyond the fingerprint granularity (~1ms on
     // ext4) so the rewrite is seen as a change.
     var sleep_ts = linux.timespec{ .sec = 0, .nsec = 5 * 1_000_000 };
@@ -2547,7 +2476,7 @@ test "reload after touching the file still reloads (DNS refresh preserved)" {
     try writeTestConfig(config_path, initial_yaml);
 
     const initial = try resolveYamlForTest(initial_yaml, null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cycle, initial.resolved, null, null);
+    var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
         return error.TestInitialStartFailed;

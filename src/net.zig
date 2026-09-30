@@ -3,7 +3,7 @@
 //! SocketAddr (IPv4/IPv6 union with sockaddr_storage conversion), the
 //! resolver abstraction (injectable for tests), listen-address expansion
 //! ("*" becomes the dual-stack wildcard pair) and protocol list helpers.
-//! This layer knows nothing about YAML or the module engine.
+//! This layer knows nothing about YAML or the configuration loader.
 
 const std = @import("std");
 

@@ -21,8 +21,8 @@
 //!                      configuration, routing or any forwarding decision.
 //!                      Allowed charset is [A-Za-z0-9._-], at most 64 bytes.
 //!
-//! A run is one configuration cycle through the module engine (conf.zig):
-//! every module parses its own directives, the core module resolves addresses
+//! A run loads the configuration once (conf.zig): every section is decoded,
+//! the core module resolves addresses
 //! and the unified orchestrator (core.ForwarderService) drives 1..N rules.
 //! Configuration or resolution errors print "curtsy: configuration error: ..."
 //! to stderr and exit 2; --check-config prints "configuration is valid" and
@@ -123,19 +123,19 @@ pub fn main(init: std.process.Init) u8 {
         .cli => null,
     };
 
-    var cycle = switch (options) {
+    var cfg = switch (options) {
         .file => |value| conf.loadFile(gpa, value.path, &diag),
         .cli => |*value| cli.loadCycle(gpa, &value.configuration, &diag),
     } catch {
         reportConfigError(&diag);
         return 2;
     };
-    var owns_cycle = true;
-    defer if (owns_cycle) cycle.deinit();
+    var owns_config = true;
+    defer if (owns_config) cfg.deinit();
 
     // Resolve addresses plus registered balancer/protocol names before
     // reporting success, so --check-config validates the complete runtime.
-    const resolved = core.resolveForwarder(gpa, cycle.allocator(), &cycle, null, &diag) catch {
+    const resolved = core.resolveForwarder(gpa, cfg.allocator(), &cfg, null, &diag) catch {
         reportConfigError(&diag);
         return 2;
     };
@@ -151,8 +151,8 @@ pub fn main(init: std.process.Init) u8 {
         .file => |value| .{ .file = value.path },
         .cli => |*value| .{ .cli = &value.configuration },
     };
-    var service = core.ForwarderService.init(gpa, source, cycle, resolved, options.instance(), pre_load_fingerprint);
-    owns_cycle = false;
+    var service = core.ForwarderService.init(gpa, source, cfg, resolved, options.instance(), pre_load_fingerprint);
+    owns_config = false;
     service.run() catch |err| {
         writeErr("curtsy: runtime error: {s}\n", .{@errorName(err)});
         service.deinit();

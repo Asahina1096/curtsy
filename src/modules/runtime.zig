@@ -1,9 +1,8 @@
-//! runtime module: owns the `runtime` directive (root context): worker thread
+//! runtime section: owns the `runtime` key (root context): worker thread
 //! count.
 
 const std = @import("std");
 const conf = @import("../conf.zig");
-const fw = @import("../module.zig");
 const yaml = @import("../yaml.zig");
 
 /// Fixed built-in worker thread count. An omitted key means exactly this
@@ -16,37 +15,20 @@ pub const RuntimeOptions = struct {
 
 pub const Conf = RuntimeOptions;
 
-pub const module: fw.Module = .{
-    .name = "runtime",
-    .directives = &directives,
-    .create_conf = createConf,
-    .validate = validate,
-};
-
-const directives = [_]fw.Directive{
-    .{ .name = "runtime", .root = true, .set = setRuntime },
-};
-
-fn createConf(cycle: *conf.Cycle) error{OutOfMemory}!*anyopaque {
-    const c = try cycle.allocator().create(Conf);
-    c.* = .{};
-    return c;
-}
-
-fn setRuntime(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+pub fn setRuntime(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "runtime");
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{"workerThreads"}, "runtime");
+    const c = &cfg.runtime;
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, value, "runtime");
+    try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{"workerThreads"}, "runtime");
     if (yaml.mappingGet(map, "workerThreads")) |v| {
-        c.worker_threads = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "runtime.workerThreads");
+        c.worker_threads = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "runtime.workerThreads");
     }
 }
 
-fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
-    const c = cycle.conf(@This());
+pub fn validate(cfg: *conf.Configuration) yaml.LoadError!void {
+    const c = &cfg.runtime;
     if (c.worker_threads < 1 or c.worker_threads > std.math.maxInt(i32)) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "runtime.workerThreads must be between 1 and {d}", .{std.math.maxInt(i32)});
+        yaml.setDiag(cfg.gpa, cfg.diag, "runtime.workerThreads must be between 1 and {d}", .{std.math.maxInt(i32)});
         return error.InvalidConfiguration;
     }
 }

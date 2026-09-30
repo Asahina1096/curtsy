@@ -1,78 +1,68 @@
-//! Configuration engine: the ngx_conf_file analogue.
+//! Configuration loading.
 //!
-//! Runs one configuration cycle: parse the YAML document, let every module
-//! create its default conf, dispatch each root mapping key to the owning
-//! module directive, then run finalize (cross-key decoding) and validate
-//! hooks in registry order. The result is a Cycle holding one conf slot per
-//! module plus the per-rule conf bundles created by nested rule dispatch.
+//! The YAML document is decoded straight into a `Configuration` value: one
+//! explicit pass over the top level and one per `rules[]` entry. Every section
+//! is owned by the module that implements it.
 //!
-//! Reloads run a fresh cycle and the core module diffs it against the live
-//! one; a retired cycle stays alive until no listener references its arena.
+//! There is deliberately no module registry, no directive table, no conf slot
+//! and no lifecycle dispatch. Adding a key means editing `RootKey`/`parseRoot`
+//! (or `RuleKey`/`parseRule`) and the owning module — there is no extension
+//! point for an out-of-tree module to register itself against.
 
 const std = @import("std");
-const module = @import("module.zig");
-const net = @import("net.zig");
+const Allocator = std.mem.Allocator;
 const yaml = @import("yaml.zig");
 
-const Allocator = std.mem.Allocator;
+pub const core = @import("modules/core.zig");
+pub const rules = @import("modules/rules.zig");
+pub const timeouts = @import("modules/timeouts.zig");
+pub const limits = @import("modules/limits.zig");
+pub const logging = @import("modules/logging.zig");
+pub const runtime = @import("modules/runtime.zig");
+pub const performance = @import("modules/performance.zig");
 
 pub const Diagnostics = yaml.Diagnostics;
 pub const LoadError = yaml.LoadError;
 
-/// Per-rule conf slots: one entry per module, null for modules without a
-/// rule context. `seen` implements first-occurrence-wins for duplicate keys,
-/// matching the legacy mappingGet semantics.
-pub const RuleBundle = struct {
-    index: usize,
-    slots: [module.module_count]?*anyopaque,
-    seen: std.ArrayList([]const u8) = .empty,
-};
+/// Upper bound on a configuration document read from disk.
+const max_config_bytes = 16 * 1_024 * 1_024;
 
-pub const Cycle = struct {
+/// Keys accepted at the document top level.
+const RootKey = enum { version, protocols, listen, upstream, rules, timeouts, limits, logging, runtime, performance };
+
+/// Keys accepted inside one `rules[]` entry.
+const RuleKey = enum { listen, upstreams, protocols, balance, timeouts, limits };
+
+/// A fully parsed configuration document. Every allocation is owned by
+/// `arena`; `diag` points at caller-owned storage for error reporting.
+pub const Configuration = struct {
     gpa: Allocator,
     arena: std.heap.ArenaAllocator,
     diag: *Diagnostics,
-    confs: [module.module_count]?*anyopaque,
-    rule_bundles: std.ArrayList(RuleBundle) = .empty,
-    /// Set when the document uses the top-level `rules` directive.
-    rules_mode: bool = false,
-    current_rule: ?usize = null,
-    seen_root: std.ArrayList([]const u8) = .empty,
 
-    pub fn allocator(self: *Cycle) Allocator {
+    /// True when the document used the `rules:` form.
+    rules_mode: bool = false,
+
+    core: core.Conf = .{},
+    rules: rules.Conf = .{},
+    timeouts: timeouts.Conf = .{},
+    limits: limits.Conf = .{},
+    logging: logging.Conf = .{},
+    runtime: runtime.Conf = .{},
+    performance: performance.Conf = .{},
+
+    pub fn allocator(self: *Configuration) Allocator {
         return self.arena.allocator();
     }
 
-    pub fn deinit(self: *Cycle) void {
+    pub fn deinit(self: *Configuration) void {
         self.arena.deinit();
-    }
-
-    /// Typed access to a module's global conf (module must exist and have
-    /// run createConf).
-    pub fn conf(self: *Cycle, comptime M: type) *M.Conf {
-        const slot = self.confs[module.moduleSlot(M)] orelse unreachable;
-        return @ptrCast(@alignCast(slot));
-    }
-
-    /// Typed access to a module's conf inside a rule bundle; null when the
-    /// module has no rule context.
-    pub fn ruleConf(self: *Cycle, bundle: *const RuleBundle, comptime M: type) ?*M.RuleConf {
-        _ = self;
-        const slot = bundle.slots[module.moduleSlot(M)] orelse return null;
-        return @ptrCast(@alignCast(slot));
-    }
-
-    fn seenRoot(self: *const Cycle, name: []const u8) bool {
-        for (self.seen_root.items) |seen| {
-            if (std.mem.eql(u8, seen, name)) return true;
-        }
-        return false;
     }
 };
 
-/// Load and fully validate a configuration file into a fresh cycle.
-pub fn loadFile(gpa: Allocator, path: []const u8, diag: *Diagnostics) LoadError!Cycle {
-    const text = yaml.readFileAlloc(gpa, path, 16 * 1_024 * 1_024) catch |err| switch (err) {
+/// Read and decode the configuration document at `path`.
+pub fn loadFile(gpa: Allocator, path: []const u8, diag: *Diagnostics) LoadError!Configuration {
+    const text = yaml.readFileAlloc(gpa, path, max_config_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             yaml.setDiag(gpa, diag, "unable to read configuration file: {s}", .{path});
@@ -83,191 +73,162 @@ pub fn loadFile(gpa: Allocator, path: []const u8, diag: *Diagnostics) LoadError!
     return loadYaml(gpa, text, diag);
 }
 
-/// Load and fully validate a configuration from YAML text.
-pub fn loadYaml(gpa: Allocator, text: []const u8, diag: *Diagnostics) LoadError!Cycle {
-    var cycle = Cycle{
+/// Decode an in-memory configuration document (also the backend of the CLI
+/// endpoint flags, which render to YAML first).
+pub fn loadYaml(gpa: Allocator, text: []const u8, diag: *Diagnostics) LoadError!Configuration {
+    var cfg = Configuration{
         .gpa = gpa,
         .arena = std.heap.ArenaAllocator.init(gpa),
         .diag = diag,
-        .confs = .{null} ** module.module_count,
     };
-    errdefer cycle.deinit();
-    const arena = cycle.arena.allocator();
+    errdefer cfg.deinit();
 
     // The YAML parser keeps scalar strings as slices of the input document
-    // (splitLines slices it directly rather than copying every token), so the
-    // cycle's Value tree borrows that buffer. Copy the document into the arena
-    // so a cycle is self-contained: `loadFile` hands the parsed cycle to its
-    // caller and then frees the file bytes, and every module conf that stores
-    // a decoded string (listen/upstream hosts, logging level, ...) stays valid
-    // for as long as the cycle lives.
-    const owned_text = try arena.dupe(u8, text);
-    const root = try yaml.parse(arena, gpa, owned_text, diag);
+    // rather than copying every token, so the Value tree borrows that buffer.
+    // Copy the document into the arena first: `loadFile` frees the file bytes
+    // as soon as the configuration is parsed, and every decoded string
+    // (listen/upstream hosts, logging level, ...) must stay valid for as long
+    // as the configuration lives.
+    const owned_text = try cfg.allocator().dupe(u8, text);
+    const root = try yaml.parse(cfg.allocator(), gpa, owned_text, diag);
     if (root.* != .mapping) {
         yaml.setDiag(gpa, diag, "YAML root must be a mapping", .{});
         return error.InvalidConfiguration;
     }
-
-    // createConf: every module installs its defaults before any directive
-    // runs, so set handlers only touch explicitly configured values.
-    for (&module.modules) |*ref| {
-        if (ref.module.create_conf) |create| {
-            cycle.confs[ref.slot] = try create(&cycle);
-        }
-    }
-
-    try dispatchMapping(&cycle, root.mapping, .root, "");
-
-    if (cycle.rules_mode and (cycle.seenRoot("listen") or cycle.seenRoot("upstream"))) {
-        yaml.setDiag(gpa, diag, "configuration cannot mix listen/upstream with rules", .{});
-        return error.InvalidConfiguration;
-    }
-
-    for (&module.modules) |*ref| {
-        if (ref.module.finalize) |finalize| try finalize(&cycle);
-    }
-    for (&module.modules) |*ref| {
-        if (ref.module.validate) |validate| try validate(&cycle);
-    }
-    return cycle;
+    try parseRoot(&cfg, root.mapping);
+    try finalize(&cfg);
+    try validate(&cfg);
+    return cfg;
 }
 
-/// Dispatch every entry of a mapping to the owning module directive in the
-/// given context. Unknown keys are rejected with dotted paths. Modules whose
-/// directives introduce a nested scope (rules) call this recursively through
-/// beginRule/dispatchMapping/endRule.
-pub fn dispatchMapping(cycle: *Cycle, mapping: []const yaml.Entry, context: module.Context, path: []const u8) LoadError!void {
-    const gpa = cycle.gpa;
-    const diag = cycle.diag;
-    const arena = cycle.allocator();
+fn contains(seen: []const []const u8, key: []const u8) bool {
+    for (seen) |entry| {
+        if (std.mem.eql(u8, entry, key)) return true;
+    }
+    return false;
+}
 
+/// Decode the document top level. The first occurrence of a duplicated key
+/// wins, matching the rest of the configuration surface.
+fn parseRoot(cfg: *Configuration, mapping: []const yaml.Entry) LoadError!void {
+    var seen: std.ArrayList([]const u8) = .empty;
     for (mapping) |entry| {
-        const found = module.findDirective(entry.key, context) orelse {
-            if (path.len == 0) {
-                yaml.setDiag(gpa, diag, "unknown configuration key: {s}", .{entry.key});
-            } else {
-                yaml.setDiag(gpa, diag, "unknown configuration key: {s}.{s}", .{ path, entry.key });
-            }
-            return error.InvalidConfiguration;
-        };
+        const key = std.meta.stringToEnum(RootKey, entry.key) orelse
+            return yaml.fail(cfg.gpa, cfg.diag, "unknown configuration key: {s}", .{entry.key});
+        if (contains(seen.items, entry.key)) continue;
+        try seen.append(cfg.allocator(), entry.key);
 
-        const slot: *anyopaque = switch (context) {
-            .root => blk: {
-                // First occurrence wins (legacy mappingGet semantics).
-                if (cycle.seenRoot(entry.key)) break :blk null;
-                try cycle.seen_root.append(arena, entry.key);
-                break :blk cycle.confs[found.module.slot].?;
+        switch (key) {
+            .version => cfg.core.version = try yaml.decodeInt(cfg.gpa, cfg.diag, entry.value, "version"),
+            .protocols => try core.setProtocols(cfg, entry.value, "protocols"),
+            .listen => {
+                if (cfg.rules_mode) return yaml.fail(cfg.gpa, cfg.diag, "configuration cannot mix listen/upstream with rules", .{});
+                cfg.core.listen_node = entry.value;
             },
-            .rule => blk: {
-                const bundle = &cycle.rule_bundles.items[cycle.current_rule.?];
-                for (bundle.seen.items) |seen| {
-                    if (std.mem.eql(u8, seen, entry.key)) break :blk null;
+            .upstream => {
+                if (cfg.rules_mode) return yaml.fail(cfg.gpa, cfg.diag, "configuration cannot mix listen/upstream with rules", .{});
+                cfg.core.upstream_node = entry.value;
+            },
+            .rules => {
+                if (cfg.core.listen_node != null or cfg.core.upstream_node != null) {
+                    return yaml.fail(cfg.gpa, cfg.diag, "configuration cannot mix listen/upstream with rules", .{});
                 }
-                try bundle.seen.append(arena, entry.key);
-                break :blk bundle.slots[found.module.slot].?;
+                cfg.rules_mode = true;
+                cfg.rules.rules_node = entry.value;
             },
-        } orelse continue;
-
-        try found.directive.set(cycle, slot, entry.value, path);
-    }
-}
-
-/// Open a nested rule scope: creates a rule bundle with one conf slot per
-/// module that has a rule context. The rules module calls this before
-/// dispatching a rule's mapping.
-pub fn beginRule(cycle: *Cycle, index: usize) error{OutOfMemory}!void {
-    var bundle = RuleBundle{
-        .index = index,
-        .slots = .{null} ** module.module_count,
-    };
-    for (&module.modules) |*ref| {
-        if (ref.module.create_rule_conf) |create| {
-            bundle.slots[ref.slot] = try create(cycle);
+            .timeouts => try timeouts.setTimeouts(cfg, entry.value, "timeouts"),
+            .limits => try limits.setLimits(cfg, entry.value, "limits"),
+            .logging => try logging.setLogging(cfg, entry.value, "logging"),
+            .runtime => try runtime.setRuntime(cfg, entry.value, "runtime"),
+            .performance => try performance.setPerformance(cfg, entry.value, "performance"),
         }
     }
-    try cycle.rule_bundles.append(cycle.allocator(), bundle);
-    cycle.current_rule = cycle.rule_bundles.items.len - 1;
 }
 
-pub fn endRule(cycle: *Cycle) void {
-    cycle.current_rule = null;
-}
+/// Decode one `rules[]` entry. The caller (`modules/rules.zig`) requires the
+/// `listen`/`upstreams` keys and finishes the entry.
+pub fn parseRule(
+    cfg: *Configuration,
+    rule: *rules.RuleConf,
+    timeout_overrides: *timeouts.RuleConf,
+    limit_overrides: *limits.RuleConf,
+    mapping: []const yaml.Entry,
+    path: []const u8,
+) LoadError!void {
+    var seen: std.ArrayList([]const u8) = .empty;
+    for (mapping) |entry| {
+        const key = std.meta.stringToEnum(RuleKey, entry.key) orelse
+            return yaml.fail(cfg.gpa, cfg.diag, "unknown configuration key: {s}.{s}", .{ path, entry.key });
+        if (contains(seen.items, entry.key)) continue;
+        try seen.append(cfg.allocator(), entry.key);
 
-/// Mark the cycle as rules-mode; called by the rules directive handler.
-pub fn enterRulesMode(cycle: *Cycle) void {
-    cycle.rules_mode = true;
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-const testing = std.testing;
-const core = @import("modules/core.zig");
-
-fn loadForTest(text: []const u8) !Cycle {
-    var diag = Diagnostics{};
-    return loadYaml(testing.allocator, text, &diag) catch |err| {
-        if (diag.message) |message| {
-            std.debug.print("unexpected load failure: {s}\n", .{message});
-            testing.allocator.free(message);
+        switch (key) {
+            .listen => try rules.setRuleListen(cfg, rule, entry.value, path),
+            .upstreams => try rules.setRuleUpstreams(cfg, rule, entry.value, path),
+            .protocols => try rules.setRuleProtocols(cfg, rule, entry.value, path),
+            .balance => try rules.setRuleBalance(cfg, rule, entry.value, path),
+            .timeouts => try timeouts.setRuleTimeouts(cfg, timeout_overrides, entry.value, path),
+            .limits => try limits.setRuleLimits(cfg, limit_overrides, entry.value, path),
         }
-        return err;
-    };
-}
-
-pub fn expectLoadFailure(text: []const u8, expected_message: ?[]const u8) !void {
-    var diag = Diagnostics{};
-    const result = loadYaml(testing.allocator, text, &diag);
-    if (result) |cycle_value| {
-        var cycle = cycle_value;
-        cycle.deinit();
-        return error.TestExpectedFailureButLoaded;
-    } else |_| {}
-    if (expected_message) |expected| {
-        try testing.expectEqualStrings(expected, diag.message.?);
     }
-    if (diag.message) |message| testing.allocator.free(message);
 }
 
-test "unknown keys are rejected by the engine at the root" {
-    try expectLoadFailure(
-        \\listen: { port: 9000 }
-        \\upstream: { host: "127.0.0.1", port: 9001 }
-        \\bogus: true
-        \\
-    , "unknown configuration key: bogus");
+/// Cross-key decoding, in the order the sections depend on each other.
+fn finalize(cfg: *Configuration) LoadError!void {
+    try core.finalize(cfg);
+    try rules.finalize(cfg);
 }
 
-test "rejects rules mixed with legacy endpoints" {
-    try expectLoadFailure(
-        \\listen: { port: 9000 }
-        \\rules:
-        \\  - listen: { port: 9001 }
-        \\    upstreams: [ { host: "a" } ]
-        \\
-    , "configuration cannot mix listen/upstream with rules");
-
-    try expectLoadFailure(
-        \\rules:
-        \\  - listen: { port: 9001 }
-        \\    upstreams: [ { host: "a" } ]
-        \\upstream: { host: "b", port: 9001 }
-        \\
-    , "configuration cannot mix listen/upstream with rules");
+fn validate(cfg: *Configuration) LoadError!void {
+    try core.validate(cfg);
+    try rules.validate(cfg);
+    try timeouts.validate(cfg);
+    try limits.validate(cfg);
+    try logging.validate(cfg);
+    try runtime.validate(cfg);
+    try performance.validate(cfg);
 }
 
-test "first occurrence of a duplicate root key wins" {
-    var cycle = try loadForTest(
+/// Test helper: the document must be rejected with `expected` as the message.
+pub fn expectLoadFailure(text: []const u8, expected: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var diag = Diagnostics{};
+    defer if (diag.message) |message| gpa.free(message);
+    try std.testing.expectError(error.InvalidConfiguration, loadYaml(gpa, text, &diag));
+    const message = diag.message orelse return error.TestExpectedError;
+    try std.testing.expectEqualStrings(expected, message);
+}
+
+test "unknown keys are rejected in both contexts" {
+    try expectLoadFailure("bogus: 1\n", "unknown configuration key: bogus");
+    try expectLoadFailure(
+        "rules:\n  - listen: 1.2.3.4:80\n    upstreams: [5.6.7.8:80]\n    bogus: 1\n",
+        "unknown configuration key: rules[0].bogus",
+    );
+}
+
+test "the document root must be a mapping" {
+    try expectLoadFailure("- 1\n- 2\n", "YAML root must be a mapping");
+}
+
+test "listen/upstream cannot be mixed with rules" {
+    const expected = "configuration cannot mix listen/upstream with rules";
+    try expectLoadFailure("listen: 1.2.3.4:80\nrules: []\n", expected);
+    try expectLoadFailure("rules: []\nupstream: 5.6.7.8:80\n", expected);
+}
+
+test "the first occurrence of a duplicate key wins" {
+    const gpa = std.testing.allocator;
+    var diag = Diagnostics{};
+    defer if (diag.message) |message| gpa.free(message);
+
+    var cfg = try loadYaml(gpa,
         \\listen: { port: 9000 }
         \\listen: { port: 9001 }
         \\upstream: { host: "localhost" }
         \\
-    );
-    defer cycle.deinit();
-    try testing.expectEqual(9_000, cycle.conf(core).listen.?.port);
-}
-
-test "YAML root must be a mapping" {
-    try expectLoadFailure("- tcp\n- udp\n", "YAML root must be a mapping");
+    , &diag);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 9000), cfg.core.listen.?.port);
+    try std.testing.expectEqualStrings("localhost", cfg.core.upstream.?.host);
 }

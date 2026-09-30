@@ -25,13 +25,12 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透�
 
 ## 代码组织
 
-整体参考 nginx 模块架构：`src/module.zig` 是 `ngx_module_t`/`ngx_modules[]` 的对应物，`src/conf.zig` 是 `ngx_conf_file` 的对应物（配置引擎），每个功能是一个注册进 comptime 注册表的模块。模块声明自己的指令表（`Directive`，对应 `ngx_command_t`，带 root/rule 上下文）和 conf 生命周期钩子：`createConf`（默认值）→ 指令 `set` → `finalize`（跨键解码，如 upstream.port 默认取 listen.port）→ `validate`。有 rule 上下文的模块再实现 `createRuleConf`，由 rules 模块驱动嵌套分发，core 模块把规则级覆盖 merge 到全局配置上（对应 `merge_conf`）。
+按功能分区：`src/modules/` 下每个 section 一个文件，但**没有模块框架**。配置由一个显式解析过程直接解码：`src/conf.zig` 的 `parseRoot` 逐键分发根键、`parseRule` 逐条解码 `rules[]`，各 section 由所属模块自己的 `set*`/`finalize`/`validate` 函数处理。没有模块注册表、指令表、conf 槽位或生命周期分发，因此也没有共享库 ABI、`plugins:` 配置或插件 CLI 入口 —— 新增一个配置键必须同时改解析过程与所属模块并重新构建。规则级覆盖由各模块自己的 `merge()` 应用到全局值上（如 upstream.port 默认取 listen.port）。
 
 基础设施（src/ 根）：
 
 - `src/main.zig`：命令行入口。一次运行就是一个配置 cycle：`conf.loadFile` 解析并校验 → `core.resolveForwarder` 解析地址 → `core.ForwarderService.run()`。配置错误退出码为 2。
-- `src/module.zig`：`Module`/`Directive` 类型、模块注册表（comptime 模块类型列表 `module_types` 为唯一排序来源，据此生成每条模块引用 `ModuleRef`，含描述符指针与 conf slot 下标）、指令查找、协议模块注册表。
-- `src/conf.zig`：配置引擎（Cycle）。解析 YAML → 各模块 createConf → 根键按指令表分发（未知键引擎直接拒绝，`rules` 与 `listen`/`upstream` 互斥在此检查）→ finalize → validate。rule 作用域经 `beginRule`/`dispatchMapping`/`endRule` 嵌套分发，每个规则产生一个 RuleBundle（各模块的规则级 conf slot）。
+- `src/conf.zig`：配置加载与校验。把 YAML 文档直接解码成 `Configuration`（`parseRoot` 逐键分发根键，未知键直接拒绝，`rules` 与 `listen`/`upstream` 互斥在此检查；`parseRule` 解码每个 `rules[]` 条目并把规则级覆盖交给各模块的 `setRule*`），随后按固定顺序跑 `finalize`（core → rules）与 `validate`（core → rules → timeouts → limits → logging → runtime → performance）。文档会被复制进 arena，因为 YAML 标量是输入缓冲的切片。
 - `src/yaml.zig`：YAML 子集解析器与标量解码助手（纯机制，不含任何配置语义）。
 - `src/net.zig`：`SocketAddr`、resolver（可注入测试）、listen 地址展开（`*` → 双栈通配对）、协议列表助手。
 - `src/log.zig`：带原子阈值和 futex mutex 的日志门面，输出到 stderr。
@@ -44,7 +43,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透�
 - `src/modules/core.zig`：核心模块（`ngx_core_module` 对应物）。拥有 `version`/`protocols`/`listen`/`upstream` 根指令（单规则语法糖，resolve 时合成为一条规则）、组合配置模型（`ForwarderConfiguration`/`ResolvedConfiguration`/`ResolvedForwarder`）、地址解析与跨规则监听冲突检测、协议模块接口（`Listener` vtable + `ProtocolModule`）、统一编排器 `ForwarderService`（单 cycle 驱动 1..N 条规则；SIGHUP 跑新 cycle 后按规则 listen 地址集合 diff，匹配规则原地更新、新规则先绑定再退役旧规则；`runtime.workerThreads` 对所有规则一视同仁）。
 - `src/modules/rules.zig`：`rules` 根指令与规则内 `listen`/`upstreams`/`protocols`/`balance` 指令、规则模型与校验。
 - `src/modules/cli.zig`：命令行运行模式模块（可选、默认关闭）。解析 `--listen`/`--upstream`（单规则简写）与可重复的 `--rule`（多规则简写），把简写渲染成 `rules:` YAML 文档后走 `conf.loadYaml`，因此 CLI 规则复用 rules 模块的解码/校验/默认值与 core 编排器的 SIGHUP 热重载；命令行简写早校验端口、weight、协议与 balance 名字。`src/main.zig` 在同时给出 `--config` 与 CLI 端点 flag 时报错退出（互斥）。
-- 当前模块均为系统级内置模块，通过 `src/module.zig` 的 comptime 注册表编译进 `curtsy`。SIGHUP 只替换配置、监听器和上游 generation，不装载或卸载机器码。未来可能支持外部插件，但当前没有共享库 ABI、`plugins:` 配置或插件 CLI 入口。
+- 所有功能都编译进 `curtsy` 这一个二进制，没有运行时装载；SIGHUP 只替换配置、监听器和上游 generation。TCP/UDP 由 `core.zig` 按协议直接分发到对应实现，不存在协议注册表或可替换的实现句柄。
 - `src/modules/timeouts.zig` / `limits.zig` / `logging.zig` / `runtime.zig` / `performance.zig`：各配置 section 模块。timeouts/limits 同时有 root 和 rule 上下文（规则级为覆盖项，`merge()` 应用到全局值上）。
 - `src/modules/upstream.zig`：上游框架（`ngx_upstream` 对应物）。`UpstreamPool`（peer 状态：被动健康摘除，连续失败 3 次摘除 10 秒，指数回退上限 5 分钟，冷却自动恢复；热加载经 `rebind` 按地址继承健康；pool 对象地址稳定）、注入数据面的 `Selector` 钩子、balancer 注册表。
 - `src/modules/balancer/round_robin.zig` / `source_hash.zig` / `weighted_round_robin.zig`：可插拔负载均衡模块，`balance:` 按名字经注册表选择。
@@ -66,7 +65,7 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透�
 - 遵循现有 Zig 风格：4 空格缩进，模块内按功能分 section，类型用 `struct`，错误集尽量显式。
 - 代码注释和标识符使用英文；用户可见文档（README 等）使用中文。
 - 日志格式为 `key=value` 拼接的纯文本，通过 `LogStore` 输出；新增日志点沿用该格式。
-- 配置新增字段时：同步更新所属模块（`src/modules/`）的指令表、conf 类型、默认值、validate 校验与配置测试，以及 `config.example.yaml`；新增配置 section 时应新建一个模块并注册进 `src/module.zig`。
+- 配置新增字段时：同步更新所属模块（`src/modules/`）的 `set*`/`validate`、conf 类型、默认值、配置测试与 `config.example.yaml`，并在 `src/conf.zig` 的 `parseRoot`/`parseRule` 里接上该键（`RootKey`/`RuleKey` 枚举同时更新）。
 - 资源管理：BPF 描述符、socket fd、epoll fd、eventfd、budget 计数都必须成对释放；`TCPBufferBudget` / `UdpAssociationBudget` 的 release 多于 acquire 会触发 debug assertion。
 
 ## 测试策略

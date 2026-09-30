@@ -722,22 +722,13 @@ pub const UdpListener = struct {
 // Protocol module registration (core orchestrator entry point)
 // ---------------------------------------------------------------------------
 
-pub const protocol_module = config.ProtocolModule{
-    .name = "udp",
-    .protocol = .udp,
-    .drains_connections = false,
-    .create = createProtocolListener,
-};
-
-fn createProtocolListener(
-    context: ?*anyopaque,
+pub fn createProtocolListener(
     outer_allocator: Allocator,
     resolved: ResolvedConfiguration,
     logger: *LogStore,
     selector: ?upstream.Selector,
     start_paused: bool,
 ) anyerror!*config.Listener {
-    _ = context;
     const listener = try outer_allocator.create(UdpListener);
     errdefer outer_allocator.destroy(listener);
     listener.* = UdpListener.initWithSelector(outer_allocator, resolved, logger, null, null, selector);

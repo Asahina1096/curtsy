@@ -1,9 +1,8 @@
-//! performance module: owns the `performance` directive (root context):
+//! performance section: owns the `performance` key (root context):
 //! sockmap acceleration modes and UDP socket/relay buffer sizing.
 
 const std = @import("std");
 const conf = @import("../conf.zig");
-const fw = @import("../module.zig");
 const yaml = @import("../yaml.zig");
 const linux = std.os.linux;
 
@@ -14,7 +13,7 @@ pub const SockmapAccelerationMode = enum { auto, enabled, disabled };
 /// i-th online (allowed) CPU, wrapping; an explicit list binds thread i to
 /// list[i % list.len]. Pinning improves cache locality on multi-core/NUMA
 /// hosts but can hurt on shared machines, so it is opt-in and defaults to
-/// none. The explicit list and the config string live in the cycle arena.
+/// none. The explicit list and the config string live in the cfg arena.
 pub const CpuAffinity = union(enum) {
     none,
     sequential,
@@ -51,108 +50,91 @@ pub const PerformanceConfiguration = struct {
 
 pub const Conf = PerformanceConfiguration;
 
-pub const module: fw.Module = .{
-    .name = "performance",
-    .directives = &directives,
-    .create_conf = createConf,
-    .validate = validate,
-};
-
-const directives = [_]fw.Directive{
-    .{ .name = "performance", .root = true, .set = setPerformance },
-};
-
-fn createConf(cycle: *conf.Cycle) error{OutOfMemory}!*anyopaque {
-    const c = try cycle.allocator().create(Conf);
-    c.* = .{};
-    return c;
-}
-
-fn decodeSockmapMode(cycle: *conf.Cycle, value: *yaml.Value, path: []const u8) yaml.LoadError!SockmapAccelerationMode {
-    const text = try yaml.decodeString(cycle.gpa, cycle.diag, value, path);
+pub fn decodeSockmapMode(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!SockmapAccelerationMode {
+    const text = try yaml.decodeString(cfg.gpa, cfg.diag, value, path);
     const map = std.StaticStringMap(SockmapAccelerationMode).initComptime(.{
         .{ "auto", .auto },
         .{ "enabled", .enabled },
         .{ "disabled", .disabled },
     });
     return map.get(text) orelse
-        yaml.fail(cycle.gpa, cycle.diag, "{s}: expected one of auto, enabled, disabled", .{path});
+        yaml.fail(cfg.gpa, cfg.diag, "{s}: expected one of auto, enabled, disabled", .{path});
 }
 
-fn decodeCpuAffinity(cycle: *conf.Cycle, value: *yaml.Value, path: []const u8) yaml.LoadError!CpuAffinity {
+pub fn decodeCpuAffinity(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!CpuAffinity {
     switch (value.*) {
         .scalar => {
-            const text = try yaml.decodeString(cycle.gpa, cycle.diag, value, path);
+            const text = try yaml.decodeString(cfg.gpa, cfg.diag, value, path);
             if (std.mem.eql(u8, text, "none")) return .none;
             if (std.mem.eql(u8, text, "sequential")) return .sequential;
-            return yaml.fail(cycle.gpa, cycle.diag, "{s}: expected none, sequential, or a list of cpu ids", .{path});
+            return yaml.fail(cfg.gpa, cfg.diag, "{s}: expected none, sequential, or a list of cpu ids", .{path});
         },
         .sequence => {
             const items = value.sequence;
-            const cpus = try cycle.allocator().alloc(u16, items.len);
+            const cpus = try cfg.allocator().alloc(u16, items.len);
             for (items, 0..) |entry, i| {
-                const cpu = try yaml.decodeInt(cycle.gpa, cycle.diag, entry, path);
+                const cpu = try yaml.decodeInt(cfg.gpa, cfg.diag, entry, path);
                 if (cpu < 0) {
-                    return yaml.fail(cycle.gpa, cycle.diag, "{s}[{d}]: cpu ids must be non-negative", .{ path, i });
+                    return yaml.fail(cfg.gpa, cfg.diag, "{s}[{d}]: cpu ids must be non-negative", .{ path, i });
                 }
                 // cpu_set_t cannot represent ids beyond CPU_SETSIZE; reject
                 // them here instead of panicking on the u16 cast or silently
                 // skipping them in pinThread.
                 if (cpu >= linux.CPU_SETSIZE) {
-                    return yaml.fail(cycle.gpa, cycle.diag, "{s}[{d}]: cpu ids must be below {d}", .{ path, i, linux.CPU_SETSIZE });
+                    return yaml.fail(cfg.gpa, cfg.diag, "{s}[{d}]: cpu ids must be below {d}", .{ path, i, linux.CPU_SETSIZE });
                 }
                 cpus[i] = @intCast(cpu);
             }
             return .{ .explicit = cpus };
         },
-        else => return yaml.fail(cycle.gpa, cycle.diag, "{s}: expected none, sequential, or a list of cpu ids", .{path}),
+        else => return yaml.fail(cfg.gpa, cfg.diag, "{s}: expected none, sequential, or a list of cpu ids", .{path}),
     }
 }
 
-fn setPerformance(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+pub fn setPerformance(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "performance");
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "tcpSockmapAcceleration", "udpSockmapAcceleration", "udpSocketBufferBytes", "udpDatagramBufferBytes", "udpIOThreads", "threadCpuAffinity" }, "performance");
+    const c = &cfg.performance;
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, value, "performance");
+    try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{ "tcpSockmapAcceleration", "udpSockmapAcceleration", "udpSocketBufferBytes", "udpDatagramBufferBytes", "udpIOThreads", "threadCpuAffinity" }, "performance");
     if (yaml.mappingGet(map, "tcpSockmapAcceleration")) |v| {
-        c.tcp_sockmap_acceleration = try decodeSockmapMode(cycle, v, "performance.tcpSockmapAcceleration");
+        c.tcp_sockmap_acceleration = try decodeSockmapMode(cfg, v, "performance.tcpSockmapAcceleration");
     }
     if (yaml.mappingGet(map, "udpSockmapAcceleration")) |v| {
-        c.udp_sockmap_acceleration = try decodeSockmapMode(cycle, v, "performance.udpSockmapAcceleration");
+        c.udp_sockmap_acceleration = try decodeSockmapMode(cfg, v, "performance.udpSockmapAcceleration");
     }
     if (yaml.mappingGet(map, "udpSocketBufferBytes")) |v| {
-        c.udp_socket_buffer_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "performance.udpSocketBufferBytes");
+        c.udp_socket_buffer_bytes = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "performance.udpSocketBufferBytes");
     }
     if (yaml.mappingGet(map, "udpDatagramBufferBytes")) |v| {
-        c.udp_datagram_buffer_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "performance.udpDatagramBufferBytes");
+        c.udp_datagram_buffer_bytes = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "performance.udpDatagramBufferBytes");
     }
     if (yaml.mappingGet(map, "udpIOThreads")) |v| {
-        c.udp_io_threads = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "performance.udpIOThreads");
+        c.udp_io_threads = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "performance.udpIOThreads");
     }
     if (yaml.mappingGet(map, "threadCpuAffinity")) |v| {
-        c.thread_cpu_affinity = try decodeCpuAffinity(cycle, v, "performance.threadCpuAffinity");
+        c.thread_cpu_affinity = try decodeCpuAffinity(cfg, v, "performance.threadCpuAffinity");
     }
 }
 
-fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
-    const c = cycle.conf(@This());
+pub fn validate(cfg: *conf.Configuration) yaml.LoadError!void {
+    const c = &cfg.performance;
     if (c.udp_socket_buffer_bytes < 0 or c.udp_socket_buffer_bytes > max_udp_socket_buffer_bytes) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "performance.udpSocketBufferBytes must be between 0 (kernel default) and {d}", .{max_udp_socket_buffer_bytes});
+        yaml.setDiag(cfg.gpa, cfg.diag, "performance.udpSocketBufferBytes must be between 0 (kernel default) and {d}", .{max_udp_socket_buffer_bytes});
         return error.InvalidConfiguration;
     }
     if (c.udp_io_threads < 1) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "performance.udpIOThreads must be positive", .{});
+        yaml.setDiag(cfg.gpa, cfg.diag, "performance.udpIOThreads must be positive", .{});
         return error.InvalidConfiguration;
     }
     if (c.udp_datagram_buffer_bytes < min_udp_datagram_buffer_bytes or
         c.udp_datagram_buffer_bytes > max_udp_datagram_buffer_bytes)
     {
-        yaml.setDiag(cycle.gpa, cycle.diag, "performance.udpDatagramBufferBytes must be between {d} and {d}", .{ min_udp_datagram_buffer_bytes, max_udp_datagram_buffer_bytes });
+        yaml.setDiag(cfg.gpa, cfg.diag, "performance.udpDatagramBufferBytes must be between {d} and {d}", .{ min_udp_datagram_buffer_bytes, max_udp_datagram_buffer_bytes });
         return error.InvalidConfiguration;
     }
     switch (c.thread_cpu_affinity) {
         .explicit => |list| if (list.len == 0) {
-            yaml.setDiag(cycle.gpa, cycle.diag, "performance.threadCpuAffinity list must not be empty", .{});
+            yaml.setDiag(cfg.gpa, cfg.diag, "performance.threadCpuAffinity list must not be empty", .{});
             return error.InvalidConfiguration;
         },
         else => {},
@@ -161,7 +143,7 @@ fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
 
 const testing = std.testing;
 
-fn loadPerformanceForTest(text: []const u8) !conf.Cycle {
+fn loadPerformanceForTest(text: []const u8) !conf.Configuration {
     var diag = conf.Diagnostics{};
     return conf.loadYaml(testing.allocator, text, &diag) catch |err| {
         if (diag.message) |message| testing.allocator.free(message);
@@ -170,13 +152,13 @@ fn loadPerformanceForTest(text: []const u8) !conf.Cycle {
 }
 
 test "threadCpuAffinity decodes none, sequential and explicit lists" {
-    var cycle = try loadPerformanceForTest(
+    var cfg = try loadPerformanceForTest(
         \\listen: { port: 9000 }
         \\upstream: { host: "localhost", port: 9000 }
         \\
     );
-    defer cycle.deinit();
-    try testing.expect(cycle.conf(@This()).thread_cpu_affinity == .none);
+    defer cfg.deinit();
+    try testing.expect(cfg.performance.thread_cpu_affinity == .none);
 
     var cycle_seq = try loadPerformanceForTest(
         \\listen: { port: 9000 }
@@ -186,7 +168,7 @@ test "threadCpuAffinity decodes none, sequential and explicit lists" {
         \\
     );
     defer cycle_seq.deinit();
-    try testing.expect(cycle_seq.conf(@This()).thread_cpu_affinity == .sequential);
+    try testing.expect(cycle_seq.performance.thread_cpu_affinity == .sequential);
 
     var cycle_list = try loadPerformanceForTest(
         \\listen: { port: 9000 }
@@ -196,7 +178,7 @@ test "threadCpuAffinity decodes none, sequential and explicit lists" {
         \\
     );
     defer cycle_list.deinit();
-    const explicit = cycle_list.conf(@This()).thread_cpu_affinity;
+    const explicit = cycle_list.performance.thread_cpu_affinity;
     try testing.expect(explicit == .explicit);
     try testing.expectEqualSlices(u16, &.{ 0, 2, 4 }, explicit.explicit);
 }

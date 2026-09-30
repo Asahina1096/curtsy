@@ -1,4 +1,4 @@
-//! limits module: owns the `limits` directive in the root and rule contexts.
+//! limits section: owns the `limits` key in the root and rule contexts.
 //!
 //! Global limits start from the fixed built-in defaults declared below and are
 //! replaced by any explicitly configured integer. Rule confs hold explicit
@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const conf = @import("../conf.zig");
-const fw = @import("../module.zig");
 const yaml = @import("../yaml.zig");
 
 pub const max_udp_associations: i64 = std.math.maxInt(u32) / 2; // 2147483647
@@ -47,114 +46,89 @@ pub fn merge(global: LimitConfiguration, overrides: RuleLimitOverrides) LimitCon
     return limits;
 }
 
-pub const module: fw.Module = .{
-    .name = "limits",
-    .directives = &directives,
-    .create_conf = createConf,
-    .create_rule_conf = createRuleConf,
-    .validate = validate,
-};
-
-const directives = [_]fw.Directive{
-    .{ .name = "limits", .root = true, .set = setLimits },
-    .{ .name = "limits", .rule = true, .set = setRuleLimits },
-};
-
-fn createConf(cycle: *conf.Cycle) error{OutOfMemory}!*anyopaque {
-    const c = try cycle.allocator().create(Conf);
-    c.* = .{};
-    return c;
-}
-
-fn createRuleConf(cycle: *conf.Cycle) error{OutOfMemory}!?*anyopaque {
-    const c = try cycle.allocator().create(RuleConf);
-    c.* = .{};
-    return c;
-}
-
-fn setLimits(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+pub fn setLimits(cfg: *conf.Configuration, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     _ = path;
-    const c: *Conf = @ptrCast(@alignCast(slot));
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "limits");
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations", "maxUDPPendingDatagrams", "maxUDPPendingBytes" }, "limits");
+    const c = &cfg.limits;
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, value, "limits");
+    try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations", "maxUDPPendingDatagrams", "maxUDPPendingBytes" }, "limits");
     if (yaml.mappingGet(map, "tcpListenBacklog")) |v| {
-        c.tcp_listen_backlog = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.tcpListenBacklog");
+        c.tcp_listen_backlog = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "limits.tcpListenBacklog");
     }
     if (yaml.mappingGet(map, "maxTCPBufferedBytes")) |v| {
-        c.max_tcp_buffered_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxTCPBufferedBytes");
+        c.max_tcp_buffered_bytes = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "limits.maxTCPBufferedBytes");
     }
     if (yaml.mappingGet(map, "maxUDPAssociations")) |v| {
-        c.max_udp_associations = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxUDPAssociations");
+        c.max_udp_associations = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "limits.maxUDPAssociations");
     }
     if (yaml.mappingGet(map, "maxUDPPendingDatagrams")) |v| {
-        c.max_udp_pending_datagrams = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxUDPPendingDatagrams");
+        c.max_udp_pending_datagrams = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "limits.maxUDPPendingDatagrams");
     }
     if (yaml.mappingGet(map, "maxUDPPendingBytes")) |v| {
-        c.max_udp_pending_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxUDPPendingBytes");
+        c.max_udp_pending_bytes = try yaml.decodeInt(cfg.gpa, cfg.diag, v, "limits.maxUDPPendingBytes");
     }
 }
 
-fn setRuleLimits(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
-    const c: *RuleConf = @ptrCast(@alignCast(slot));
+pub fn setRuleLimits(cfg: *conf.Configuration, oc: *RuleConf, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
+    const c = oc;
     var path_buf: [96]u8 = undefined;
     const limits_path = std.fmt.bufPrint(&path_buf, "{s}.limits", .{path}) catch "rules.limits";
-    const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, limits_path);
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations" }, limits_path);
+    const map = try yaml.requireMapping(cfg.gpa, cfg.diag, value, limits_path);
+    try yaml.checkKeys(cfg.gpa, cfg.diag, map, &.{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations" }, limits_path);
     var key_buf: [128]u8 = undefined;
     if (yaml.mappingGet(map, "tcpListenBacklog")) |v| {
         const field_path = std.fmt.bufPrint(&key_buf, "{s}.tcpListenBacklog", .{limits_path}) catch limits_path;
-        c.tcp_listen_backlog = try yaml.decodeInt(cycle.gpa, cycle.diag, v, field_path);
+        c.tcp_listen_backlog = try yaml.decodeInt(cfg.gpa, cfg.diag, v, field_path);
     }
     if (yaml.mappingGet(map, "maxTCPBufferedBytes")) |v| {
         const field_path = std.fmt.bufPrint(&key_buf, "{s}.maxTCPBufferedBytes", .{limits_path}) catch limits_path;
-        c.max_tcp_buffered_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, field_path);
+        c.max_tcp_buffered_bytes = try yaml.decodeInt(cfg.gpa, cfg.diag, v, field_path);
     }
     if (yaml.mappingGet(map, "maxUDPAssociations")) |v| {
         const field_path = std.fmt.bufPrint(&key_buf, "{s}.maxUDPAssociations", .{limits_path}) catch limits_path;
-        c.max_udp_associations = try yaml.decodeInt(cycle.gpa, cycle.diag, v, field_path);
+        c.max_udp_associations = try yaml.decodeInt(cfg.gpa, cfg.diag, v, field_path);
     }
 }
 
-fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
-    const c = cycle.conf(@This());
+pub fn validate(cfg: *conf.Configuration) yaml.LoadError!void {
+    const c = &cfg.limits;
     if (c.tcp_listen_backlog < 1 or c.tcp_listen_backlog > std.math.maxInt(i32)) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "limits.tcpListenBacklog must be between 1 and {d}", .{std.math.maxInt(i32)});
+        yaml.setDiag(cfg.gpa, cfg.diag, "limits.tcpListenBacklog must be between 1 and {d}", .{std.math.maxInt(i32)});
         return error.InvalidConfiguration;
     }
     if (c.max_tcp_buffered_bytes <= 0) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "limits.maxTCPBufferedBytes must be positive", .{});
+        yaml.setDiag(cfg.gpa, cfg.diag, "limits.maxTCPBufferedBytes must be positive", .{});
         return error.InvalidConfiguration;
     }
     if (c.max_udp_associations < 1 or c.max_udp_associations > max_udp_associations) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "limits.maxUDPAssociations must be between 1 and {d}", .{max_udp_associations});
+        yaml.setDiag(cfg.gpa, cfg.diag, "limits.maxUDPAssociations must be between 1 and {d}", .{max_udp_associations});
         return error.InvalidConfiguration;
     }
     if (c.max_udp_pending_datagrams <= 0) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "limits.maxUDPPendingDatagrams must be positive", .{});
+        yaml.setDiag(cfg.gpa, cfg.diag, "limits.maxUDPPendingDatagrams must be positive", .{});
         return error.InvalidConfiguration;
     }
     if (c.max_udp_pending_bytes <= 0) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "limits.maxUDPPendingBytes must be positive", .{});
+        yaml.setDiag(cfg.gpa, cfg.diag, "limits.maxUDPPendingBytes must be positive", .{});
         return error.InvalidConfiguration;
     }
 
-    for (cycle.rule_bundles.items) |*bundle| {
-        const overrides = cycle.ruleConf(bundle, @This()).?.*;
+    for (cfg.rules.rules, 0..) |*rule, index| {
+        const overrides = rule.limits;
         if (overrides.tcp_listen_backlog) |value| {
             if (value < 1 or value > std.math.maxInt(i32)) {
-                yaml.setDiag(cycle.gpa, cycle.diag, "rules[{d}].limits.tcpListenBacklog must be between 1 and {d}", .{ bundle.index, std.math.maxInt(i32) });
+                yaml.setDiag(cfg.gpa, cfg.diag, "rules[{d}].limits.tcpListenBacklog must be between 1 and {d}", .{ index, std.math.maxInt(i32) });
                 return error.InvalidConfiguration;
             }
         }
         if (overrides.max_tcp_buffered_bytes) |value| {
             if (value <= 0) {
-                yaml.setDiag(cycle.gpa, cycle.diag, "rules[{d}].limits.maxTCPBufferedBytes must be positive", .{bundle.index});
+                yaml.setDiag(cfg.gpa, cfg.diag, "rules[{d}].limits.maxTCPBufferedBytes must be positive", .{index});
                 return error.InvalidConfiguration;
             }
         }
         if (overrides.max_udp_associations) |value| {
             if (value < 1 or value > max_udp_associations) {
-                yaml.setDiag(cycle.gpa, cycle.diag, "rules[{d}].limits.maxUDPAssociations must be between 1 and {d}", .{ bundle.index, max_udp_associations });
+                yaml.setDiag(cfg.gpa, cfg.diag, "rules[{d}].limits.maxUDPAssociations must be between 1 and {d}", .{ index, max_udp_associations });
                 return error.InvalidConfiguration;
             }
         }

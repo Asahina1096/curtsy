@@ -807,22 +807,13 @@ pub const TCPListener = struct {
 // Protocol module registration (core orchestrator entry point)
 // ---------------------------------------------------------------------------
 
-pub const protocol_module = config.ProtocolModule{
-    .name = "tcp",
-    .protocol = .tcp,
-    .drains_connections = true,
-    .create = createProtocolListener,
-};
-
-fn createProtocolListener(
-    context: ?*anyopaque,
+pub fn createProtocolListener(
     outer_allocator: Allocator,
     resolved: config.ResolvedConfiguration,
     logger: *log.LogStore,
     selector: ?upstream.Selector,
     start_paused: bool,
 ) anyerror!*config.Listener {
-    _ = context;
     const listener = try outer_allocator.create(TCPListener);
     errdefer outer_allocator.destroy(listener);
     listener.* = try TCPListener.init(resolved, logger, .{ .upstream_selector = selector });
@@ -924,7 +915,7 @@ const Worker = struct {
     connections: ?*Connection = null,
     zombies: ?*Connection = null,
     /// Worker-local freelist of dead Connection objects (linked through
-    /// zombie_next); avoids malloc/free per accept/close cycle.
+    /// zombie_next); avoids malloc/free per accept/close cfg.
     connection_pool: ?*Connection = null,
     connection_pool_count: usize = 0,
     /// Earliest timer deadline across all connections, recomputed lazily.

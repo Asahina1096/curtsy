@@ -55,9 +55,11 @@ eBPF C 使用 Zig 发行包内置的 Clang 前端，生成带 BTF 和重定位�
 
 - `/usr/bin/curtsy`
 - `/etc/curtsy/config.yaml`，来自 [`config.example.yaml`](config.example.yaml)
-- `curtsy.service` systemd unit
+- `curtsy.service`、`curtsy@.service` systemd units
+- `/usr/lib/sysctl.d/60-curtsy.conf`（系统级 socket/队列默认值）
+- `man 1 curtsy` 与 `/usr/share/doc/curtsy/` 下的 README、示例配置、changelog
 
-服务默认不会在安装后自动启用或启动。先修改 `/etc/curtsy/config.yaml`，再检查并启动：
+该单元在安装后会被**自动启用并启动**（`dh_installsystemd` 的默认行为：`deb-systemd-helper enable` + `deb-systemd-invoke start`）。包内附带的是示例配置，安装后即按它监听；如需自行掌控启动时机，先停用再修改 `/etc/curtsy/config.yaml`，校验无误后启动：
 
 ```bash
 sudo curtsy --config /etc/curtsy/config.yaml --check-config
@@ -85,7 +87,7 @@ upstream:
   host: "example.com"
 ```
 
-未写出的配置项会自动适配；需要固定行为时再显式覆盖。然后检查配置：
+未写出的配置项使用内置的固定默认值（见下文），不随主机资源变化；需要不同行为时显式覆盖。然后检查配置：
 
 ```bash
 zig-out/bin/curtsy --config config.yaml --check-config
@@ -183,16 +185,18 @@ eBPF：sockmap/reuseport 程序按进程/socket 装载，多个实例互不冲�
 
 ## 信号
 
-- `SIGHUP`：重新读取并应用配置。若配置文件自上次成功加载以来未被修改（mtime 与大小一致），重载是 no-op：只记录一条日志并跳过解析/校验/应用全部阶段，因此误发的 `systemctl reload` 近乎零成本；`touch` 或编辑文件（mtime 变化）都会照常触发全量重载，主机名照常重新解析（DNS 变化生效）。注意判定基于文件系统时间戳粒度（ext4 约 1ms），编辑与重载间隔极短（亚毫秒级）的自动化可能被判定为未修改。重载是事务式的：新规则和新增协议监听会先绑定但保持暂停（不接受 TCP、不转发 UDP），连同上游 generation 和 listen backlog 预检全部就绪后才提交并激活；任一失败则整体保留旧配置，候选配置正常释放。配置无效或新端口绑定失败时继续使用旧配置。同一时刻到达的多个 SIGHUP 会合并为一次重载。
+- `SIGHUP`：重新读取并应用配置。若配置文件自上次成功加载以来未被修改（mtime 与大小一致），重载是 no-op：只记录一条日志并跳过解析/校验/应用全部阶段，因此误发的 `systemctl reload` 近乎零成本；`touch` 或编辑文件（mtime 变化）都会照常触发全量重载，主机名照常重新解析（DNS 变化生效）。注意判定基于文件系统时间戳粒度（受内核时钟粒度限制，通常 1–4 ms；本机 `CONFIG_HZ=250` 即 4 ms），编辑与重载间隔极短（亚毫秒级）的自动化可能被判定为未修改。重载是事务式的：新规则和新增协议监听会先绑定但保持暂停（不接受 TCP、不转发 UDP），连同上游 generation 和 listen backlog 预检全部就绪后才提交并激活；任一失败则整体保留旧配置，候选配置正常释放。配置无效或新端口绑定失败时继续使用旧配置。同一时刻到达的多个 SIGHUP 会合并为一次重载。
 - `SIGINT` / `SIGTERM`：停止监听并优雅退出。现有 TCP 连接最多等待 `shutdownGraceSeconds`。
 
 热加载后，已有 TCP 连接继续使用原上游，新连接使用新上游；上游变化时已有 UDP 映射会被清除并按新配置重建。
 
 ## 内置系统模块
 
-Curtsy 当前的 CLI、rules、upstream、balancer、TCP/UDP 协议实现都是系统级内置模块，随主程序一起编译，并通过 `src/module.zig` 中的 comptime 注册表确定模块集合和顺序。新增模块需要修改源码、注册并重新构建 `curtsy`。
+Curtsy 的 CLI、rules、upstream、balancer、TCP/UDP 协议实现都随主程序编译进同一个二进制。配置由一个显式解析过程直接解码：`src/conf.zig` 的 `parseRoot`/`parseRule` 逐键分发，各 section 由所属模块自己的函数解析与校验。
 
-SIGHUP 热重载只重新解析配置，并事务式替换规则、监听器和上游 generation；它不会在运行时装载或卸载机器码。项目未来可能支持外部插件，但当前不提供共享库 ABI、`plugins:` 配置项、`--plugin` 参数或外部插件兼容性承诺。
+这里**没有模块注册表、指令表或运行时装载机制**，也不提供共享库 ABI、`plugins:` 配置项或 `--plugin` 参数 —— 新增一个配置键需要同时修改解析过程与所属模块并重新构建。
+
+SIGHUP 热重载只重新解析配置，并事务式替换规则、监听器和上游 generation；它不会在运行时装载或卸载机器码。
 
 ## TCP 性能
 
@@ -214,7 +218,7 @@ sockmap 是否更快取决于数据路径。跨主机、高 RTT 或 CPU 受限�
 
 ## UDP 性能
 
-UDP 转发由独立 I/O 线程池驱动（默认每 CPU 一个线程，可用 `performance.udpIOThreads` 固定）：每个线程持有一个经 `SO_REUSEPORT` 绑定同一地址的监听 socket，内核按客户端四元组 hash 把流量稳定分流到固定线程——即一个 UDP 五元组会话始终固定到同一个引擎，不跨线程迁移。各线程用 epoll 管理自己的监听与上游 socket，收发均以 64 报文为一批。收到就绪事件后，引擎用非阻塞 `recvmmsg` 连续聚合：把多次 syscall 收到的报文合并成一批（最多 64 报文）再 `sendmmsg` 转发，一次就绪事件内最多执行 16 次 `recvmmsg`（公平配额），因此热 socket 可在单次就绪事件内转发多个 64 报文批，同时不会饿死同引擎其他就绪 socket。会话在首个报文到达时同步建立。`maxUDPAssociations` 由所有线程共享，仍是全局上限而不是每线程配额。
+UDP 转发由独立 I/O 线程池驱动（默认 1 个 I/O 线程，可用 `performance.udpIOThreads` 增加）：每个线程持有一个经 `SO_REUSEPORT` 绑定同一地址的监听 socket，内核按客户端四元组 hash 把流量稳定分流到固定线程——即一个 UDP 五元组会话始终固定到同一个引擎，不跨线程迁移。各线程用 epoll 管理自己的监听与上游 socket，收发均以 64 报文为一批（单槽容量由 `performance.udpDatagramBufferBytes` 控制，默认 64 KiB，范围 576 B–64 KiB）。收到就绪事件后，引擎用非阻塞 `recvmmsg` 连续聚合：把多次 syscall 收到的报文合并成一批（最多 64 报文）再 `sendmmsg` 转发，一次就绪事件内最多执行 16 次 `recvmmsg`（公平配额），因此热 socket 可在单次就绪事件内转发多个 64 报文批，同时不会饿死同引擎其他就绪 socket。会话在首个报文到达时同步建立。`maxUDPAssociations` 由所有线程共享，仍是全局上限而不是每线程配额。
 
 UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触顶的瓶颈。`performance.udpSocketBufferBytes`（默认 4 MiB，设为 `0` 保持内核默认）会应用到监听、上游和每客户端 socket 的收发缓冲；没有 `CAP_NET_ADMIN` 时内核会把请求静默收敛到 `net.core.rmem_max` / `net.core.wmem_max`，因此建议部署时同步调大这两个 sysctl（Debian 包自带 `usr/lib/sysctl.d/60-curtsy.conf`，把两者设为 8 MiB）。
 
@@ -227,7 +231,7 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 - 默认只支持一条监听规则和一个上游；多规则与多上游需使用可选的 `rules` 写法（见上文）。
 - 所有超时单位均为秒，必须大于零，且不能超过 `9223372036` 秒。
 - UDP 会话按客户端 IP 与端口隔离，空闲超过 `udpSessionSeconds` 后回收。
-- 达到 `maxUDPAssociations` 后，新 UDP 客户端会被丢弃，已有会话不受影响；默认上限按系统内存自动计算。
+- 达到 `maxUDPAssociations` 后，新 UDP 客户端会被丢弃，已有会话不受影响；默认为 2048。
 - UDP 转发由独立 I/O 线程池以 `recvmmsg`/`sendmmsg` 批量收发（64 报文/批），就绪事件内用非阻塞 `recvmmsg` 合并聚合报文并转发多个 64 报文批，单次就绪最多 16 次接收 syscall；每个客户端五元组会话固定到一个 `SO_REUSEPORT` 引擎，会话在首个报文到达时同步建立，不存在待转发缓冲窗口；`maxUDPPendingDatagrams` 和 `maxUDPPendingBytes` 仅为兼容旧配置保留，当前不再使用。
 - 程序不会终止 TLS、检查流量内容或记录转发数据正文。
 
