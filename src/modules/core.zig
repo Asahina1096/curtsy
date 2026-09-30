@@ -47,7 +47,6 @@ const reap_interval_ms: i32 = 100;
 pub const SocketAddr = net.SocketAddr;
 pub const ForwardProtocol = net.ForwardProtocol;
 pub const EndpointConfiguration = net.EndpointConfiguration;
-pub const Resolver = net.Resolver;
 pub const ResolveError = net.ResolveError;
 pub const TimeoutConfiguration = timeouts.TimeoutConfiguration;
 pub const LimitConfiguration = limits.LimitConfiguration;
@@ -427,10 +426,8 @@ pub fn resolveForwarder(
     gpa: Allocator,
     alloc: Allocator,
     cfg: *conf.Configuration,
-    resolver: ?Resolver,
     diag: *conf.Diagnostics,
 ) ResolveError!ResolvedForwarder {
-    const resolve = resolver orelse net.defaultResolver;
     const globals = configuration(cfg);
 
     const definitions: []RuleConfiguration = blk: {
@@ -457,13 +454,13 @@ pub fn resolveForwarder(
             };
         }
         const listen_port: u16 = @intCast(definition.listen.port);
-        const listen_addresses = net.resolveListenAddresses(resolve, alloc, definition.listen.host, listen_port, gpa, diag) catch
+        const listen_addresses = net.resolveListenAddresses(alloc, definition.listen.host, listen_port, gpa, diag) catch
             return error.ResolutionFailed;
 
         const upstream_addresses = try alloc.alloc(SocketAddr, definition.upstreams.len);
         for (definition.upstreams, 0..) |entry, j| {
             const upstream_port: u16 = @intCast(entry.port);
-            upstream_addresses[j] = net.resolverAddress(resolve, entry.host, upstream_port, gpa, diag) catch
+            upstream_addresses[j] = net.resolverAddress(entry.host, upstream_port, gpa, diag) catch
                 return error.ResolutionFailed;
         }
 
@@ -1309,7 +1306,6 @@ pub const ForwarderService = struct {
             self.allocator,
             cfg.allocator(),
             &cfg,
-            null,
             &diag,
         ) catch |err| {
             self.logger.err("configuration reload rejected error={s} reason={s}", .{
@@ -1574,7 +1570,7 @@ test "resolve rejects a protocol absent from the built-in registry" {
     defer if (diag.message) |message| testing.allocator.free(message);
     try testing.expectError(
         error.ResolutionFailed,
-        resolveForwarder(testing.allocator, cfg.allocator(), &cfg, null, &diag),
+        resolveForwarder(testing.allocator, cfg.allocator(), &cfg, &diag),
     );
     try testing.expect(std.mem.indexOf(u8, diag.message.?, "not_loaded") != null);
 }
@@ -1742,11 +1738,11 @@ test "rejects missing required keys and non-mapping root" {
     try conf.expectLoadFailure("listen: { port: 9000 }\nupstream: { port: 9001 }\n", "missing required key: upstream.host");
 }
 
-fn resolveYamlForTest(text: []const u8, resolver: ?Resolver) !struct { cfg: conf.Configuration, resolved: ResolvedForwarder } {
+fn resolveYamlForTest(text: []const u8) !struct { cfg: conf.Configuration, resolved: ResolvedForwarder } {
     var cfg = try loadForTest(text);
     errdefer cfg.deinit();
     var diag = conf.Diagnostics{};
-    const resolved = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, resolver, &diag) catch |err| {
+    const resolved = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, &diag) catch |err| {
         if (diag.message) |message| {
             std.debug.print("unexpected resolve failure: {s}\n", .{message});
             testing.allocator.free(message);
@@ -1761,7 +1757,7 @@ test "single rule resolves to one synthetic rule" {
         \\listen: { host: "127.0.0.1", port: 9000 }
         \\upstream: { host: "127.0.0.2", port: 9001 }
         \\
-    , null);
+    );
     var cfg = result.cfg;
     defer cfg.deinit();
 
@@ -1786,7 +1782,7 @@ test "resolves rules listen and upstream addresses" {
         \\    protocols: [udp]
         \\    upstreams: [ { host: "127.0.0.3", port: 53 } ]
         \\
-    , null);
+    );
     var cfg = result.cfg;
     defer cfg.deinit();
 
@@ -1809,7 +1805,7 @@ fn expectResolveFailure(text: []const u8, expected_message: []const u8) !void {
     var cfg = try loadForTest(text);
     defer cfg.deinit();
     var diag = conf.Diagnostics{};
-    const result = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, null, &diag);
+    const result = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, &diag);
     if (result) |_| return error.TestExpectedFailureButResolved else |_| {}
     try testing.expectEqualStrings(expected_message, diag.message.?);
     if (diag.message) |message| testing.allocator.free(message);
@@ -1846,7 +1842,7 @@ test "allows rules sharing an address across disjoint protocols" {
         \\    protocols: [udp]
         \\    upstreams: [ { host: "127.0.0.3", port: 9001 } ]
         \\
-    , null);
+    );
     var cfg = result.cfg;
     defer cfg.deinit();
     try testing.expectEqual(@as(usize, 2), result.resolved.rules.len);
@@ -1866,11 +1862,6 @@ fn makeTestConfiguration(upstream_host: []const u8) ForwarderConfiguration {
             .max_udp_pending_bytes = 256 * 1_024,
         },
     };
-}
-
-fn loopbackResolver(host: []const u8, port: u16) anyerror!SocketAddr {
-    _ = host;
-    return SocketAddr.parseIp("127.0.0.1", port).?;
 }
 
 test "sockmap auto: tcp skips loopback upstreams while udp stays userspace" {
@@ -2023,7 +2014,7 @@ test "rule resolution flags any loopback upstream for tcp sockmap auto" {
         \\      - { host: "192.0.2.1", port: 9001 }
         \\      - { host: "127.0.0.1", port: 9002 }
         \\
-    , null);
+    );
     var remote_first_cycle = remote_first.cfg;
     defer remote_first_cycle.deinit();
     const remote_first_rule = remote_first.resolved.rules[0];
@@ -2043,7 +2034,7 @@ test "rule resolution flags any loopback upstream for tcp sockmap auto" {
         \\      - { host: "127.0.0.1", port: 9002 }
         \\      - { host: "192.0.2.1", port: 9001 }
         \\
-    , null);
+    );
     var loopback_first_cycle = loopback_first.cfg;
     defer loopback_first_cycle.deinit();
     const loopback_first_rule = loopback_first.resolved.rules[0];
@@ -2060,22 +2051,13 @@ test "rule resolution flags any loopback upstream for tcp sockmap auto" {
         \\      - { host: "192.0.2.1", port: 9001 }
         \\      - { host: "192.0.2.2", port: 9002 }
         \\
-    , null);
+    );
     var all_remote_cycle = all_remote.cfg;
     defer all_remote_cycle.deinit();
     const all_remote_rule = all_remote.resolved.rules[0];
     const all_remote_resolved = resolvedForRule(all_remote_rule.effective, &all_remote_rule);
     try testing.expectEqual(@as(?bool, false), all_remote_resolved.upstream_has_loopback);
     try testing.expect(all_remote_resolved.shouldEnableTCPSockmap());
-}
-
-fn hostBasedResolver(comptime listener_ip: []const u8) Resolver {
-    return struct {
-        fn resolve(host: []const u8, port: u16) anyerror!SocketAddr {
-            const ip = if (std.mem.eql(u8, host, "upstream.internal")) "127.0.0.10" else listener_ip;
-            return SocketAddr.parseIp(ip, port).?;
-        }
-    }.resolve;
 }
 
 test "detects listen hostname resolution change" {
@@ -2097,8 +2079,6 @@ test "detects listen hostname resolution change" {
 
     try testing.expect(original.listenBindingDiffers(&changed));
     try testing.expect(!original.listenBindingDiffers(&original));
-    _ = hostBasedResolver("127.0.0.1");
-    _ = loopbackResolver;
 }
 
 test "config.example.yaml parses with expected values" {
@@ -2216,7 +2196,7 @@ test "failed reload is transactional: matched rules stay entirely old" {
     , .{ port_one, upstream_port, port_two, upstream_port + 1 }) catch unreachable;
     try writeTestConfig(config_path, initial_yaml);
 
-    const initial = try resolveYamlForTest(initial_yaml, null);
+    const initial = try resolveYamlForTest(initial_yaml);
     var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
@@ -2315,7 +2295,7 @@ test "cli source starts and reloads through the config source" {
     var cfg = try cli.loadCycle(testing.allocator, &config, &diag);
     var resolve_diag = conf.Diagnostics{};
     defer if (resolve_diag.message) |message| testing.allocator.free(message);
-    const resolved = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, null, &resolve_diag) catch {
+    const resolved = resolveForwarder(testing.allocator, cfg.allocator(), &cfg, &resolve_diag) catch {
         cfg.deinit();
         return error.TestResolveFailed;
     };
@@ -2358,7 +2338,7 @@ test "reload with an unchanged config file is a no-op" {
     , .{ port, upstream_port }) catch unreachable;
     try writeTestConfig(config_path, initial_yaml);
 
-    const initial = try resolveYamlForTest(initial_yaml, null);
+    const initial = try resolveYamlForTest(initial_yaml);
     var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
@@ -2408,7 +2388,7 @@ test "retained cycles are pruned once no retired object borrows them" {
     , .{ port, upstream_port }) catch unreachable;
     try writeTestConfig(config_path, initial_yaml);
 
-    const initial = try resolveYamlForTest(initial_yaml, null);
+    const initial = try resolveYamlForTest(initial_yaml);
     var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();
@@ -2475,7 +2455,7 @@ test "reload after touching the file still reloads (DNS refresh preserved)" {
     , .{ port, upstream_port }) catch unreachable;
     try writeTestConfig(config_path, initial_yaml);
 
-    const initial = try resolveYamlForTest(initial_yaml, null);
+    const initial = try resolveYamlForTest(initial_yaml);
     var service = ForwarderService.init(testing.allocator, .{ .file = config_path }, initial.cfg, initial.resolved, null, null);
     service.startInitialRules() catch {
         service.deinit();

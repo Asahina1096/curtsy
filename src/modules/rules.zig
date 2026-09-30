@@ -417,11 +417,6 @@ test "rejects invalid rules values" {
     }
 }
 
-fn fixedResolver(host: []const u8, port: u16) !net.SocketAddr {
-    _ = host;
-    return net.SocketAddr.parseIp("127.0.0.1", port).?;
-}
-
 test "unknown balancer is rejected during resolve" {
     const result = try loadRulesForTest(
         \\rules:
@@ -434,7 +429,7 @@ test "unknown balancer is rejected during resolve" {
     defer cfg.deinit();
     var diag = conf.Diagnostics{};
     defer if (diag.message) |message| testing.allocator.free(message);
-    try testing.expectError(error.ResolutionFailed, core.resolveForwarder(testing.allocator, cfg.allocator(), &cfg, fixedResolver, &diag));
+    try testing.expectError(error.ResolutionFailed, core.resolveForwarder(testing.allocator, cfg.allocator(), &cfg, &diag));
     try testing.expect(std.mem.startsWith(u8, diag.message.?, "rules[0].balance: expected one of "));
 }
 

@@ -135,7 +135,7 @@ pub fn main(init: std.process.Init) u8 {
 
     // Resolve addresses plus registered balancer/protocol names before
     // reporting success, so --check-config validates the complete runtime.
-    const resolved = core.resolveForwarder(gpa, cfg.allocator(), &cfg, null, &diag) catch {
+    const resolved = core.resolveForwarder(gpa, cfg.allocator(), &cfg, &diag) catch {
         reportConfigError(&diag);
         return 2;
     };

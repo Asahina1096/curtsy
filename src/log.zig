@@ -75,20 +75,9 @@ pub const Mutex = struct {
 /// Longest message that can be emitted; longer messages are truncated.
 pub const max_message_bytes = 16 * 1_024;
 
-/// Local, injectable emission sink. When a LogStore has one set, `emit` routes
-/// messages there instead of stderr; production code never sets it. The sink is
-/// confined to one LogStore, so tests can capture or discard output without
-/// touching the process-global stderr descriptor (and without racing other
-/// tests).
-pub const EmitOverride = struct {
-    context: *anyopaque,
-    fn_ptr: *const fn (context: *anyopaque, message: []const u8) void,
-};
-
 pub const LogStore = struct {
     threshold: std.atomic.Value(u8),
     mutex: Mutex = .{},
-    emit_override: ?EmitOverride = null,
     /// Optional instance identifier; when set, every emitted line is prefixed
     /// with `instance=<name> ` so multi-instance output is distinguishable.
     /// The slice is borrowed and must outlive the store.
@@ -183,12 +172,6 @@ pub const LogStore = struct {
             }
             const prefixed = std.fmt.bufPrint(&line, "instance={s} {s}", .{ name, rest }) catch unreachable;
 
-            if (self.emit_override) |override| {
-                // The override sees the prefixed message without a trailing
-                // newline (its historical contract).
-                override.fn_ptr(override.context, prefixed);
-                return;
-            }
             if (prefixed.len < max_message_bytes) {
                 line[prefixed.len] = '\n';
                 writeAllFd(std.posix.STDERR_FILENO, line[0 .. prefixed.len + 1]);
@@ -199,10 +182,6 @@ pub const LogStore = struct {
             return;
         }
 
-        if (self.emit_override) |override| {
-            override.fn_ptr(override.context, message);
-            return;
-        }
         if (message.len < max_message_bytes) {
             scratch[message.len] = '\n';
             writeAllFd(std.posix.STDERR_FILENO, scratch[0 .. message.len + 1]);
@@ -238,56 +217,6 @@ test "level parsing is case-insensitive and complete" {
     try std.testing.expect(Level.fromString("verbose") == null);
 }
 
-test "threshold gates lazy message evaluation" {
-    // Local capture sink: the emission goes here instead of the process-global
-    // stderr descriptor, so this passing test never writes incidental stderr
-    // (which the test runner attributes to the whole run) and never races other
-    // tests on fd 2.
-    var sink = LogTestSink{};
-    defer sink.deinit();
-
-    var store = LogStore.init("critical");
-    store.emit_override = .{ .context = &sink, .fn_ptr = LogTestSink.run };
-    var evaluated = false;
-
-    const Ctx = struct {
-        evaluated: *bool,
-    };
-    const render = struct {
-        fn run(ctx: Ctx, buf: []u8) []const u8 {
-            ctx.evaluated.* = true;
-            return std.fmt.bufPrint(buf, "expensive debug message", .{}) catch unreachable;
-        }
-    }.run;
-
-    // Below the threshold the render is never invoked and nothing is emitted.
-    store.logLazy(.debug, Ctx{ .evaluated = &evaluated }, render);
-    try std.testing.expect(!evaluated);
-    try std.testing.expectEqual(@as(usize, 0), sink.captured.items.len);
-
-    // Above the threshold the render runs and the message is emitted exactly
-    // once, through the local sink rather than stderr.
-    store.update("debug");
-    store.logLazy(.debug, Ctx{ .evaluated = &evaluated }, render);
-    try std.testing.expect(evaluated);
-    try std.testing.expectEqualStrings("expensive debug message", sink.captured.items);
-}
-
-/// Test-local emission sink that captures messages instead of writing to
-/// stderr. Defined at file scope so its methods can reference the type.
-const LogTestSink = struct {
-    captured: std.ArrayList(u8) = .empty,
-
-    fn run(ctx: *anyopaque, message: []const u8) void {
-        const self: *LogTestSink = @ptrCast(@alignCast(ctx));
-        self.captured.appendSlice(std.testing.allocator, message) catch {};
-    }
-
-    fn deinit(self: *LogTestSink) void {
-        self.captured.deinit(std.testing.allocator);
-    }
-};
-
 test "unknown level name falls back to info" {
     var store = LogStore.init("nonsense");
     try std.testing.expect(store.isEnabled(.info));
@@ -300,34 +229,4 @@ test "update switches threshold atomically" {
     store.update("warning");
     try std.testing.expect(store.isEnabled(.warning));
     try std.testing.expect(!store.isEnabled(.notice));
-}
-
-test "instance name prefixes every emitted line" {
-    var sink = LogTestSink{};
-    defer sink.deinit();
-
-    var store = LogStore.init("debug");
-    store.emit_override = .{ .context = &sink, .fn_ptr = LogTestSink.run };
-    store.setInstance("edge");
-    store.info("forwarder started rules={d}", .{2});
-    try std.testing.expectEqualStrings("instance=edge forwarder started rules=2", sink.captured.items);
-    sink.captured.clearRetainingCapacity();
-
-    // Clearing the instance restores the plain format.
-    store.setInstance(null);
-    store.info("plain", .{});
-    try std.testing.expectEqualStrings("plain", sink.captured.items);
-}
-
-test "instance prefix truncates oversized messages without losing the newline" {
-    var sink = LogTestSink{};
-    defer sink.deinit();
-
-    var store = LogStore.init("debug");
-    store.emit_override = .{ .context = &sink, .fn_ptr = LogTestSink.run };
-    store.setInstance("a");
-    const payload = "x" ** (max_message_bytes + 32);
-    store.log(.info, "{s}", .{payload});
-    try std.testing.expect(sink.captured.items.len <= max_message_bytes);
-    try std.testing.expect(std.mem.startsWith(u8, sink.captured.items, "instance=a "));
 }

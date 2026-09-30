@@ -1,7 +1,7 @@
 //! Network primitives shared by every module.
 //!
 //! SocketAddr (IPv4/IPv6 union with sockaddr_storage conversion), the
-//! resolver abstraction (injectable for tests), listen-address expansion
+//! host resolution, listen-address expansion
 //! ("*" becomes the dual-stack wildcard pair) and protocol list helpers.
 //! This layer knows nothing about YAML or the configuration loader.
 
@@ -160,7 +160,7 @@ pub const SocketAddr = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Resolver: host name or IP literal plus port -> concrete SocketAddr
+// Resolution: host name or IP literal plus port -> concrete SocketAddr
 // ---------------------------------------------------------------------------
 
 pub const ResolveError = error{
@@ -169,17 +169,13 @@ pub const ResolveError = error{
 };
 
 /// Maps a host name or IP literal plus port to a concrete SocketAddr.
-/// Injectable for tests.
-pub const Resolver = *const fn (host: []const u8, port: u16) anyerror!SocketAddr;
-
 pub fn resolverAddress(
-    resolve: Resolver,
     host: []const u8,
     port: u16,
     gpa: Allocator,
     diag: *Diagnostics,
 ) !SocketAddr {
-    return resolve(host, port) catch {
+    return resolveHost(host, port) catch {
         setDiag(gpa, diag, "unable to resolve host '{s}'", .{host});
         return error.ResolutionFailed;
     };
@@ -188,7 +184,6 @@ pub fn resolverAddress(
 /// Resolve a listen endpoint to one or two addresses; "*" expands to the
 /// dual-stack wildcard pair 0.0.0.0 and ::. `alloc` must outlive the result.
 pub fn resolveListenAddresses(
-    resolve: Resolver,
     alloc: Allocator,
     host: []const u8,
     port: u16,
@@ -201,15 +196,15 @@ pub fn resolveListenAddresses(
         pair[1] = SocketAddr.initV6(@splat(0), port);
         return pair;
     }
-    const address = try resolverAddress(resolve, host, port, gpa, diag);
+    const address = try resolverAddress(host, port, gpa, diag);
     const single = try alloc.alloc(SocketAddr, 1);
     single[0] = address;
     return single;
 }
 
-/// Default resolver: IP literals are parsed directly, everything else goes
-/// through getaddrinfo (first usable AF_INET/AF_INET6 result wins).
-pub fn defaultResolver(host: []const u8, port: u16) anyerror!SocketAddr {
+/// IP literals are parsed directly, everything else goes through getaddrinfo
+/// (the first usable AF_INET/AF_INET6 result wins).
+fn resolveHost(host: []const u8, port: u16) anyerror!SocketAddr {
     if (SocketAddr.parseIp(host, port)) |address| return address;
 
     var host_buf: [512]u8 = undefined;
@@ -346,7 +341,7 @@ test "socket address formatting and sockaddr conversion" {
 
 test "wildcard listen resolves to dual-stack wildcards" {
     var diag = Diagnostics{};
-    const addresses = try resolveListenAddresses(defaultResolver, testing.allocator, "*", 9000, testing.allocator, &diag);
+    const addresses = try resolveListenAddresses(testing.allocator, "*", 9000, testing.allocator, &diag);
     defer testing.allocator.free(addresses);
     try testing.expectEqual(@as(usize, 2), addresses.len);
     try testing.expectEqual(SocketAddr.Family.v4, addresses[0].family);
@@ -357,11 +352,11 @@ test "wildcard listen resolves to dual-stack wildcards" {
 
 test "resolves IPv4, IPv6 and hostnames" {
     var diag = Diagnostics{};
-    const v4 = try resolverAddress(defaultResolver, "127.0.0.1", 9001, testing.allocator, &diag);
+    const v4 = try resolverAddress("127.0.0.1", 9001, testing.allocator, &diag);
     try testing.expectEqual(SocketAddr.Family.v4, v4.family);
-    const v6 = try resolverAddress(defaultResolver, "::1", 9001, testing.allocator, &diag);
+    const v6 = try resolverAddress("::1", 9001, testing.allocator, &diag);
     try testing.expectEqual(SocketAddr.Family.v6, v6.family);
-    const hostname = try resolverAddress(defaultResolver, "localhost", 9001, testing.allocator, &diag);
+    const hostname = try resolverAddress("localhost", 9001, testing.allocator, &diag);
     try testing.expectEqual(@as(u16, 9001), hostname.port);
 }
 

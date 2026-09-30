@@ -339,11 +339,9 @@ pub const TCPSockmapAccelerator = struct {
     }
 };
 
-/// Injectable accelerator factory. Test overrides count invocations and/or fail the load.
-pub const SockmapLoader = *const fn (context: ?*anyopaque) (bpf.Error || Allocator.Error)!*TCPSockmapAccelerator;
-
-fn defaultSockmapLoader(context: ?*anyopaque) (bpf.Error || Allocator.Error)!*TCPSockmapAccelerator {
-    _ = context;
+/// Load the kernel-side accelerator. A failure is never fatal: the relay falls
+/// back to userspace.
+fn loadAccelerator() (bpf.Error || Allocator.Error)!*TCPSockmapAccelerator {
     var verifier_log: [256 * 1_024]u8 = undefined;
     return TCPSockmapAccelerator.load(TCPSockmapAccelerator.default_max_entries, &verifier_log);
 }
@@ -386,8 +384,6 @@ pub const TCPListener = struct {
         worker_threads: usize = 0,
         /// Test override for the sockmap on/off decision. null follows the configuration.
         enable_sockmap_acceleration: ?bool = null,
-        sockmap_loader: ?SockmapLoader = null,
-        sockmap_loader_context: ?*anyopaque = null,
         /// Rules plugin hook; null keeps the fixed configured upstream.
         upstream_selector: ?UpstreamSelector = null,
     };
@@ -470,12 +466,8 @@ pub const TCPListener = struct {
         allocator.free(self.workers);
     }
 
-    fn loader(self: *const TCPListener) SockmapLoader {
-        return self.options.sockmap_loader orelse defaultSockmapLoader;
-    }
-
     fn tryLoadAccelerator(self: *TCPListener) ?*TCPSockmapAccelerator {
-        const accelerator_ref = self.loader()(self.options.sockmap_loader_context) catch |err| {
+        const accelerator_ref = loadAccelerator() catch |err| {
             self.logger.warning("tcp sockmap acceleration unavailable; using userspace relay error={s} errno={s}", .{
                 @errorName(err), @tagName(bpf.lastErrno),
             });
@@ -2954,63 +2946,6 @@ test "tcp splice pipe remains reusable after an abnormal upstream reset" {
     writer.join();
 }
 
-test "tcp listener uses resolved sockmap decision and allows test override" {
-    var logger = log.LogStore.init("critical");
-    const resolved = try makeTestResolved(testing.allocator, 9);
-    defer testing.allocator.free(resolved.listen_addresses);
-
-    const CountingLoader = struct {
-        count: usize = 0,
-        fn load(context: ?*anyopaque) bpf.Error!*TCPSockmapAccelerator {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            self.count += 1;
-            return error.PermissionDenied;
-        }
-    };
-    var counting = CountingLoader{};
-
-    // Auto mode skips loopback upstreams: the resolved 127.0.0.1 upstream is
-    // loopback, so no load attempt happens.
-    var automatic = try TCPListener.init(resolved, &logger, .{
-        .sockmap_loader = CountingLoader.load,
-        .sockmap_loader_context = &counting,
-    });
-    defer automatic.deinit();
-    try testing.expectEqual(@as(usize, 0), counting.count);
-
-    // Configuration updates keep skipping loopback while auto stays in effect.
-    automatic.updateConfiguration(resolved);
-    try testing.expectEqual(@as(usize, 0), counting.count);
-
-    // Auto still attempts a load for a remote upstream.
-    var remote = try makeTestResolved(testing.allocator, 9);
-    defer testing.allocator.free(remote.listen_addresses);
-    remote.upstream_address = config.SocketAddr.parseIp("192.0.2.1", 9).?;
-    var automatic_remote = try TCPListener.init(remote, &logger, .{
-        .sockmap_loader = CountingLoader.load,
-        .sockmap_loader_context = &counting,
-    });
-    defer automatic_remote.deinit();
-    try testing.expectEqual(@as(usize, 1), counting.count);
-
-    // Explicit override forces the decision regardless of configuration.
-    var disabled = try TCPListener.init(resolved, &logger, .{
-        .enable_sockmap_acceleration = false,
-        .sockmap_loader = CountingLoader.load,
-        .sockmap_loader_context = &counting,
-    });
-    defer disabled.deinit();
-    try testing.expectEqual(@as(usize, 1), counting.count);
-
-    var enabled = try TCPListener.init(resolved, &logger, .{
-        .enable_sockmap_acceleration = true,
-        .sockmap_loader = CountingLoader.load,
-        .sockmap_loader_context = &counting,
-    });
-    defer enabled.deinit();
-    try testing.expectEqual(@as(usize, 2), counting.count);
-}
-
 test "tcp listening backlog can be updated in place" {
     var logger = log.LogStore.init("critical");
     const resolved = try makeTestResolved(testing.allocator, 9);
@@ -3060,42 +2995,6 @@ test "wildcard creates ipv4 and ipv6 listeners" {
     try testing.expectEqual(@as(usize, 4), listener.listenerSocketCount());
     try testing.expectEqual(config.SocketAddr.Family.v4, listener.localAddresses()[0].family);
     try testing.expectEqual(config.SocketAddr.Family.v6, listener.localAddresses()[1].family);
-}
-
-test "tcp listener falls back when sockmap loader throws" {
-    var echo = try EchoServer.start();
-    defer echo.stop();
-
-    var logger = log.LogStore.init("critical");
-    const resolved = try makeTestResolved(testing.allocator, echo.port);
-    defer testing.allocator.free(resolved.listen_addresses);
-
-    const FailingLoader = struct {
-        fn load(context: ?*anyopaque) bpf.Error!*TCPSockmapAccelerator {
-            _ = context;
-            return error.PermissionDenied;
-        }
-    };
-
-    var listener = try TCPListener.init(resolved, &logger, .{
-        .worker_threads = 2,
-        .enable_sockmap_acceleration = true,
-        .sockmap_loader = FailingLoader.load,
-    });
-    defer listener.deinit();
-    try listener.start();
-    defer {
-        listener.stopAccepting();
-        listener.forceCloseConnections();
-    }
-
-    const client = try connectClient(listener.localAddresses()[0].port);
-    defer closeFd(client);
-
-    try writeAll(client, "fallback");
-    var received: [8]u8 = undefined;
-    try readFully(client, &received);
-    try testing.expectEqualStrings("fallback", &received);
 }
 
 test "tcp idle timeout closes inactive connections" {
