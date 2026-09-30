@@ -494,24 +494,3 @@ pub fn decodeString(gpa: Allocator, diag: *Diagnostics, value: *Value, path: []c
     if (value.* == .scalar) return value.scalar.text;
     return fail(gpa, diag, "{s}: expected a string", .{path});
 }
-
-/// Decode an integer field that also accepts the string "auto".
-/// Returns the value and whether it is auto-tuned (absent counts as auto).
-pub fn decodeAutoTunedInt(gpa: Allocator, diag: *Diagnostics, map: []const Entry, key: []const u8, path: []const u8, default: i64) LoadError!struct { value: i64, is_auto: bool } {
-    const value = mappingGet(map, key) orelse return .{ .value = default, .is_auto = true };
-    if (value.* == .scalar) {
-        if (!value.scalar.quoted) {
-            if (std.fmt.parseInt(i64, value.scalar.text, 10)) |v| {
-                return .{ .value = v, .is_auto = false };
-            } else |_| {}
-        }
-        var buf: [8]u8 = undefined;
-        const text = value.scalar.text;
-        if (text.len <= buf.len) {
-            if (std.mem.eql(u8, "auto", std.ascii.lowerString(&buf, text))) {
-                return .{ .value = default, .is_auto = true };
-            }
-        }
-    }
-    return fail(gpa, diag, "{s}: expected an integer or auto", .{path});
-}

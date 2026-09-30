@@ -205,10 +205,10 @@ resolve_primary_ipv4() { # spec
 # under tools/benchmark/templates. Only placeholders are substituted; nothing
 # outside tools/benchmark is written.
 generate_curtsy_config() { # listen_host listen_port upstream_host upstream_port \
-    #   protocols tcp_sockmap udp_sockmap udp_sockbuf workers tuning_daemon output
+    #   protocols tcp_sockmap udp_sockmap udp_sockbuf workers output
     local listen_host="$1" listen_port="$2" upstream_host="$3" upstream_port="$4"
     local protocols="$5" tcp_sockmap="$6" udp_sockmap="$7" udp_sockbuf="$8"
-    local workers="$9" tuning_daemon="${10}" output="${11}"
+    local workers="$9" output="${10}"
     sed -e "s|__LISTEN_HOST__|$listen_host|g" \
         -e "s|__LISTEN_PORT__|$listen_port|g" \
         -e "s|__UPSTREAM_HOST__|$upstream_host|g" \
@@ -218,7 +218,6 @@ generate_curtsy_config() { # listen_host listen_port upstream_host upstream_port
         -e "s|__UDP_SOCKMAP__|$udp_sockmap|g" \
         -e "s|__UDP_SOCK_BUF__|$udp_sockbuf|g" \
         -e "s|__WORKER_THREADS__|$workers|g" \
-        -e "s|__TUNING_DAEMON__|$tuning_daemon|g" \
         "$CONFIG_TEMPLATE" > "$output"
 }
 

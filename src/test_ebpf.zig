@@ -15,7 +15,6 @@ test {
     _ = @import("conf.zig");
     _ = @import("modules/core.zig");
     _ = @import("log.zig");
-    _ = @import("autotune.zig");
     _ = @import("modules/upstream.zig");
     _ = @import("modules/rules.zig");
     _ = @import("modules/timeouts.zig");
@@ -25,7 +24,6 @@ test {
     _ = @import("modules/performance.zig");
     _ = @import("modules/tcp.zig");
     _ = @import("modules/udp.zig");
-    _ = @import("modules/tuning.zig");
     _ = @import("modules/balancer/round_robin.zig");
     _ = @import("modules/balancer/source_hash.zig");
     _ = @import("modules/balancer/weighted_round_robin.zig");

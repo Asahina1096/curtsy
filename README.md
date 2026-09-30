@@ -99,7 +99,7 @@ zig-out/bin/curtsy --config config.yaml
 
 `protocols` 省略时同时启用 TCP 和 UDP，也可设为 `[tcp]`、`[udp]` 或 `[tcp, udp]`。`listen.host` 省略时为 `*`，监听所有 IPv4/IPv6 地址；上游支持 IPv4、IPv6 和主机名。`upstream.port` 省略时使用 `listen.port`。
 
-`runtime.workerThreads` 省略、设为 `0` 或设为 `auto` 时，Curtsy 会按 CPU 数自动选择 worker 数，并限制过高核心数带来的空载内存和调度成本；显式正整数会固定 worker 数。`runtime.tuningDaemon` 默认启用，`runtime.tuningIntervalSeconds` 默认 5 秒。`limits` 下的整数项省略或写 `auto` 时，会按 Linux 主机 CPU/内存探测结果生成保守初始值，并由常驻 tuning daemon 持续观测后调整；显式整数始终优先。启动日志会输出最终生效的 worker 和主要限额。
+`runtime.workerThreads` 默认值为 `1`，显式正整数固定 worker 数。`limits` 下的整数项省略时使用固定的内置默认值：`tcpListenBacklog` 4096、`maxTCPBufferedBytes` 128 MiB、`maxUDPAssociations` 2048、`maxUDPPendingDatagrams` 64、`maxUDPPendingBytes` 512 KiB；显式整数始终优先。所有取值都在启动时确定，运行期间不再变化，启动日志会输出最终生效的 worker 和主要限额。
 
 ## 多规则与负载均衡（可选模块）
 
@@ -125,7 +125,7 @@ rules:
 - `balance` 支持 `round_robin`（默认，TCP 按连接轮转，UDP 按客户端会话轮转）、`source_hash`（按客户端地址 hash，同一客户端固定落同一上游）、`weighted_round_robin`（按权重分配）。
 - 上游健康检查是被动的：连续失败 3 次的上游会被摘除 10 秒，反复失败指数回退（上限 5 分钟），冷却结束后自动恢复并用真实流量探测；TCP connect 失败时会在连接内换下一个上游重试。
 - `protocols`、`timeouts.connectSeconds`、`timeouts.tcpIdleSeconds`、`timeouts.udpSessionSeconds`、`limits.tcpListenBacklog`、`limits.maxTCPBufferedBytes`、`limits.maxUDPAssociations` 可按规则覆盖；`runtime`/`logging`/`performance` 不可按规则覆盖。
-- `workerThreads`/`udpIOThreads` 为 auto 时按规则数均分（如 8 CPU、4 条规则 = 每规则 2 线程），显式整数不干预。
+- `workerThreads`/`udpIOThreads` 是全局设置，每条规则都按同一数值运行，不做按规则数的均分。
 - 热加载按规则 diff：监听地址未变的规则原地更新（上游健康状态按地址继承），新增规则绑定成功后才退役被删除的规则；已有 TCP 连接保持原上游，UDP 会话在上游集合变化时重建。在 rules 与单规则两种写法之间切换需要重启进程。
 
 ## 命令行运行模式（可选模块）
@@ -177,9 +177,9 @@ curtsy --config dmz.yaml --instance dmz
 
 端口共享：监听 socket 带 `SO_REUSEPORT`，但内核只把**相同 effective UID** 的 socket 分到同一组。systemd 模板的 `DynamicUser=true` 会给每个实例分配独立 uid，因此两个实例无法共享同一 `地址:端口`（后绑定者 bind 失败）；需要共享端口时须固定 `User=`（或去掉 `DynamicUser` 以同一用户运行）。共享端口是有意的水平伸缩（内核/BPF 分流），不是自动冲突检测；共享时建议各实例 `workerThreads` 一致，避免 reuseport eBPF（按各自 worker 数取模）与内核 hash 混用导致分布不均。
 
-资源规划：auto 的 `workerThreads` 与限额按每实例独立取满计算，tuning daemon 又读取全局 `/proc/net/netstat`，多实例会互相叠加；建议多实例部署时显式配置 worker 数与限额。
+资源规划：`workerThreads` 与限额是固定的每实例值，同一主机上的多实例会直接相加；建议多实例部署时显式配置 worker 数与限额，而不是依赖内置默认值。
 
-eBPF：observer kprobe 按实例自身 pid 过滤，sockmap/reuseport 程序按进程/socket 装载，多个实例互不冲突。
+eBPF：sockmap/reuseport 程序按进程/socket 装载，多个实例互不冲突。
 
 ## 信号
 
@@ -210,8 +210,6 @@ TCP 转发路径使用每 worker 一个 epoll loop：每个 worker 持有 `SO_RE
 
 sockmap 是否更快取决于数据路径。跨主机、高 RTT 或 CPU 受限环境通常更可能受益；loopback 和部分小包场景中，SK_SKB/sockhash 的逐包成本可能高于用户态 relay。部署前应使用实际网卡、包大小和 RTT 分别压测 `enabled` 与 `disabled`，不要仅根据本机回环结果选择。
 
-常驻 tuning daemon 默认启用。它会优先加载 eBPF kprobe observer，观测当前 Curtsy 进程触发的 TCP/UDP send/recv 内核调用，并结合 `/proc/net/netstat` 的监听队列溢出计数和 Curtsy 内部 TCP/UDP 使用量持续调参。当前版本只调整 Curtsy 自己的运行时限额，不写系统 sysctl；如果 eBPF observer 加载失败，会降级使用内部计数和 `/proc`，服务继续运行。
-
 高 RTT 链路需要足够大的系统 TCP 自动调优上限。例如 1 Gbps、100 ms RTT 的链路至少需要约 12.5 MB 的 TCP 窗口，可按部署环境检查并调整 `net.ipv4.tcp_rmem`、`net.ipv4.tcp_wmem`、`net.core.rmem_max` 和 `net.core.wmem_max`。Curtsy 不会自行覆盖这些系统级参数。
 
 ## UDP 性能
@@ -222,7 +220,7 @@ UDP 高吞吐场景下，内核默认的 208 KiB socket 缓冲经常是最先触
 
 在具备 eBPF 权限且内核 >= 5.12 的 Linux 上，Curtsy 还可以为 UDP 会话启用 sockmap 内核转发：首个报文仍由用户态建立会话，随后为该客户端创建一个 connect 到其地址的专用 socket，并把客户端 socket 与上游 socket 配对放入 `BPF_MAP_TYPE_SOCKHASH`；`SK_SKB` verdict 程序用 `bpf_sk_redirect_hash` 把两个方向的报文直接转发到对端发送路径，不再经过用户态。每个 I/O 线程持有独立的 sockhash 与 verdict 程序，会话不跨线程迁移。
 
-`performance.udpSockmapAcceleration` 控制该路径（`enabled` / `disabled` / 默认 `auto`）。UDP `auto` 从稳定的用户态 `recvmmsg`/`sendmmsg` 批量路径启动；只有非 loopback 上游连续 5 个一秒窗口达到每窗口至少 200 个报文、平均报文至少 256 字节时，才会尝试 sockmap。加载失败、连续配对失败或加速后仍持续有大量报文回落用户态时，会关闭 sockmap 并冷却 30 秒后重新观测，因此 loopback、小包和不稳定负载保持用户态路径。`enabled` 强制尽力尝试，`disabled` 始终关闭；sockmap 不承诺报文顺序。权限不足、内核不支持或单会话配对失败时安全回退，不影响服务启动。热加载从 `enabled` 切到 `auto`/`disabled`，或 `auto` 切到 loopback 上游时，会在发布新配置前同步禁止新会话进入 sockmap，再由 I/O 线程按“先解绑会话、后销毁 runtime”的顺序完成切换，并把控制器重置为可重新探测的用户态状态；`auto` 配置不变且仍非 loopback 的重载（例如 tuning 守护进程的限额微调）会保留已加载的 runtime 和自适应状态，不会中断加速。
+`performance.udpSockmapAcceleration` 控制该路径（`enabled` / `disabled` / 默认 `auto`）。UDP `auto` 从稳定的用户态 `recvmmsg`/`sendmmsg` 批量路径启动；只有非 loopback 上游连续 5 个一秒窗口达到每窗口至少 200 个报文、平均报文至少 256 字节时，才会尝试 sockmap。加载失败、连续配对失败或加速后仍持续有大量报文回落用户态时，会关闭 sockmap 并冷却 30 秒后重新观测，因此 loopback、小包和不稳定负载保持用户态路径。`enabled` 强制尽力尝试，`disabled` 始终关闭；sockmap 不承诺报文顺序。权限不足、内核不支持或单会话配对失败时安全回退，不影响服务启动。热加载从 `enabled` 切到 `auto`/`disabled`，或 `auto` 切到 loopback 上游时，会在发布新配置前同步禁止新会话进入 sockmap，再由 I/O 线程按“先解绑会话、后销毁 runtime”的顺序完成切换，并把控制器重置为可重新探测的用户态状态；`auto` 配置不变且仍非 loopback 的重载会保留已加载的 runtime 和自适应状态，不会中断加速。
 
 ## 配置约束
 

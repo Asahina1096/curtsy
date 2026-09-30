@@ -5,8 +5,8 @@
 # to `curtsy --config <file>` for the proxied runs. Nothing outside
 # tools/benchmark is touched; system settings are never changed by the harness.
 #
-# tuningDaemon is disabled so benchmark numbers are not perturbed by runtime
-# auto-tuning; sockmap acceleration follows --acceleration.
+# Every limit is fixed at startup, so benchmark numbers are reproducible;
+# sockmap acceleration follows --acceleration.
 listen:
   host: "__LISTEN_HOST__"
   port: __LISTEN_PORT__
@@ -19,7 +19,6 @@ protocols: [__PROTOCOLS__]
 
 runtime:
   workerThreads: __WORKER_THREADS__
-  tuningDaemon: __TUNING_DAEMON__
 
 performance:
   tcpSockmapAcceleration: __TCP_SOCKMAP__

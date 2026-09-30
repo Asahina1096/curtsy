@@ -43,8 +43,11 @@ link_speed=25
 mtu=1500
 udp_sockbuf=4194304
 acceleration=auto
-worker_threads=auto
-tuning_daemon=false
+# runtime.workerThreads has no auto mode: default to one thread per CPU,
+# capped at 32 as host-derived selection used to do.
+worker_threads=$(nproc 2>/dev/null || echo 1)
+case "$worker_threads" in '' | *[!0-9]*) worker_threads=1 ;; esac
+if [ "$worker_threads" -gt 32 ]; then worker_threads=32; fi
 curtsy_binary="$REPO_ROOT/zig-out/bin/curtsy"
 listen_port=9000
 upstream_port=9001
@@ -99,7 +102,7 @@ Curtsy:
   --upstream-port <p>  iperf3 server port.                      [9001]
   --config <path>      Reuse an existing curtsy config instead of the
                        generated one; ports above must match it.
-  --worker-threads <n> runtime.workerThreads (auto|int).        [auto]
+  --worker-threads <n> runtime.workerThreads (positive int).  [nproc, max 32]
 
 Session:
   --output-dir <dir>   Parent directory for results.            [/tmp/curtsy-benchmark]
@@ -193,7 +196,8 @@ validate_args() {
         usage_die "--upstream-port must be 1..65535 (got '$upstream_port')"
     [ "$listen_port" -ne "$upstream_port" ] || usage_die "--listen-port and --upstream-port must differ"
     [ -n "$bandwidth" ] || usage_die "--bandwidth must be non-empty"
-    case "$worker_threads" in auto | [0-9]*) ;; *) usage_die "--worker-threads must be 'auto' or an integer" ;; esac
+    case "$worker_threads" in '' | *[!0-9]*) usage_die "--worker-threads must be a positive integer" ;; esac
+    [ "$worker_threads" -ge 1 ] || usage_die "--worker-threads must be at least 1"
     if [ -n "$user_config" ]; then
         [ -f "$user_config" ] || die "$EXIT_USAGE" "--config file not found: $user_config"
         warn "--config in use: ensure --listen-port/--upstream-port match its values"
@@ -316,7 +320,7 @@ setup() {
         generate_curtsy_config \
             "$listen_host_val" "$listen_port" "$upstream_target" "$upstream_port" \
             "$(config_protocols_string)" "$acceleration" "$acceleration" "$udp_sockbuf" \
-            "$worker_threads" "$tuning_daemon" "$probe_config"
+            "$worker_threads" "$probe_config"
     fi
 
     validate_curtsy

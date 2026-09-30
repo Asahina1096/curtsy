@@ -1,15 +1,17 @@
-//! runtime module: owns the `runtime` directive (root context): worker
-//! thread count, tuning daemon toggle and interval.
+//! runtime module: owns the `runtime` directive (root context): worker thread
+//! count.
 
 const std = @import("std");
 const conf = @import("../conf.zig");
 const fw = @import("../module.zig");
 const yaml = @import("../yaml.zig");
 
+/// Fixed built-in worker thread count. An omitted key means exactly this
+/// value; there is no host-derived selection.
+pub const default_worker_threads: i64 = 1;
+
 pub const RuntimeOptions = struct {
-    worker_threads: i64 = 0,
-    tuning_daemon: bool = true,
-    tuning_interval_seconds: i64 = 5,
+    worker_threads: i64 = default_worker_threads,
 };
 
 pub const Conf = RuntimeOptions;
@@ -35,25 +37,16 @@ fn setRuntime(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []
     _ = path;
     const c: *Conf = @ptrCast(@alignCast(slot));
     const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "runtime");
-    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "workerThreads", "tuningDaemon", "tuningIntervalSeconds" }, "runtime");
-    const workers = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "workerThreads", "runtime.workerThreads", 0);
-    c.worker_threads = workers.value;
-    if (yaml.mappingGet(map, "tuningDaemon")) |v| {
-        c.tuning_daemon = try yaml.decodeBool(cycle.gpa, cycle.diag, v, "runtime.tuningDaemon");
-    }
-    if (yaml.mappingGet(map, "tuningIntervalSeconds")) |v| {
-        c.tuning_interval_seconds = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "runtime.tuningIntervalSeconds");
+    try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{"workerThreads"}, "runtime");
+    if (yaml.mappingGet(map, "workerThreads")) |v| {
+        c.worker_threads = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "runtime.workerThreads");
     }
 }
 
 fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
     const c = cycle.conf(@This());
-    if (c.worker_threads < 0) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "runtime.workerThreads must be zero for auto or positive", .{});
-        return error.InvalidConfiguration;
-    }
-    if (c.tuning_interval_seconds <= 0) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "runtime.tuningIntervalSeconds must be positive", .{});
+    if (c.worker_threads < 1 or c.worker_threads > std.math.maxInt(i32)) {
+        yaml.setDiag(cycle.gpa, cycle.diag, "runtime.workerThreads must be between 1 and {d}", .{std.math.maxInt(i32)});
         return error.InvalidConfiguration;
     }
 }

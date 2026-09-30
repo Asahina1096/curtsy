@@ -18,7 +18,6 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 
-const autotune = @import("../autotune.zig");
 const bpf = @import("../bpf.zig");
 const cli = @import("cli.zig");
 const conf = @import("../conf.zig");
@@ -31,7 +30,6 @@ const performance = @import("performance.zig");
 const rules = @import("rules.zig");
 const runtime = @import("runtime.zig");
 const timeouts = @import("timeouts.zig");
-const tuning = @import("tuning.zig");
 const upstream = @import("upstream.zig");
 const yaml = @import("../yaml.zig");
 
@@ -392,7 +390,7 @@ pub const Listener = struct {
 
     /// Cumulative data-path accounting for this listener generation, safe to
     /// read from any thread (the adapters snapshot per-worker atomics). Pure
-    /// accounting; it never influences a forwarding or tuning decision.
+    /// accounting; it never influences a forwarding decision.
     pub fn metrics(self: *Listener) MetricsSnapshot {
         return self.metrics_fn(self.context);
     }
@@ -784,8 +782,6 @@ pub const ForwarderService = struct {
     resolved: ResolvedForwarder,
     logger: log.LogStore,
     worker_threads: i64,
-    /// Global-section view for the tuning daemon (which only reads limits).
-    tuning_view: ResolvedConfiguration,
     /// Fingerprint of the config file at its last successful load. A SIGHUP
     /// whose file still matches is a no-op (reload skipped). null until a
     /// file-source cycle has been captured, and null for CLI sources.
@@ -803,7 +799,6 @@ pub const ForwarderService = struct {
     /// Generation of the current loaded cycle, bumped on every successful
     /// reload. Retirements tag their borrowed cycle with the pre-bump value.
     cycle_generation: u64 = 0,
-    tuning_daemon: ?tuning.TuningDaemon = null,
     shutting_down: bool = false,
 
     pub fn init(
@@ -822,8 +817,7 @@ pub const ForwarderService = struct {
             .loaded = loaded,
             .resolved = resolved,
             .logger = logger,
-            .worker_threads = autotune.workerThreads(resolved.configuration.runtime.worker_threads, .system()),
-            .tuning_view = tuningViewFor(resolved.configuration, resolved.rules),
+            .worker_threads = resolved.configuration.runtime.worker_threads,
             // Prefer the fingerprint the caller captured before reading the
             // file: an edit landing during resolution (DNS can take seconds)
             // is then caught by the first SIGHUP instead of skipped forever.
@@ -836,7 +830,6 @@ pub const ForwarderService = struct {
     }
 
     pub fn deinit(self: *ForwarderService) void {
-        self.stopTuningDaemon();
         for (self.rules_list.items) |rt| self.destroyRuleRuntime(rt);
         self.rules_list.deinit(self.allocator);
         self.reapRetiredRules(true);
@@ -865,7 +858,6 @@ pub const ForwarderService = struct {
         );
 
         try self.startInitialRules();
-        self.startTuningDaemonIfNeeded();
         self.logger.info("forwarder started rules={d}", .{self.rules_list.items.len});
 
         while (!self.shutting_down) {
@@ -894,8 +886,6 @@ pub const ForwarderService = struct {
     }
 
     fn shutdownRules(self: *ForwarderService) void {
-        self.stopTuningDaemon();
-
         self.mutex.lock();
         const grace_seconds = self.resolved.configuration.timeouts.shutdown_grace_seconds;
         for (self.rules_list.items) |rt| {
@@ -1573,19 +1563,16 @@ pub const ForwarderService = struct {
     /// new rule list.
     ///
     /// On any preparation failure nothing is published: the live rules, pools,
-    /// listeners, `self.resolved`, tuning view and cycle ownership all stay on
+    /// listeners, `self.resolved` and cycle ownership all stay on
     /// the previous configuration, the candidate cycle is released normally by
     /// the caller, and preflighted live backlog changes are rolled back.
     pub fn apply(self: *ForwarderService, candidate: ResolvedForwarder) Error!void {
-        const requested_worker_threads = autotune.workerThreads(candidate.configuration.runtime.worker_threads, .system());
+        const requested_worker_threads = candidate.configuration.runtime.worker_threads;
         if (requested_worker_threads != self.worker_threads) {
             self.logger.warning("runtime worker thread change requires restart current={d} requested={d}", .{
                 self.worker_threads,
                 requested_worker_threads,
             });
-        }
-        if (candidate.configuration.runtime.tuning_daemon != (self.tuning_daemon != null)) {
-            self.logger.warning("runtime tuning daemon enablement change requires restart", .{});
         }
 
         // ------------------------------------------------------------------
@@ -1642,7 +1629,6 @@ pub const ForwarderService = struct {
         }
         self.rules_list.deinit(self.allocator);
         self.rules_list = next_rules;
-        self.tuning_view = tuningViewFor(candidate.configuration, candidate.rules);
     }
 
     fn requestShutdown(self: *ForwarderService, reason: []const u8) void {
@@ -1651,96 +1637,6 @@ pub const ForwarderService = struct {
         if (self.shutting_down) return;
         self.shutting_down = true;
         self.logger.info("shutdown requested signal={s}", .{reason});
-    }
-
-    // ------------------------------------------------------------------
-    // Tuning daemon
-    // ------------------------------------------------------------------
-
-    fn startTuningDaemonIfNeeded(self: *ForwarderService) void {
-        if (!self.resolved.configuration.runtime.tuning_daemon) return;
-        self.tuning_daemon = tuning.TuningDaemon.init(
-            self.resolved.configuration.runtime.tuning_interval_seconds,
-            &self.logger,
-            self,
-            snapshotProvider,
-            self,
-            applyTunedLimitsCallback,
-        );
-        self.tuning_daemon.?.start();
-    }
-
-    fn stopTuningDaemon(self: *ForwarderService) void {
-        if (self.tuning_daemon) |*daemon| daemon.stop();
-        self.tuning_daemon = null;
-    }
-
-    pub fn snapshot(self: *ForwarderService) ?tuning.TuningSnapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.shutting_down) return null;
-        var tcp_buffered: i64 = 0;
-        var udp_associations: u64 = 0;
-        var metrics = MetricsSnapshot.zero;
-        for (self.rules_list.items) |rt| {
-            if (rt.tcp_listener) |listener| {
-                tcp_buffered += listener.bufferedBytesUsed();
-                metrics = MetricsSnapshot.add(metrics, listener.metrics());
-            }
-            if (rt.udp_listener) |listener| {
-                udp_associations += listener.associationCount();
-                metrics = MetricsSnapshot.add(metrics, listener.metrics());
-            }
-            for (rt.custom_listeners.items) |slot| {
-                tcp_buffered += slot.listener.bufferedBytesUsed();
-                udp_associations += slot.listener.associationCount();
-                metrics = MetricsSnapshot.add(metrics, slot.listener.metrics());
-            }
-        }
-        return .{
-            .configuration = self.tuning_view,
-            .tcp_buffered_bytes = tcp_buffered,
-            .udp_associations = @intCast(udp_associations),
-            .metrics = metrics,
-        };
-    }
-
-    /// Push new global auto-tuned limits into every rule, honoring per-rule
-    /// explicit overrides.
-    fn applyTunedLimits(self: *ForwarderService, new_limits: LimitConfiguration) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.shutting_down) return;
-
-        self.resolved.configuration.limits = new_limits;
-        self.tuning_view.configuration.limits = new_limits;
-
-        for (self.rules_list.items) |rt| {
-            const old_effective = rt.resolved.configuration;
-            var new_effective = old_effective;
-            new_effective.limits = limits.merge(new_limits, rt.rule.limits);
-            if (std.meta.eql(old_effective.limits, new_effective.limits)) continue;
-
-            if (new_effective.limits.tcp_listen_backlog != old_effective.limits.tcp_listen_backlog) {
-                if (rt.tcp_listener) |listener| {
-                    listener.updateBacklog(@intCast(new_effective.limits.tcp_listen_backlog)) catch |err| {
-                        self.logger.warning("tuning daemon backlog update failed error={s}", .{@errorName(err)});
-                        new_effective.limits.tcp_listen_backlog = old_effective.limits.tcp_listen_backlog;
-                    };
-                }
-            }
-
-            const new_resolved = ResolvedConfiguration{
-                .configuration = new_effective,
-                .listen_addresses = rt.resolved.listen_addresses,
-                .upstream_address = rt.resolved.upstream_address,
-                .upstream_has_loopback = rt.resolved.upstream_has_loopback,
-            };
-            if (rt.tcp_listener) |listener| listener.updateConfiguration(new_resolved, false);
-            if (rt.udp_listener) |listener| listener.updateConfiguration(new_resolved, false);
-            for (rt.custom_listeners.items) |slot| slot.listener.updateConfiguration(new_resolved, false);
-            rt.resolved = new_resolved;
-        }
     }
 
     fn ruleWeights(self: *ForwarderService, rule: RuleConfiguration) Allocator.Error![]u32 {
@@ -1762,21 +1658,11 @@ fn ruleWeightsEqual(a: RuleConfiguration, b: RuleConfiguration) bool {
     return true;
 }
 
-/// Rule overrides plus auto thread pools divided across rules when more
-/// than one rule exists.
+/// Effective configuration for one rule: global sections with the rule's
+/// own overrides applied.
 fn adjustedEffective(candidate: *const ResolvedRule, rule_count: usize) ForwarderConfiguration {
-    var effective = candidate.effective;
-    if (rule_count > 1) {
-        const total = autotune.workerThreads(0, .system());
-        const divisor: i64 = @intCast(rule_count);
-        if (effective.runtime.worker_threads == 0) {
-            effective.runtime.worker_threads = @max(1, @divTrunc(total, divisor));
-        }
-        if (effective.performance.udp_io_threads == 0) {
-            effective.performance.udp_io_threads = @max(1, @divTrunc(total, divisor));
-        }
-    }
-    return effective;
+    _ = rule_count;
+    return candidate.effective;
 }
 
 fn resolvedForRule(effective: ForwarderConfiguration, candidate: *const ResolvedRule) ResolvedConfiguration {
@@ -1799,15 +1685,6 @@ fn hasLoopbackUpstream(addresses: []const SocketAddr) bool {
     return false;
 }
 
-/// Global-section snapshot for the tuning daemon; only limits is consumed.
-fn tuningViewFor(globals: ForwarderConfiguration, resolved_rules: []const ResolvedRule) ResolvedConfiguration {
-    return .{
-        .configuration = globals,
-        .listen_addresses = resolved_rules[0].listen_addresses,
-        .upstream_address = resolved_rules[0].upstream_addresses[0],
-    };
-}
-
 fn signalMask() posix.sigset_t {
     var signals = posix.sigemptyset();
     posix.sigaddset(&signals, .INT);
@@ -1815,16 +1692,6 @@ fn signalMask() posix.sigset_t {
     posix.sigaddset(&signals, .HUP);
     posix.sigaddset(&signals, .PIPE);
     return signals;
-}
-
-fn snapshotProvider(context: ?*anyopaque) ?tuning.TuningSnapshot {
-    const service: *ForwarderService = @ptrCast(@alignCast(context.?));
-    return service.snapshot();
-}
-
-fn applyTunedLimitsCallback(context: ?*anyopaque, new_limits: LimitConfiguration) void {
-    const service: *ForwarderService = @ptrCast(@alignCast(context.?));
-    service.applyTunedLimits(new_limits);
 }
 
 fn monotonicNowNs() u64 {
@@ -1869,7 +1736,6 @@ test "loads defaults" {
     defer cycle.deinit();
     try testing.expect(!cycle.rules_mode);
     const config = configuration(&cycle);
-    const auto_limits = autotune.limits(.system());
 
     try testing.expectEqual(1, config.version);
     try testing.expectEqualSlices(ForwardProtocol, &.{ .tcp, .udp }, config.protocols);
@@ -1881,21 +1747,18 @@ test "loads defaults" {
     try testing.expectEqual(300, config.timeouts.tcp_idle_seconds);
     try testing.expectEqual(60, config.timeouts.udp_session_seconds);
     try testing.expectEqual(10, config.timeouts.shutdown_grace_seconds);
-    try testing.expectEqual(auto_limits.tcp_listen_backlog, config.limits.tcp_listen_backlog);
-    try testing.expectEqual(auto_limits.max_tcp_buffered_bytes, config.limits.max_tcp_buffered_bytes);
-    try testing.expectEqual(auto_limits.max_udp_associations, config.limits.max_udp_associations);
-    try testing.expectEqual(auto_limits.max_udp_pending_datagrams, config.limits.max_udp_pending_datagrams);
-    try testing.expectEqual(auto_limits.max_udp_pending_bytes, config.limits.max_udp_pending_bytes);
-    try testing.expectEqual(0, config.runtime.worker_threads);
-    try testing.expect(config.runtime.tuning_daemon);
-    try testing.expectEqual(5, config.runtime.tuning_interval_seconds);
-    try testing.expect(config.limits.auto_tuning.max_tcp_buffered_bytes);
+    try testing.expectEqual(limits.default_tcp_listen_backlog, config.limits.tcp_listen_backlog);
+    try testing.expectEqual(limits.default_max_tcp_buffered_bytes, config.limits.max_tcp_buffered_bytes);
+    try testing.expectEqual(limits.default_max_udp_associations, config.limits.max_udp_associations);
+    try testing.expectEqual(limits.default_max_udp_pending_datagrams, config.limits.max_udp_pending_datagrams);
+    try testing.expectEqual(limits.default_max_udp_pending_bytes, config.limits.max_udp_pending_bytes);
+    try testing.expectEqual(1, config.runtime.worker_threads);
     try testing.expectEqualStrings("info", config.logging.level);
     try testing.expectEqual(SockmapAccelerationMode.auto, config.performance.tcp_sockmap_acceleration);
     try testing.expectEqual(SockmapAccelerationMode.auto, config.performance.udp_sockmap_acceleration);
     try testing.expectEqual(PerformanceConfiguration.default_udp_socket_buffer_bytes, config.performance.udp_socket_buffer_bytes);
     try testing.expectEqual(PerformanceConfiguration.default_udp_datagram_buffer_bytes, config.performance.udp_datagram_buffer_bytes);
-    try testing.expectEqual(0, config.performance.udp_io_threads);
+    try testing.expectEqual(1, config.performance.udp_io_threads);
 }
 
 test "resolve rejects a protocol absent from the built-in registry" {
@@ -1932,7 +1795,7 @@ test "loads overrides" {
         \\  maxUDPAssociations: 128
         \\  maxUDPPendingDatagrams: 8
         \\  maxUDPPendingBytes: 4096
-        \\runtime: { workerThreads: 2, tuningDaemon: false, tuningIntervalSeconds: 10 }
+        \\runtime: { workerThreads: 2 }
         \\performance: { tcpSockmapAcceleration: enabled, udpSockmapAcceleration: disabled, udpSocketBufferBytes: 8388608, udpDatagramBufferBytes: 8192, udpIOThreads: 2 }
         \\logging: { level: debug }
         \\
@@ -1956,10 +1819,6 @@ test "loads overrides" {
     try testing.expectEqual(4_096, config.limits.max_udp_pending_bytes);
     try testing.expectEqualStrings("debug", config.logging.level);
     try testing.expectEqual(2, config.runtime.worker_threads);
-    try testing.expect(!config.runtime.tuning_daemon);
-    try testing.expectEqual(10, config.runtime.tuning_interval_seconds);
-    try testing.expect(!config.limits.auto_tuning.max_tcp_buffered_bytes);
-    try testing.expect(config.limits.auto_tuning.tcp_listen_backlog == false);
     try testing.expectEqual(SockmapAccelerationMode.enabled, config.performance.tcp_sockmap_acceleration);
     try testing.expectEqual(SockmapAccelerationMode.disabled, config.performance.udp_sockmap_acceleration);
     try testing.expectEqual(8 * 1_024 * 1_024, config.performance.udp_socket_buffer_bytes);
@@ -1967,31 +1826,31 @@ test "loads overrides" {
     try testing.expectEqual(2, config.performance.udp_io_threads);
 }
 
-test "accepts explicit auto values" {
-    var cycle = try loadForTest(
-        \\listen: { port: 9000 }
-        \\upstream: { host: "localhost", port: 9001 }
+test "rejects the removed auto keyword in numeric fields" {
+    try conf.expectLoadFailure(
+        \\version: 1
+        \\protocols: [tcp]
+        \\listen: { host: "127.0.0.1", port: 9000 }
+        \\upstream: { host: "127.0.0.1", port: 9001 }
         \\runtime: { workerThreads: auto }
-        \\limits:
-        \\  tcpListenBacklog: auto
-        \\  maxTCPBufferedBytes: auto
-        \\  maxUDPAssociations: auto
-        \\  maxUDPPendingDatagrams: auto
-        \\  maxUDPPendingBytes: auto
         \\
-    );
-    defer cycle.deinit();
-    const config = configuration(&cycle);
-    const auto_limits = autotune.limits(.system());
-
-    try testing.expectEqual(0, config.runtime.worker_threads);
-    try testing.expectEqual(auto_limits.tcp_listen_backlog, config.limits.tcp_listen_backlog);
-    try testing.expectEqual(auto_limits.max_tcp_buffered_bytes, config.limits.max_tcp_buffered_bytes);
-    try testing.expectEqual(auto_limits.max_udp_associations, config.limits.max_udp_associations);
-    try testing.expectEqual(auto_limits.max_udp_pending_datagrams, config.limits.max_udp_pending_datagrams);
-    try testing.expectEqual(auto_limits.max_udp_pending_bytes, config.limits.max_udp_pending_bytes);
-    try testing.expect(config.limits.auto_tuning.tcp_listen_backlog);
-    try testing.expect(config.limits.auto_tuning.max_udp_pending_bytes);
+    , "runtime.workerThreads: expected an integer");
+    try conf.expectLoadFailure(
+        \\version: 1
+        \\protocols: [tcp]
+        \\listen: { host: "127.0.0.1", port: 9000 }
+        \\upstream: { host: "127.0.0.1", port: 9001 }
+        \\limits: { tcpListenBacklog: auto }
+        \\
+    , "limits.tcpListenBacklog: expected an integer");
+    try conf.expectLoadFailure(
+        \\version: 1
+        \\protocols: [tcp]
+        \\listen: { host: "127.0.0.1", port: 9000 }
+        \\upstream: { host: "127.0.0.1", port: 9001 }
+        \\performance: { udpIOThreads: auto }
+        \\
+    , "performance.udpIOThreads: expected an integer");
 }
 
 test "accepts block sequences and comments" {
@@ -2061,15 +1920,15 @@ test "rejects invalid ranges and log levels" {
         .{ .yaml_text = prefix ++ "timeouts: { udpSessionSeconds: 0 }\n", .message = "all timeout values must be positive" },
         .{ .yaml_text = prefix ++ "timeouts: { tcpIdleSeconds: 9223372037 }\n", .message = "all timeout values must be no greater than 9223372036 seconds" },
         .{ .yaml_text = prefix ++ "logging: { level: verbose }\n", .message = "logging.level is invalid" },
-        .{ .yaml_text = prefix ++ "runtime: { workerThreads: -1 }\n", .message = "runtime.workerThreads must be zero for auto or positive" },
-        .{ .yaml_text = prefix ++ "runtime: { tuningIntervalSeconds: 0 }\n", .message = "runtime.tuningIntervalSeconds must be positive" },
+        .{ .yaml_text = prefix ++ "runtime: { workerThreads: -1 }\n", .message = "runtime.workerThreads must be between 1 and 2147483647" },
+        .{ .yaml_text = prefix ++ "runtime: { workerThreads: auto }\n", .message = "runtime.workerThreads: expected an integer" },
         .{ .yaml_text = prefix ++ "performance: { tcpSockmapAcceleration: sometimes }\n", .message = "performance.tcpSockmapAcceleration: expected one of auto, enabled, disabled" },
         .{ .yaml_text = prefix ++ "limits: { maxUDPAssociations: 2147483648 }\n", .message = "limits.maxUDPAssociations must be between 1 and 2147483647" },
         .{ .yaml_text = prefix ++ "performance: { udpSockmapAcceleration: sometimes }\n", .message = "performance.udpSockmapAcceleration: expected one of auto, enabled, disabled" },
         .{ .yaml_text = prefix ++ "performance: { udpSocketBufferBytes: -1 }\n", .message = "performance.udpSocketBufferBytes must be between 0 (kernel default) and 268435456" },
         .{ .yaml_text = prefix ++ "performance: { udpSocketBufferBytes: 536870912 }\n", .message = "performance.udpSocketBufferBytes must be between 0 (kernel default) and 268435456" },
-        .{ .yaml_text = prefix ++ "performance: { udpIOThreads: -1 }\n", .message = "performance.udpIOThreads must be zero for auto or positive" },
-        .{ .yaml_text = prefix ++ "runtime: { workerThreads: forever }\n", .message = "runtime.workerThreads: expected an integer or auto" },
+        .{ .yaml_text = prefix ++ "performance: { udpIOThreads: -1 }\n", .message = "performance.udpIOThreads must be positive" },
+        .{ .yaml_text = prefix ++ "runtime: { workerThreads: forever }\n", .message = "runtime.workerThreads: expected an integer" },
     };
     for (cases) |case| {
         try conf.expectLoadFailure(case.yaml_text, case.message);
@@ -2450,7 +2309,7 @@ test "config.example.yaml parses with expected values" {
         \\upstream:
         \\  host: "example.com"
         \\
-        \\# Optional overrides. Omitted values are auto-tuned continuously at runtime.
+        \\# Optional overrides. Every omitted numeric key uses a fixed built-in default.
         \\# version: 1
         \\# protocols: [tcp, udp]
         \\# listen:
@@ -2460,26 +2319,24 @@ test "config.example.yaml parses with expected values" {
         \\#   host: "example.com"
         \\#   port: 9000
         \\# runtime:
-        \\#   workerThreads: auto
-        \\#   tuningDaemon: true
-        \\#   tuningIntervalSeconds: 5
+        \\#   workerThreads: 4
         \\# timeouts:
         \\#   connectSeconds: 5
         \\#   tcpIdleSeconds: 300
         \\#   udpSessionSeconds: 60
         \\#   shutdownGraceSeconds: 10
         \\# limits:
-        \\#   tcpListenBacklog: auto
-        \\#   maxTCPBufferedBytes: auto
-        \\#   maxUDPAssociations: auto
-        \\#   maxUDPPendingDatagrams: auto   # legacy: unused by the batched UDP transport
-        \\#   maxUDPPendingBytes: auto       # legacy: unused by the batched UDP transport
+        \\#   tcpListenBacklog: 4096
+        \\#   maxTCPBufferedBytes: 134217728
+        \\#   maxUDPAssociations: 2048
+        \\#   maxUDPPendingDatagrams: 64     # legacy: unused by the batched UDP transport
+        \\#   maxUDPPendingBytes: 524288     # legacy: unused by the batched UDP transport
         \\# performance:
         \\#   tcpSockmapAcceleration: auto   # auto skips loopback upstreams
         \\#   udpSockmapAcceleration: auto   # starts in userspace, then adapts to sustained eligible traffic
         \\#   udpSocketBufferBytes: 4194304   # 0 keeps kernel defaults; clamped to
         \\#                                   # net.core.rmem_max/wmem_max without CAP_NET_ADMIN
-        \\#   udpIOThreads: auto              # UDP relay threads; auto = worker count
+        \\#   udpIOThreads: 1                 # UDP relay threads
         \\# logging:
         \\#   level: info
         \\# Optional rules module (disabled unless written): multiple independent
@@ -2889,6 +2746,25 @@ test "coalesceSignals folds duplicate signals into one dispatch decision" {
 
 /// Writes `text` to `path`, truncating any prior content.
 fn writeTestConfig(path: []const u8, text: []const u8) !void {
+    const previous = ConfigFingerprint.capture(path);
+    try writeTestConfigOnce(path, text);
+    // The reload fingerprint is (mtime_ns, size) and mtimes only advance at
+    // filesystem tick granularity (4ms on this host). A same-size rewrite
+    // inside one tick is invisible, which would silently turn the reload the
+    // test is about to trigger into a no-op. Rewrite until the mtime leaves
+    // the tick the previous file was in; see `ConfigFingerprint`.
+    const baseline = previous orelse return;
+    for (0..200) |_| {
+        const live = ConfigFingerprint.capture(path) orelse return;
+        if (live.mtime_ns != baseline.mtime_ns or live.size != baseline.size) return;
+        const delay = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&delay, null);
+        try writeTestConfigOnce(path, text);
+    }
+    return error.TestConfigWriteStalled;
+}
+
+fn writeTestConfigOnce(path: []const u8, text: []const u8) !void {
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
@@ -2946,137 +2822,4 @@ test "metrics snapshot zero add delta and isZero" {
     const replaced = MetricsSnapshot{ .tcp = .{ .splice_bytes = 0 } };
     try testing.expect(MetricsSnapshot.delta(replaced, a).isZero());
     try testing.expect(MetricsSnapshot.delta(a, a).isZero());
-}
-
-/// Minimal listener wrapper whose metrics_fn returns a fixed snapshot. The
-/// wrapper and its context are heap-allocated so the service's destroy path
-/// (listener.destroy) is exercised symmetrically.
-const FakeListener = struct {
-    const Context = struct {
-        metrics: MetricsSnapshot,
-    };
-
-    fn create(allocator: Allocator, metrics: MetricsSnapshot) !*Listener {
-        const context = try allocator.create(Context);
-        context.* = .{ .metrics = metrics };
-        const wrapper = try allocator.create(Listener);
-        wrapper.* = .{
-            .allocator = allocator,
-            .context = context,
-            .activate_fn = noop,
-            .stop_accepting_fn = noop,
-            .destroy_fn = destroy,
-            .update_configuration_fn = noopUpdate,
-            .update_backlog_fn = null,
-            .force_close_fn = noop,
-            .active_count_fn = zeroCount,
-            .buffered_bytes_fn = zeroBuffered,
-            .associations_fn = zeroAssociations,
-            .metrics_fn = metricsOf,
-        };
-        return wrapper;
-    }
-
-    fn noop(context: *anyopaque) void {
-        _ = context;
-    }
-
-    fn noopUpdate(context: *anyopaque, resolved: ResolvedConfiguration, reset_sessions: bool) void {
-        _ = context;
-        _ = resolved;
-        _ = reset_sessions;
-    }
-
-    fn destroy(listener_allocator: Allocator, context: *anyopaque) void {
-        const c: *Context = @ptrCast(@alignCast(context));
-        listener_allocator.destroy(c);
-    }
-
-    fn zeroCount(context: *anyopaque) usize {
-        _ = context;
-        return 0;
-    }
-
-    fn zeroBuffered(context: *anyopaque) i64 {
-        _ = context;
-        return 0;
-    }
-
-    fn zeroAssociations(context: *anyopaque) u64 {
-        _ = context;
-        return 0;
-    }
-
-    fn metricsOf(context: *anyopaque) MetricsSnapshot {
-        const c: *Context = @ptrCast(@alignCast(context));
-        return c.metrics;
-    }
-};
-
-/// RuleRuntime whose pool is real (so service.deinit's destroy path works)
-/// but whose listeners are fakes; the rule/resolved views are unused by
-/// snapshot().
-fn makeFakeRuleRuntime(allocator: Allocator, tcp_listener: ?*Listener, udp_listener: ?*Listener) !*RuleRuntime {
-    const addresses = [_]SocketAddr{SocketAddr.parseIp("127.0.0.1", 9_001).?};
-    const weights = [_]u32{1};
-    const rt = try allocator.create(RuleRuntime);
-    rt.* = .{
-        .rule = undefined,
-        .resolved = undefined,
-        .pool = try upstream.UpstreamPool.init(allocator, &addresses, &weights, upstream.defaultBalancer()),
-        .balance = upstream.defaultBalancer(),
-        .tcp_listener = tcp_listener,
-        .udp_listener = udp_listener,
-        .started_worker_threads = 0,
-        .started_udp_io_threads = 0,
-    };
-    return rt;
-}
-
-test "snapshot aggregates listener metrics across rules" {
-    const result = try resolveYamlForTest(
-        \\listen: { host: "127.0.0.1", port: 9000 }
-        \\upstream: { host: "127.0.0.2", port: 9001 }
-    , null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null, null);
-    defer service.deinit();
-
-    // Rule 0: one TCP listener. Rule 1: TCP + UDP. The service-level snapshot
-    // must sum every listener's metrics into the matching protocol half.
-    const fake_tcp_0 = try FakeListener.create(testing.allocator, .{
-        .tcp = .{ .splice_bytes = 100, .buffered_bytes = 7 },
-    });
-    const fake_tcp_1 = try FakeListener.create(testing.allocator, .{
-        .tcp = .{ .splice_bytes = 50 },
-    });
-    const fake_udp = try FakeListener.create(testing.allocator, .{
-        .udp = .{ .recv_datagrams = 42, .send_bytes = 1_024 },
-    });
-    const rt0 = try makeFakeRuleRuntime(testing.allocator, fake_tcp_0, null);
-    const rt1 = try makeFakeRuleRuntime(testing.allocator, fake_tcp_1, fake_udp);
-    try service.rules_list.append(testing.allocator, rt0);
-    try service.rules_list.append(testing.allocator, rt1);
-
-    const snap = service.snapshot().?;
-    try testing.expectEqual(@as(u64, 150), snap.metrics.tcp.splice_bytes);
-    try testing.expectEqual(@as(u64, 7), snap.metrics.tcp.buffered_bytes);
-    try testing.expectEqual(@as(u64, 0), snap.metrics.tcp.splice_calls);
-    try testing.expectEqual(@as(u64, 42), snap.metrics.udp.recv_datagrams);
-    try testing.expectEqual(@as(u64, 1_024), snap.metrics.udp.send_bytes);
-    // The fake listeners report no buffered bytes or associations.
-    try testing.expectEqual(@as(i64, 0), snap.tcp_buffered_bytes);
-    try testing.expectEqual(@as(i64, 0), snap.udp_associations);
-}
-
-test "snapshot metrics stay all-zero when a service has no listeners" {
-    const result = try resolveYamlForTest(
-        \\listen: { host: "127.0.0.1", port: 9000 }
-        \\upstream: { host: "127.0.0.2", port: 9001 }
-    , null);
-    var service = ForwarderService.init(testing.allocator, .{ .file = "metrics-test.yaml" }, result.cycle, result.resolved, null, null);
-    defer service.deinit();
-    const snap = service.snapshot().?;
-    try testing.expect(snap.metrics.isZero());
-    try testing.expectEqual(@as(u64, 0), snap.metrics.tcp.splice_bytes);
-    try testing.expectEqual(@as(u64, 0), snap.metrics.udp.recv_datagrams);
 }

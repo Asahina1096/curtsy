@@ -26,6 +26,10 @@ pub const max_udp_socket_buffer_bytes: i64 = 1 << 28; // 268435456
 pub const min_udp_datagram_buffer_bytes: i64 = 576;
 pub const max_udp_datagram_buffer_bytes: i64 = 65_536;
 
+/// Fixed built-in batched-UDP I/O thread count. An omitted key means exactly
+/// this value; there is no host-derived selection.
+pub const default_udp_io_threads: i64 = 1;
+
 pub const PerformanceConfiguration = struct {
     pub const default_udp_socket_buffer_bytes: i64 = 4 * 1_024 * 1_024;
     pub const default_udp_datagram_buffer_bytes: i64 = 65_536;
@@ -39,8 +43,8 @@ pub const PerformanceConfiguration = struct {
     // improve cache/TLB locality for small-datagram workloads; datagrams
     // larger than this are truncated.
     udp_datagram_buffer_bytes: i64 = default_udp_datagram_buffer_bytes,
-    // Zero auto-tunes to the worker thread count.
-    udp_io_threads: i64 = 0,
+    // Batched-UDP I/O threads; see `default_udp_io_threads`.
+    udp_io_threads: i64 = default_udp_io_threads,
     /// CPU affinity for relay threads; see `CpuAffinity`. Default: no pinning.
     thread_cpu_affinity: CpuAffinity = .none,
 };
@@ -122,8 +126,9 @@ fn setPerformance(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path
     if (yaml.mappingGet(map, "udpDatagramBufferBytes")) |v| {
         c.udp_datagram_buffer_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "performance.udpDatagramBufferBytes");
     }
-    const io_threads = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "udpIOThreads", "performance.udpIOThreads", 0);
-    c.udp_io_threads = io_threads.value;
+    if (yaml.mappingGet(map, "udpIOThreads")) |v| {
+        c.udp_io_threads = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "performance.udpIOThreads");
+    }
     if (yaml.mappingGet(map, "threadCpuAffinity")) |v| {
         c.thread_cpu_affinity = try decodeCpuAffinity(cycle, v, "performance.threadCpuAffinity");
     }
@@ -135,8 +140,8 @@ fn validate(cycle: *conf.Cycle) yaml.LoadError!void {
         yaml.setDiag(cycle.gpa, cycle.diag, "performance.udpSocketBufferBytes must be between 0 (kernel default) and {d}", .{max_udp_socket_buffer_bytes});
         return error.InvalidConfiguration;
     }
-    if (c.udp_io_threads < 0) {
-        yaml.setDiag(cycle.gpa, cycle.diag, "performance.udpIOThreads must be zero for auto or positive", .{});
+    if (c.udp_io_threads < 1) {
+        yaml.setDiag(cycle.gpa, cycle.diag, "performance.udpIOThreads must be positive", .{});
         return error.InvalidConfiguration;
     }
     if (c.udp_datagram_buffer_bytes < min_udp_datagram_buffer_bytes or

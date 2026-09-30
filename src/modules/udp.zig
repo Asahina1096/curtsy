@@ -39,7 +39,6 @@ const performance = @import("performance.zig");
 const upstream = @import("upstream.zig");
 const log = @import("../log.zig");
 const bpf = @import("../bpf.zig");
-const autotune = @import("../autotune.zig");
 
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
@@ -350,7 +349,7 @@ pub const UdpSockmapPolicy = struct {
     };
 
     // ------------------------------------------------------------------
-    // Internal tuning constants. Conservative by design; the policy is
+    // Internal policy constants. Conservative by design; the policy is
     // never enabled by traffic alone without these windows elapsing.
     // ------------------------------------------------------------------
 
@@ -383,7 +382,7 @@ pub const UdpSockmapPolicy = struct {
     /// Rebuilds the controller for `mode`; used on startup and whenever the
     /// configured mode changes across a reload. A reload that keeps the same
     /// mode leaves the controller (and any loaded runtime) in place, so e.g.
-    /// limits tuning does not reset an auto decision.
+    /// a limits-only reload does not reset an auto decision.
     pub fn reset(self: *UdpSockmapPolicy, mode: Mode) void {
         self.* = .{};
         self.mode = mode;
@@ -575,10 +574,7 @@ pub const UdpListener = struct {
 
     pub fn start(self: *UdpListener) Error!void {
         const snapshot = self.runtime.current();
-        const thread_count: u32 = @intCast(autotune.workerThreads(
-            snapshot.configuration.performance.udp_io_threads,
-            .system(),
-        ));
+        const thread_count: u32 = @intCast(snapshot.configuration.performance.udp_io_threads);
         errdefer self.stop();
 
         // The first engine binds the configured addresses; the rest bind the
@@ -1517,7 +1513,7 @@ pub const UdpRelayEngine = struct {
             },
             .auto => {
                 // An unchanged auto mode with a still-eligible rule (e.g. a
-                // routine tuning-daemon limits tick) keeps the adaptive
+                // routine limits-only reload) keeps the adaptive
                 // runtime and policy exactly as they are. Teardown is only for
                 // transitions that revoke acceleration: coming from explicit
                 // enabled, or the rule becoming loopback-ineligible. In both
@@ -3079,7 +3075,7 @@ test "udp auto reload: unchanged eligible auto keeps the adaptive runtime active
     try testing.expect(engine.sockmap_runtime != null);
     try testing.expect(engine.policy.steerAllowed());
 
-    // A routine limits-only auto reload (tuning-daemon style) must not tear
+    // A routine limits-only auto reload must not tear
     // acceleration down: the runtime and active policy are preserved.
     var tuned = engine.runtime.current();
     tuned.configuration.limits.max_udp_associations = 512;

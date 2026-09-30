@@ -35,23 +35,21 @@ Curtsy 是一个以 Zig 实现用户态、以 C 实现 eBPF 内核程序的透�
 - `src/yaml.zig`：YAML 子集解析器与标量解码助手（纯机制，不含任何配置语义）。
 - `src/net.zig`：`SocketAddr`、resolver（可注入测试）、listen 地址展开（`*` → 双栈通配对）、协议列表助手。
 - `src/log.zig`：带原子阈值和 futex mutex 的日志门面，输出到 stderr。
-- `src/autotune.zig`：CPU/内存自适应默认值公式。
 - `src/bpf.zig`：eBPF/syscall 运行时封装，负责使用 libbpf 打开内嵌 BPF ELF、配置 map/只读常量、取得 FD、管理 link/object 生命周期，以及 sockhash 操作、UDP 批量 I/O 和 Linux socket/epoll/eventfd helper。
 - `src/ebpf/`：C 编写的 eBPF 内核程序，包括 SK_SKB parser/verdict、reuseport 分流程序和 kprobe observer；Clang 产出的 ELF（含 BTF/重定位）嵌入 `curtsy`，运行时由 libbpf 加载。
 - `src/libbpf_shim.c`：隔离 Zig 与 libbpf C API 的薄封装，避免在 Zig 侧复制 libbpf 结构布局。
 
 模块（src/modules/）：
 
-- `src/modules/core.zig`：核心模块（`ngx_core_module` 对应物）。拥有 `version`/`protocols`/`listen`/`upstream` 根指令（单规则语法糖，resolve 时合成为一条规则）、组合配置模型（`ForwarderConfiguration`/`ResolvedConfiguration`/`ResolvedForwarder`）、地址解析与跨规则监听冲突检测、协议模块接口（`Listener` vtable + `ProtocolModule`）、统一编排器 `ForwarderService`（单 cycle 驱动 1..N 条规则；SIGHUP 跑新 cycle 后按规则 listen 地址集合 diff，匹配规则原地更新、新规则先绑定再退役旧规则；auto 线程数按规则数均分；tuning daemon 聚合各规则用量）。
+- `src/modules/core.zig`：核心模块（`ngx_core_module` 对应物）。拥有 `version`/`protocols`/`listen`/`upstream` 根指令（单规则语法糖，resolve 时合成为一条规则）、组合配置模型（`ForwarderConfiguration`/`ResolvedConfiguration`/`ResolvedForwarder`）、地址解析与跨规则监听冲突检测、协议模块接口（`Listener` vtable + `ProtocolModule`）、统一编排器 `ForwarderService`（单 cycle 驱动 1..N 条规则；SIGHUP 跑新 cycle 后按规则 listen 地址集合 diff，匹配规则原地更新、新规则先绑定再退役旧规则；`runtime.workerThreads` 对所有规则一视同仁）。
 - `src/modules/rules.zig`：`rules` 根指令与规则内 `listen`/`upstreams`/`protocols`/`balance` 指令、规则模型与校验。
 - `src/modules/cli.zig`：命令行运行模式模块（可选、默认关闭）。解析 `--listen`/`--upstream`（单规则简写）与可重复的 `--rule`（多规则简写），把简写渲染成 `rules:` YAML 文档后走 `conf.loadYaml`，因此 CLI 规则复用 rules 模块的解码/校验/默认值与 core 编排器的 SIGHUP 热重载；命令行简写早校验端口、weight、协议与 balance 名字。`src/main.zig` 在同时给出 `--config` 与 CLI 端点 flag 时报错退出（互斥）。
 - 当前模块均为系统级内置模块，通过 `src/module.zig` 的 comptime 注册表编译进 `curtsy`。SIGHUP 只替换配置、监听器和上游 generation，不装载或卸载机器码。未来可能支持外部插件，但当前没有共享库 ABI、`plugins:` 配置或插件 CLI 入口。
-- `src/modules/timeouts.zig` / `limits.zig` / `logging.zig` / `runtime.zig` / `performance.zig`：各配置 section 模块。timeouts/limits 同时有 root 和 rule 上下文（规则级为覆盖项，`merge()` 应用到全局值上并清掉对应 auto 标记）。
+- `src/modules/timeouts.zig` / `limits.zig` / `logging.zig` / `runtime.zig` / `performance.zig`：各配置 section 模块。timeouts/limits 同时有 root 和 rule 上下文（规则级为覆盖项，`merge()` 应用到全局值上）。
 - `src/modules/upstream.zig`：上游框架（`ngx_upstream` 对应物）。`UpstreamPool`（peer 状态：被动健康摘除，连续失败 3 次摘除 10 秒，指数回退上限 5 分钟，冷却自动恢复；热加载经 `rebind` 按地址继承健康；pool 对象地址稳定）、注入数据面的 `Selector` 钩子、balancer 注册表。
 - `src/modules/balancer/round_robin.zig` / `source_hash.zig` / `weighted_round_robin.zig`：可插拔负载均衡模块，`balance:` 按名字经注册表选择。
 - `src/modules/tcp.zig`：TCP 协议模块（listener 和 relay）。每 worker 一个 epoll loop、每监听地址一个 `SO_REUSEPORT` socket；用户态 relay 优先 `splice(2)` 零拷贝，背压回退预算缓冲；空闲超时、reuseport eBPF、TCP sockmap 加速。多上游时经 `Selector` 按连接选路、connect 失败故障转移并上报健康；selector 为 null（单上游）时行为与固定上游完全一致。
 - `src/modules/udp.zig`：UDP 协议模块（listener 和 relay engine）。多个 I/O 线程经 `SO_REUSEPORT` 共享端口，每线程 epoll 管理监听、上游和 per-client socket，`recvmmsg`/`sendmmsg` 批量转发，UDP sockmap 加速；多上游时按会话选路，ICMP 错误上报并触发摘除。
-- `src/modules/tuning.zig`：常驻 tuning daemon，读取 eBPF observer 和 `/proc/net/netstat`，按压力调整自动限额；由 core 编排器驱动。
 
 ## 运行时架构要点
 

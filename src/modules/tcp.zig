@@ -29,7 +29,6 @@ const bpf = @import("../bpf.zig");
 const config = @import("core.zig");
 const performance = @import("performance.zig");
 const upstream = @import("upstream.zig");
-const autotune = @import("../autotune.zig");
 const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
@@ -382,8 +381,8 @@ pub const StartError = error{ OutOfMemory, StartFailed, SystemCall };
 
 pub const TCPListener = struct {
     pub const Options = struct {
-        /// 0 derives the worker count from autotune.workerThreads(
-        /// runtime.worker_threads); a positive value pins it (tests use 2).
+        /// Test override for the worker count; 0 follows the configured
+        /// runtime.workerThreads (tests use 2).
         worker_threads: usize = 0,
         /// Test override for the sockmap on/off decision. null follows the configuration.
         enable_sockmap_acceleration: ?bool = null,
@@ -395,7 +394,7 @@ pub const TCPListener = struct {
 
     logger: *log.LogStore,
     options: Options,
-    /// Global userspace relay buffer budget; shared with the tuning daemon.
+    /// Global userspace relay buffer budget.
     budget: TCPBufferBudget,
 
     state_mutex: log.Mutex = .{},
@@ -488,8 +487,7 @@ pub const TCPListener = struct {
 
     fn workerCount(self: *const TCPListener) usize {
         if (self.options.worker_threads > 0) return self.options.worker_threads;
-        const count = autotune.workerThreads(self.configured_worker_threads, .system());
-        return @intCast(count);
+        return @intCast(self.configured_worker_threads);
     }
 
     /// Snapshot of the accept-time configuration; retains the accelerator so
@@ -683,7 +681,7 @@ pub const TCPListener = struct {
         return self.active_connections.load(.acquire);
     }
 
-    /// Queued userspace relay bytes, for the tuning daemon.
+    /// Queued userspace relay bytes.
     pub fn bufferedBytesUsed(self: *const TCPListener) i64 {
         return self.budget.used();
     }

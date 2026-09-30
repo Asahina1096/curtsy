@@ -236,7 +236,7 @@ tools/benchmark/lib/recommend-system.sh --json findings.json --text findings.txt
 | `--mtu BYTES` | `1500` | 目标 MTU，只校验/记录，不修改 |
 | `--udp-socket-buffer B` | `4194304` | iperf3 UDP `-w`（字节） |
 | `--acceleration auto\|enabled\|disabled` | `auto` | 写入生成的 Curtsy 配置的 sockmap 开关 |
-| `--worker-threads auto\|N` | `auto` | 写入生成的配置的 `runtime.workerThreads` |
+| `--worker-threads N` | `nproc`（上限 32） | 写入生成的配置的 `runtime.workerThreads` |
 | `--listen-port` / `--upstream-port` | `9000` / `9001` | Curtsy 监听 / iperf3 server 端口 |
 | `--config PATH` | 自动生成 | 复用已有 Curtsy 配置（端口须与上面两项一致） |
 
@@ -252,7 +252,6 @@ jumbo 尺寸并记录告警（9000 字节报文在 1500 MTU 下无意义）。�
 
 模板见 `templates/curtsy-config.yaml`。固定设置：
 
-- `runtime.tuningDaemon: false`：关闭常驻调参 daemon，保证基准结果不被动态调参扰动；
 - `performance.tcp/udpSockmapAcceleration` 跟随 `--acceleration`；
 - `performance.udpSocketBufferBytes: 4194304`：UDP socket 缓冲 4 MiB。
 

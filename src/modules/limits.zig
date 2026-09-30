@@ -1,37 +1,33 @@
 //! limits module: owns the `limits` directive in the root and rule contexts.
 //!
-//! Global limits default to the autotune formulas and track per-field
-//! auto-tuning flags (the tuning daemon only adjusts fields still marked
-//! auto). Rule confs hold explicit overrides only; merge() applies them over
-//! the global limits, clearing the corresponding auto flags.
+//! Global limits start from the fixed built-in defaults declared below and are
+//! replaced by any explicitly configured integer. Rule confs hold explicit
+//! overrides only; merge() applies them over the global limits.
 
 const std = @import("std");
-const autotune = @import("../autotune.zig");
 const conf = @import("../conf.zig");
 const fw = @import("../module.zig");
 const yaml = @import("../yaml.zig");
 
 pub const max_udp_associations: i64 = std.math.maxInt(u32) / 2; // 2147483647
 
-pub const LimitAutoTuning = struct {
-    tcp_listen_backlog: bool = true,
-    max_tcp_buffered_bytes: bool = true,
-    max_udp_associations: bool = true,
-    max_udp_pending_datagrams: bool = true,
-    max_udp_pending_bytes: bool = true,
-};
+/// Fixed built-in global limit defaults. An omitted key always means exactly
+/// this value; there is no host-derived default and no runtime adjustment.
+pub const default_tcp_listen_backlog: i64 = 4_096;
+pub const default_max_tcp_buffered_bytes: i64 = 128 * 1_024 * 1_024; // 128 MiB
+pub const default_max_udp_associations: i64 = 2_048;
+pub const default_max_udp_pending_datagrams: i64 = 64;
+pub const default_max_udp_pending_bytes: i64 = 512 * 1_024; // 512 KiB
 
 pub const LimitConfiguration = struct {
-    tcp_listen_backlog: i64,
-    max_tcp_buffered_bytes: i64,
-    max_udp_associations: i64,
-    max_udp_pending_datagrams: i64,
-    max_udp_pending_bytes: i64,
-    auto_tuning: LimitAutoTuning = .{},
+    tcp_listen_backlog: i64 = default_tcp_listen_backlog,
+    max_tcp_buffered_bytes: i64 = default_max_tcp_buffered_bytes,
+    max_udp_associations: i64 = default_max_udp_associations,
+    max_udp_pending_datagrams: i64 = default_max_udp_pending_datagrams,
+    max_udp_pending_bytes: i64 = default_max_udp_pending_bytes,
 };
 
-/// Per-rule limit overrides; null inherits the global value (including its
-/// auto-tuning flag).
+/// Per-rule limit overrides; null inherits the global value.
 pub const RuleLimitOverrides = struct {
     tcp_listen_backlog: ?i64 = null,
     max_tcp_buffered_bytes: ?i64 = null,
@@ -41,22 +37,13 @@ pub const RuleLimitOverrides = struct {
 pub const Conf = LimitConfiguration;
 pub const RuleConf = RuleLimitOverrides;
 
-/// merge_conf analogue: rule overrides applied over the global limits;
-/// an explicit override pins the field (no more tuning-daemon adjustment).
+/// merge_conf analogue: rule overrides applied over the global limits; an
+/// explicit override replaces the global value for that rule.
 pub fn merge(global: LimitConfiguration, overrides: RuleLimitOverrides) LimitConfiguration {
     var limits = global;
-    if (overrides.tcp_listen_backlog) |v| {
-        limits.tcp_listen_backlog = v;
-        limits.auto_tuning.tcp_listen_backlog = false;
-    }
-    if (overrides.max_tcp_buffered_bytes) |v| {
-        limits.max_tcp_buffered_bytes = v;
-        limits.auto_tuning.max_tcp_buffered_bytes = false;
-    }
-    if (overrides.max_udp_associations) |v| {
-        limits.max_udp_associations = v;
-        limits.auto_tuning.max_udp_associations = false;
-    }
+    if (overrides.tcp_listen_backlog) |v| limits.tcp_listen_backlog = v;
+    if (overrides.max_tcp_buffered_bytes) |v| limits.max_tcp_buffered_bytes = v;
+    if (overrides.max_udp_associations) |v| limits.max_udp_associations = v;
     return limits;
 }
 
@@ -74,15 +61,8 @@ const directives = [_]fw.Directive{
 };
 
 fn createConf(cycle: *conf.Cycle) error{OutOfMemory}!*anyopaque {
-    const auto_limits = autotune.limits(.system());
     const c = try cycle.allocator().create(Conf);
-    c.* = .{
-        .tcp_listen_backlog = auto_limits.tcp_listen_backlog,
-        .max_tcp_buffered_bytes = auto_limits.max_tcp_buffered_bytes,
-        .max_udp_associations = auto_limits.max_udp_associations,
-        .max_udp_pending_datagrams = auto_limits.max_udp_pending_datagrams,
-        .max_udp_pending_bytes = auto_limits.max_udp_pending_bytes,
-    };
+    c.* = .{};
     return c;
 }
 
@@ -97,39 +77,42 @@ fn setLimits(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []c
     const c: *Conf = @ptrCast(@alignCast(slot));
     const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, "limits");
     try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations", "maxUDPPendingDatagrams", "maxUDPPendingBytes" }, "limits");
-    const backlog = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "tcpListenBacklog", "limits.tcpListenBacklog", c.tcp_listen_backlog);
-    const tcp_bytes = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "maxTCPBufferedBytes", "limits.maxTCPBufferedBytes", c.max_tcp_buffered_bytes);
-    const udp_associations = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "maxUDPAssociations", "limits.maxUDPAssociations", c.max_udp_associations);
-    const pending_datagrams = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "maxUDPPendingDatagrams", "limits.maxUDPPendingDatagrams", c.max_udp_pending_datagrams);
-    const pending_bytes = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "maxUDPPendingBytes", "limits.maxUDPPendingBytes", c.max_udp_pending_bytes);
-    c.* = .{
-        .tcp_listen_backlog = backlog.value,
-        .max_tcp_buffered_bytes = tcp_bytes.value,
-        .max_udp_associations = udp_associations.value,
-        .max_udp_pending_datagrams = pending_datagrams.value,
-        .max_udp_pending_bytes = pending_bytes.value,
-        .auto_tuning = .{
-            .tcp_listen_backlog = backlog.is_auto,
-            .max_tcp_buffered_bytes = tcp_bytes.is_auto,
-            .max_udp_associations = udp_associations.is_auto,
-            .max_udp_pending_datagrams = pending_datagrams.is_auto,
-            .max_udp_pending_bytes = pending_bytes.is_auto,
-        },
-    };
+    if (yaml.mappingGet(map, "tcpListenBacklog")) |v| {
+        c.tcp_listen_backlog = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.tcpListenBacklog");
+    }
+    if (yaml.mappingGet(map, "maxTCPBufferedBytes")) |v| {
+        c.max_tcp_buffered_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxTCPBufferedBytes");
+    }
+    if (yaml.mappingGet(map, "maxUDPAssociations")) |v| {
+        c.max_udp_associations = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxUDPAssociations");
+    }
+    if (yaml.mappingGet(map, "maxUDPPendingDatagrams")) |v| {
+        c.max_udp_pending_datagrams = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxUDPPendingDatagrams");
+    }
+    if (yaml.mappingGet(map, "maxUDPPendingBytes")) |v| {
+        c.max_udp_pending_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, "limits.maxUDPPendingBytes");
+    }
 }
 
 fn setRuleLimits(cycle: *conf.Cycle, slot: *anyopaque, value: *yaml.Value, path: []const u8) yaml.LoadError!void {
     const c: *RuleConf = @ptrCast(@alignCast(slot));
-    var path_buf: [80]u8 = undefined;
+    var path_buf: [96]u8 = undefined;
     const limits_path = std.fmt.bufPrint(&path_buf, "{s}.limits", .{path}) catch "rules.limits";
     const map = try yaml.requireMapping(cycle.gpa, cycle.diag, value, limits_path);
     try yaml.checkKeys(cycle.gpa, cycle.diag, map, &.{ "tcpListenBacklog", "maxTCPBufferedBytes", "maxUDPAssociations" }, limits_path);
-    const backlog = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "tcpListenBacklog", limits_path, 0);
-    if (!backlog.is_auto) c.tcp_listen_backlog = backlog.value;
-    const tcp_bytes = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "maxTCPBufferedBytes", limits_path, 0);
-    if (!tcp_bytes.is_auto) c.max_tcp_buffered_bytes = tcp_bytes.value;
-    const udp_associations = try yaml.decodeAutoTunedInt(cycle.gpa, cycle.diag, map, "maxUDPAssociations", limits_path, 0);
-    if (!udp_associations.is_auto) c.max_udp_associations = udp_associations.value;
+    var key_buf: [128]u8 = undefined;
+    if (yaml.mappingGet(map, "tcpListenBacklog")) |v| {
+        const field_path = std.fmt.bufPrint(&key_buf, "{s}.tcpListenBacklog", .{limits_path}) catch limits_path;
+        c.tcp_listen_backlog = try yaml.decodeInt(cycle.gpa, cycle.diag, v, field_path);
+    }
+    if (yaml.mappingGet(map, "maxTCPBufferedBytes")) |v| {
+        const field_path = std.fmt.bufPrint(&key_buf, "{s}.maxTCPBufferedBytes", .{limits_path}) catch limits_path;
+        c.max_tcp_buffered_bytes = try yaml.decodeInt(cycle.gpa, cycle.diag, v, field_path);
+    }
+    if (yaml.mappingGet(map, "maxUDPAssociations")) |v| {
+        const field_path = std.fmt.bufPrint(&key_buf, "{s}.maxUDPAssociations", .{limits_path}) catch limits_path;
+        c.max_udp_associations = try yaml.decodeInt(cycle.gpa, cycle.diag, v, field_path);
+    }
 }
 
 fn validate(cycle: *conf.Cycle) yaml.LoadError!void {

@@ -495,8 +495,8 @@ test "effective configuration merges rule overrides" {
     try testing.expectEqual(8, effective.timeouts.connect_seconds);
     try testing.expectEqual(600, effective.timeouts.tcp_idle_seconds);
     try testing.expectEqual(8_388_608, effective.limits.max_tcp_buffered_bytes);
-    try testing.expect(!effective.limits.auto_tuning.max_tcp_buffered_bytes);
-    try testing.expect(effective.limits.auto_tuning.max_udp_associations);
+    try testing.expectEqual(limits.default_tcp_listen_backlog, effective.limits.tcp_listen_backlog);
+    try testing.expectEqual(limits.default_max_udp_associations, effective.limits.max_udp_associations);
     try testing.expectEqualStrings("a", effective.upstream.host);
     try testing.expectEqual(9_000, effective.upstream.port);
 }

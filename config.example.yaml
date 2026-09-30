@@ -4,7 +4,7 @@ listen:
 upstream:
   host: "example.com"
 
-# Optional overrides. Omitted values are auto-tuned continuously at runtime.
+# Optional overrides. Every omitted key uses a fixed built-in default.
 # version: 1
 # protocols: [tcp, udp] # names registered by built-in protocol modules
 # listen:
@@ -14,20 +14,18 @@ upstream:
 #   host: "example.com"
 #   port: 9000
 # runtime:
-#   workerThreads: auto
-#   tuningDaemon: true
-#   tuningIntervalSeconds: 5
+#   workerThreads: 4
 # timeouts:
 #   connectSeconds: 5
 #   tcpIdleSeconds: 300
 #   udpSessionSeconds: 60
 #   shutdownGraceSeconds: 10
 # limits:
-#   tcpListenBacklog: auto
-#   maxTCPBufferedBytes: auto
-#   maxUDPAssociations: auto
-#   maxUDPPendingDatagrams: auto   # legacy: unused by the batched UDP transport
-#   maxUDPPendingBytes: auto       # legacy: unused by the batched UDP transport
+#   tcpListenBacklog: 4096
+#   maxTCPBufferedBytes: 134217728
+#   maxUDPAssociations: 2048
+#   maxUDPPendingDatagrams: 64     # legacy: unused by the batched UDP transport
+#   maxUDPPendingBytes: 524288     # legacy: unused by the batched UDP transport
 # performance:
 #   tcpSockmapAcceleration: auto     # auto skips loopback upstreams; set
 #                                    # enabled to force the attempt
@@ -41,7 +39,7 @@ upstream:
 #   udpDatagramBufferBytes: 65536   # per-slot receive buffer of the batched UDP
 #                                   # relay (576..65536); smaller values improve
 #                                   # cache locality, larger datagrams truncate
-#   udpIOThreads: auto              # UDP relay threads; auto = worker count
+#   udpIOThreads: 1                 # UDP relay threads
 #   threadCpuAffinity: none         # CPU pinning for TCP workers and UDP I/O
 #                                   # threads: none | sequential | [list]
 #                                   #   none: leave scheduling to the kernel
@@ -110,10 +108,10 @@ upstream:
 # eBPF modulus (per-instance worker count) and the kernel hash do not mix into
 # a lopsided distribution.
 #
-# Resource planning: auto-tuned workerThreads and limits are computed per
-# instance as if it owned the whole machine, and the tuning daemon reads the
-# global /proc/net/netstat counters. With several instances, prefer explicit
-# workerThreads and limits so totals stay within budget.
+# Resource planning: workerThreads and limits are fixed per instance, so the
+# values of every instance add up on one host. Prefer explicit values sized
+# for the whole machine instead of relying on the built-in per-instance
+# defaults.
 #
 # eBPF: observer kprobes are filtered by the instance's own pid and sockmap /
 # reuseport programs are loaded per process/socket, so multiple instances
